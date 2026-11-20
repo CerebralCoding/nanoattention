@@ -1,235 +1,254 @@
-# nanoattention2
+<h1 align="center">nanoattention2</h1>
 
-Native **Zig + Metal** inference for [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint), with Lean-generated integer execution contracts. Zig owns checkpoint mappings, buffers, model scheduling, and KV caches; Metal kernels do the model computation. The runtime does **not** link MLX, PyTorch, CUDA, or a Python model implementation.
+<p align="center"><strong>Flint inference, close to the metal.</strong></p>
 
-This is a single-sequence, inference-only engine—not a general MLX replacement or a production HTTP server. The executable is named `flint`.
+<p align="center">A native Zig + Metal engine for Apple Silicon.<br>Explicit memory. Persistent KV caches. Lean-checked execution contracts.</p>
 
-## Requirements
+<p align="center">
+  <img alt="Apple Silicon macOS" src="https://img.shields.io/badge/platform-Apple%20Silicon-555">
+  <img alt="Built in Zig 0.17" src="https://img.shields.io/badge/built%20in-Zig%200.17-f7a41d?logo=zig&logoColor=white">
+  <img alt="GPU backend Metal" src="https://img.shields.io/badge/GPU-Metal-555">
+  <img alt="Original code MIT licensed" src="https://img.shields.io/badge/original%20code-MIT-44cc11">
+</p>
 
-- Apple Silicon macOS and Xcode/Command Line Tools with the macOS SDK.
-- **Zig 0.17.0** and **Lean/Lake 4.35.0**. The Lean project uses `Std` only.
-- Python 3.9+ for proof-binding checks; NumPy for synthetic numerical verification.
-- Optional `transformers`/`tokenizers` for text input, and MLX/MLX-LM for reference comparisons.
-- An existing compatible Flint checkpoint and sufficient unified memory. Weights are not included or automatically downloaded.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-it-does">What it does</a> ·
+  <a href="#use-with-codegraff">CodeGraff</a> ·
+  <a href="#performance">Performance</a> ·
+  <a href="#correctness-and-proofs">Proofs</a> ·
+  <a href="#development">Development</a>
+</p>
 
-## Build and verify
+Run [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint) locally with a
+small, inspectable inference stack. Zig maps the checkpoint, owns buffers and KV
+state, and schedules the model. Metal kernels execute attention, packed quantized
+projections, expert routing, and the vocabulary head on the GPU.
 
-Run from the repository root:
+**The native runtime does not link MLX, PyTorch, or CUDA.** Optional Python tools
+handle tokenization, chat templates, and the local HTTP bridge—not model math.
+This is a focused, single-sequence inference engine, not a general tensor framework.
+
+## Quick start
+
+### 1. Build the engine
+
+You need an Apple Silicon Mac, Xcode or Command Line Tools with the macOS SDK,
+**Zig 0.17.0**, **Lean/Lake 4.35.0**, and **Python 3.9+**. The Lean project uses
+`Std` only. Builds check the generated proof bindings before compiling the engine.
 
 ```sh
+git clone https://github.com/justrach/nanoattention2.git
+cd nanoattention2
 zig build -Doptimize=ReleaseSafe
-zig build test -Doptimize=ReleaseSafe
-zig build proofs
-python3 -B proofs/test_verifier.py
-zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zig
-
-# Requires NumPy; creates disposable tiny checkpoints.
-python3 tools/verify.py zig-out/bin/flint --staged-row-tile 2
 ```
 
-Native builds automatically build the Lean proofs and reject generated Zig/Metal binding drift. All GPU verification is headless: no windows, activation, or desktop input.
+This repository is private; cloning requires access. The executable is
+`zig-out/bin/flint`. There is no runtime or model auto-install step.
 
-## Run Flint
+### 2. Get the weights
 
-The native loader supports F32/F16/BF16 safetensors and MLX-style affine INT4/INT8 exports, including U8/U32 packed storage, per-group scales/biases, mixed-width embeddings, stacked experts, and sharded checkpoints. Dequantization happens inside Metal kernels; weights stay in mapped shared memory. NVIDIA NVFP4 is not supported. The published BF16 checkpoint is approximately 80 GB and has not received the same full-model validation as the tested 22.57 GB INT4 export.
+Download the tested affine-INT4 checkpoint from
+[codegraff.com/flint](https://codegraff.com/flint). The download includes all five
+weight shards, tokenizer, chat template, configuration, license, and checksums.
+Allow roughly **22.58 GB of disk space**, plus enough unified memory for weights,
+working buffers, and your chosen context. The download does not install or start
+an inference server. Model weights are licensed separately from this engine.
+
+Point the commands below at the directory containing the complete checkpoint:
 
 ```sh
 ./zig-out/bin/flint inspect /path/to/flint-int4
-./zig-out/bin/flint generate /path/to/flint-int4 \
-  --tokens-file prompt.json --context 2048 --max-tokens 64 --staged-row-tile 2
 ```
 
-`prompt.json` is an array of token IDs, not text. Generation is greedy and emits `{"tokens":[...]}`; EOS is included and ends generation. `--context` caps prompt plus generated positions. Use the checkpoint's own tokenizer and chat template.
+`inspect` checks model configuration; it is not a full checkpoint integrity check.
+Use the download's checksums to verify the files.
 
-For direct text input, the optional adapter applies that template and decodes IDs; **all model inference still runs in Zig/Metal**:
+### 3. Generate text
+
+In a Python environment with `transformers` and `tokenizers` installed:
 
 ```sh
-/path/to/python -B tools/chat.py /path/to/flint-int4 \
+python3 -B tools/chat.py /path/to/flint-int4 \
   "Write a Python binary search function." \
   --context 2048 --max-tokens 64 --staged-row-tile 2
 ```
 
-`flint eval` emits all vocabulary logits for every supplied token. It is diagnostic output, not an efficient serving protocol. `inspect` validates configuration only, not the complete checkpoint payload.
+The helper uses only the checkpoint's local tokenizer and chat template. All
+inference runs in the native executable. Generation is greedy.
 
-### Use as Codegraff's local model
+<details>
+<summary>Work directly with token IDs</summary>
 
-`tools/codegraff_adapter.py` exposes loopback OpenAI chat/function-tool endpoints
-backed by one persistent native `flint session`. It uses the checkpoint's own
-local tokenizer/template, preserves exact native KV prefixes across compatible
-tool turns, and explicitly reports resets when history changes. All inference
-remains Zig/Metal; Python is only the transport/tokenizer/protocol bridge.
-See [Codegraff setup and verification](docs/CODEGRAFF.md) and the
-[project-router example](examples/codegraff-router.json). SSE is buffered, not
-token-live streaming. Full context allocation is not a filled-window benchmark.
-
-## Performance and correctness
-
-The optimized staged configuration is selected explicitly with **`--staged-row-tile 2`**; tile 1 remains the default. A validated pre-extraction run of these kernels on an **M3 Ultra, 60 GPU cores, 256 GB unified memory** measured:
-
-| Engine | Median decode tokens/s |
-| --- | ---: |
-| Zig/Metal FP32 activations, original packed INT4 weights | **121.18** |
-| Stock MLX FP32, same local checkpoint/workload | 96.33 |
-| Stock MLX BF16, same local checkpoint/workload | 94.19 |
-
-The three native runs measured **121.55 / 120.85 / 121.18 tok/s**. Workload: 21 prompt tokens and 64 teacher-forced decode tokens, three warmed repetitions, fresh/reset caches, synchronous GPU completion and CPU greedy readback. Loading and warmup are excluded. This is not long-context, free-running generation, or server throughput. Native prefill is serial and remains substantially slower than MLX's batched prefill. See [benchmark evidence and methodology](benchmarks/README.md), including the standalone-folder rerun.
-
-**This does not show a win over Recursive's own `rec` benchmark.** Its [published chart](https://github.com/recursive-oss/rec/blob/main/.github/assets/throughput.svg) reports **131.2 tok/s at 1K context** on an M4 Pro with 48 GB, 4-bit weights, five runs and 1,024 output steps; it falls to 22.6 tok/s at 252K context. Our hardware, context, and decode protocol differ. A matched-device/checkpoint/context/protocol comparison is required.
-
-Validation includes **43 unit/kernel tests**, nine Lean-binding tests, six verifier-behavior tests, and seven synthetic checkpoint cases against independent NumPy (worst absolute logit error 1.37e-6). Full-checkpoint checks of the pre-extraction kernels against unsteered FP32 MLX compared every vocabulary logit: coding top-1 agreement **36/36 positions**, held-out linked-list **28/28**, and **16/16 greedy tokens** matching for each prompt. Maximum absolute logit errors were **0.0002823 / 0.0002670**, with unchanged allclose tolerances. These checks establish bounded numerical agreement, not bitwise, broad quality, long-context, or default-BF16 parity.
-
-To reproduce optional full-model checks, use a Python environment with the reference packages installed and run engines sequentially:
+Create `prompt.json` as an array of IDs produced by the checkpoint's tokenizer,
+then run:
 
 ```sh
-python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 600 -- \
-  /path/to/mlx-python -B tools/compare_mlx.py /path/to/flint-int4 --staged-row-tile 2
-
-python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 600 -- \
-  /path/to/mlx-python -B tools/benchmark.py /path/to/flint-int4 \
-  --decode-tokens 64 --repeats 3 --staged-row-tile 2 --output .zig-cache/benchmark.json
+./zig-out/bin/flint generate /path/to/flint-int4 \
+  --tokens-file prompt.json --context 2048 --max-tokens 64 --staged-row-tile 2
 ```
 
-The guard refuses a held lock, checks memory headroom, and cleans up only its owned process group. It does not stop other servers. Omit `--lock` only when no other inference stack needs coordination. Native and MLX full models never overlap within these drivers. `FLINT_PROFILE=1` enables diagnostic per-kernel timestamps; profiling perturbs scheduling, so its throughput is **not** a benchmark.
+The result is a JSON object containing generated `tokens`. EOS is included when
+reached. `--context` bounds prompt plus generated positions. Raw text is not a
+valid token-ID prompt. `flint eval` exposes vocabulary logits for diagnostics.
 
-## Decode-only hill climbing
+</details>
 
-`tools/tune_decode.py` compares head/down row tiles, packed router launches and
-parallel expert-down scheduling against one real cached prefix. Every vocabulary
-bit at every tested decode position must match before a candidate is timed;
-round order rotates to reduce machine-state bias. The 4K/16K trials found small
-kernel gains but **no meaningful 16K wall-time improvement**, so production
-defaults remain unchanged. Losing busy-wait code was removed, not enabled.
-See [decode trials, reproduction commands and RAM accounting](benchmarks/decode-hillclimb.md).
+## What it does
 
-Zig provides explicit allocation, ownership and scheduling control—not automatic
-GPU speed or lower RAM than MLX. Both use Metal/unified memory. Our KV remains
-FP32; equivalent BF16 KV would use half the cache storage. Mapped checkpoint
-size, process RSS and device allocations are different measurements.
+- **Native quantized inference.** Load mmap-backed safetensors, including sharded
+  MLX affine INT4/INT8 exports, without expanding the full checkpoint to FP32.
+- **GPU-side model work.** Packed projections, fused QKV launches, routed/shared
+  experts, normalization, attention, and greedy selection use Metal kernels.
+- **Persistent conversations.** A JSONL session keeps weights and per-layer KV
+  alive. Compatible follow-up turns reuse the exact cached token prefix; changed
+  histories trigger an explicit reset rather than a pretend cache hit.
+- **Long-context attention.** Sliding layers use bounded ring caches; global
+  layers retain the full configured prefix. Flint applies RoPE to sliding layers
+  and NoPE to global layers.
+- **Checked kernel contracts.** Lean proves selected integer scheduling and
+  indexing properties; generated bindings connect those contracts to Zig and Metal.
+- **Measured experiments.** Optional BF16 global KV, history-based speculation,
+  and tuning candidates are separate from the ordinary FP32-KV decode baseline.
 
-## Longer-context MLX-layout mode
+The loader also supports F32/F16/BF16 tensors and mixed-precision embeddings.
+NVIDIA NVFP4 is not supported. The tested INT4 export has received more full-model
+validation than the published BF16 checkpoint.
 
-The default-off `--mlx-attention` path now passes **bit-exact all-vocabulary
-comparisons against stock sequential MLX** on the tested 4K/8K prefixes and
-16-token continuations. No tolerances, weights or routing decisions were relaxed
-or steered. Global attention stays **NoPE**; only the checkpoint's sliding layers
-use RoPE.
+## Use with CodeGraff
 
-Same-machine M3 Ultra, ReleaseSafe, 256 teacher-forced decode tokens and three
-warmed repeats:
-
-| Actual prompt tokens | Native tok/s | MLX FP32 tok/s | MLX BF16 tok/s |
-| --- | ---: | ---: | ---: |
-| 1,024 | **126.94** | 87.14 | 88.81 |
-| 4,096 | **119.72** | 81.86 | 85.73 |
-| 8,192 | **110.75** | 73.14 | 83.66 |
-
-`--prompt-tokens` creates actual exact-length repeated-code prefixes, not larger
-allocations with short prompts. `--reuse-prefill` measures one real native
-prefill, snapshots its actual KV/position and restores outside decode timing.
-Native prefill has **one sample**. Stock MLX performance runs use batched prefill;
-strict numerical checks explicitly select sequential prefill. These are decode
-measurements, not prefill-performance or broad task-quality parity. The entire
-256-token timing continuation is not all-logit validated.
+Keep the model local while CodeGraff reads files, runs tools, and handles the coding
+conversation. The owned launcher starts one loopback adapter and one persistent
+native worker, then selects `nanoattention/flint` for the chosen workspace.
 
 ```sh
-python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 1200 -- \
-  /path/to/mlx-python -B tools/compare_mlx.py /path/to/flint-int4 \
-  --prompt-tokens 8192 --mlx-prefill-chunk-size 1 --decode-tokens 16 \
-  --staged-row-tile 2 --mlx-attention
-
-python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 1200 -- \
-  /path/to/mlx-python -B tools/benchmark.py /path/to/flint-int4 \
-  --prompt-tokens 8192 --decode-tokens 256 --repeats 3 --reuse-prefill \
-  --staged-row-tile 2 --mlx-attention --output .zig-cache/matched-8192.json
+python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 1400 -- \
+  python3 -B tools/graff_native.py /path/to/flint-int4 \
+  --graff /path/to/graff --workspace /path/to/coding-workspace \
+  --context 32768 --max-tokens 4096 --timeout 1200 -- \
+  -p "Add tests for the parser, then fix any failures."
 ```
 
-The native executable accepts `--mlx-attention 1`; Python drivers accept
-`--mlx-attention`. This mode conflicts with resident execution and
-`--attention-chunk`. See [current results, fixes and scope](benchmarks/mlx-layout-long-context.md)
-and [individual timings/source fingerprints](benchmarks/mlx-layout-long-context.json).
-The [earlier state-merge experiments](benchmarks/long-context.md) failed numerical
-admission; their speed figures are historical, not current accepted results.
-The separate ordered `--attention-chunk` path is still experimental and is not
-the mode measured above.
+Use the tokenizer-enabled Python environment. Omit the arguments after `--` for
+an interactive terminal session. Run local inference jobs sequentially under the
+same exclusive lock.
 
-## Persistent multi-turn sessions and KV reuse
+Compatible Graff builds use the built-in local provider. Older binaries use a
+temporary project router, without overwriting an existing router or changing global
+provider settings. The launcher cleans up its owned processes on exit. Normal
+Graff tool permissions still apply; the launcher is not itself an OS sandbox.
 
-`flint session` keeps one loaded model and its actual per-layer KV buffers alive
-while reading JSONL requests from stdin. Each request supplies **only new suffix
-token IDs**; the native session never replays earlier turns or resets implicitly.
-EOF closes the process. This is a local stdio worker, not an HTTP server.
+The Python bridge provides OpenAI-compatible chat and function-tool translation;
+**it never executes tools**. It accepts one active model request at a time, and
+SSE output is buffered rather than token-live. See the
+[setup, lifecycle, and verification guide](docs/CODEGRAFF.md).
+
+## Performance
+
+Decode speed depends on context, kernel configuration, and workload. The benchmark
+reports retain configurations, methodology, negative results, and correctness gates
+rather than treating the fastest run as a universal speed claim.
+
+| Workload | Recorded native decode rate | Evidence |
+| --- | ---: | --- |
+| Short coding prompt, 21-token prefix / 64 teacher-forced steps | 120.40 tok/s | [Matched local MLX comparison](benchmarks/README.md) |
+| Seeded random raw IDs, filled 16K / 256 ordinary steps | 106.09 tok/s | [Raw decode experiments](benchmarks/raw-decode.md) |
+| Seeded random raw IDs, filled 32K / 256 ordinary steps | 93.19 tok/s | [Raw decode experiments](benchmarks/raw-decode.md) |
+
+These are historical measurements on an **Apple M3 Ultra, 60 GPU cores, 256 GB
+unified memory**, with the INT4 checkpoint and native FP32 activations/KV. Loading,
+prefill, and warmup are excluded. Rows come from different trials/configurations;
+they are not a paired comparison or a fresh benchmark of this documentation change.
+Raw teacher-forced rates are not free-running coding-agent throughput.
+
+The short-context matched trial measured stock MLX FP32 at 96.84 tok/s and BF16 at
+91.96 tok/s. That establishes only that workload: native serial prefill remains
+substantially slower than MLX's batched prefill. Recursive's published `rec`
+numbers use different hardware and protocols; **this is not a matched win over
+`rec`, overall MLX parity, or a claim of 130 tok/s at long context**.
+
+More: [long-context sessions](benchmarks/larger-context-sessions.md),
+[raw attention tuning](benchmarks/raw-attention-hillclimb.md), and
+[prepared-input experiments that did not improve speed](benchmarks/raw-prepared-inputs.md).
+
+<details>
+<summary>Experimental modes</summary>
+
+- **BF16 global KV** reduces global-cache storage, while sliding KV and model math
+  remain FP32. It can change logits and generated tokens; it is not stock MLX BF16
+  inference. See [measurements](benchmarks/bf16-kv.md).
+- **Greedy speculation** uses committed-history drafts and batched target
+  verification with sliding-cache rollback. It is disabled by default, preserves
+  target greedy tokens in the tested cases, and can be slower on real coding
+  tasks. See [contracts and limitations](docs/SPECULATIVE.md) and
+  [workload-dependent results](benchmarks/speculative-hillclimb.md).
+- **Resident execution** interprets the generated plan in one GPU dispatch, with
+  `--resident-workers 1..32` and checked dimension/context limits. It is slower than
+  the optimized staged path. Ordinary staged execution uses multiple kernels;
+  one command-buffer submission is not one kernel.
+
+</details>
+
+## Correctness and proofs
+
+Correctness is checked at several levels: headless Metal tests, synthetic
+checkpoints against independent NumPy, bounded full-model MLX comparisons, and
+Lean-generated binding checks. Numerical agreement is reported with its tested
+precision, context, and tolerance—not as a blanket quality or bitwise-MLX claim.
+
+For long-context coding, recorded sequential FP32 MLX checks cover every greedy
+choice through 28,623 cached tokens and six full-vocabulary boundary rows, not
+all logits at every position. Raw kernel candidates use separate bitwise admission
+against the ordinary native reference. Neither establishes full-window task quality.
+
+**Lean proves selected integer properties:** execution-plan order, guarded coverage,
+index bounds, packed INT4 reconstruction, and launch geometry. Builds verify exact
+bindings consumed by Zig and Metal. **It does not prove floating-point equivalence,
+whole-shader correctness, GPU memory semantics, forward progress, or speed.**
+See [proof scope and assumptions](proofs/README.md).
+
+## Development
+
+Run from the repository root. NumPy is needed for synthetic numerical checks;
+MLX/MLX-LM are optional reference-test dependencies, not runtime dependencies.
 
 ```sh
-zig-out/bin/flint session /path/to/flint-int4 \
-  --context 32768 --mlx-attention 1 --staged-row-tile 2
+zig build test -Doptimize=ReleaseSafe
+zig build proofs
+python3 -B proofs/test_verifier.py
+zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zig
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools -p 'test_*.py'
+python3 tools/verify.py zig-out/bin/flint --staged-row-tile 2
 ```
 
-Example request shape (use the checkpoint's tokenizer/template for real chat):
+| Location | Responsibility |
+| --- | --- |
+| [`src/model.zig`](src/model.zig) | Model execution, expert scheduling, and persistent KV state |
+| [`src/weights.zig`](src/weights.zig) | Checkpoint mappings and quantized tensor descriptors |
+| [`src/metal.zig`](src/metal.zig), [`src/metal.m`](src/metal.m) | Metal bridge, cached pipelines, barriers, and completion handling |
+| [`src/`](src/) | Metal kernels, generated plans, and native tests |
+| [`proofs/`](proofs/) | Lean contracts, emitters, and binding verification |
+| [`tools/`](tools/) | Tokenizer/HTTP bridges, parity checks, and benchmark drivers |
+| [`benchmarks/`](benchmarks/) | Reproducible measurements and rejected experiments |
 
-```json
-{"id":1,"tokens":[150002,123,456],"max_tokens":256,"reset":false,"return_logits":false}
-```
+### Current boundaries
 
-Responses report generated IDs, `cache_before/after`, `reused_prefix_tokens`, new
-prefill/decode counts, commit-inclusive timings, and allocated/valid KV bytes.
-Every sampled token—including final EOS or the last length-limited token—is
-forwarded into KV before returning. Context capacity reserves that final commit.
-A requested `reset` is explicit and validated before mutation. Full-attention
-layers retain the sequence; sliding layers keep their bounded 513-token ring.
-KV remains FP32, not quantized. Editing earlier history requires an explicit
-reset; this is append-only session reuse, not a cross-conversation prefix trie.
+Apple Silicon only. Single sequence, inference only. No training/autograd, general
+lazy tensor graph, multi-device execution, concurrent multi-user batching, or native
+tokenizer/template renderer. Ordinary generation is greedy, not Flint's recommended
+stochastic sampling. The Python adapter rejects unsupported sampling and reasoning
+controls rather than silently ignoring them. Full batched prefill and broad
+model-quality parity remain unverified. mmap avoids an extra full weight copy; it
+does not remove physical-memory or Metal-buffer limits.
 
-Staged generation, sessions, and benchmarks compute the terminal normalization
-and vocabulary projection only for the **last new prefix token**. Every prefix
-embedding, transformer layer, routing decision, KV write and position increment
-still executes. This removes unused output-head work, not context or attention.
-Decode still computes full logits for each forwarded token. Diagnostic `eval`
-continues to compute every supplied token's logits; resident execution retains
-its original certified full-forward plan. This is not batched prefill. See the
-[controlled prefill optimization measurements](benchmarks/prefill-elision.md).
+## License
 
-`tools/check_sessions.py` checks real persistent tiny checkpoints against both an
-independent NumPy implementation and fresh native replay, including ring wrap,
-EOS/final-token commitment, reset, byte accounting and overflow rejection.
-`tools/coding_multiturn.py` provides an offline three-turn coding exercise with
-strict tokenizer/template prefix checks. It refuses to reset, truncate or replay
-history to conceal a mismatch. Native and MLX reference invocations are separate;
-artifacts live in ignored `target/`. Generated code is syntax-checked only,
-**never executed** by this driver.
+Original code and contributions are **[MIT licensed](LICENSE)**. Adapted Recursive
+`rec` components retain Apache-2.0 terms; adapted MLX components retain MIT terms
+and notices. The top-level MIT license does not replace those upstream obligations.
+Model weights are not bundled and remain separately licensed.
 
-The large-context matched schedule selects more stripes at 16K/64K. Contexts of
-at least 16K currently require the measured M3 Ultra/GQA8 profile; this is not
-universal hardware auto-tuning. The configured context ceiling is not a claim
-that every length has been benchmarked or quality-validated.
+See [third-party notices](THIRD_PARTY_NOTICES.md), [provenance](PROVENANCE.md), and
+[`licenses/`](licenses/).
 
-See [16K/32K timings and the executed coding/cache trial](benchmarks/larger-context-sessions.md),
-including initial-prefill latency, incomplete responses, and verification limits.
-
-## Execution architecture
-
-- `src/model.zig`, `weights.zig`, `safetensors.zig`: validated model metadata, mmap-backed shared checkpoints, expert descriptors, bounded sliding/full KV caches, and eager scheduling.
-- `src/metal.zig`, `metal.m`: a narrow headless Foundation/Metal bridge with cached pipelines, explicit resource residency, dependency barriers, and completion/error handling.
-- `kernels.metal`, `row_tiling.metal`: packed INT4/group-64 matvec, descriptor-backed QKV launch fusion, shared gate/up input preparation plus SwiGLU, and fused down/mixture/shared-expert/residual operations.
-- `dense_matvec.metal`, `routing.metal`: dtype-specialized loads, eight-SIMD small-output projection reductions, and register-cached sigmoid/top-k with deterministic ties and finite checks.
-- `attention_parallel.metal`, `normalization.metal`: eight-SIMD online attention, learned denominator-only sinks, split-half RoPE, parallel RMSNorm, and QK/cache/residual normalization fusion.
-- `attention_split.metal`, `attention_ordered.metal`: historical experimental state-merge and ordered score/value paths; no cross-threadgroup spin barrier.
-- `attention_mlx.metal`, `normalization_aligned.metal`: opt-in MLX-layout reductions, physical sliding-ring traversal, adjacent-four normalization and matching RoPE phase construction.
-- `proofs/`, `src/resident_plan.{zig,metal}`: checked integer contracts and exact generated bindings consumed by the runtime.
-
-The original short-context staged path uses **one submission and 489 dispatches per token** for Flint. The measured MLX-layout long-context mode uses **one submission and 503 dispatches per token**. Neither is a single monolithic kernel. Flint semantics include attention in the first two dense layers, 47 routed MoE layers, six selected experts plus an ungated shared expert, selection-only router bias, a 513-token sliding window, and RoPE only on sliding layers. Activations, accumulations, and caches remain FP32.
-
-An opt-in resident interpreter (`--resident-workers 1..32`, optional `--resident-row-tile 1|2|4|8`) executes the generated plan in one dispatch. It supports at most 4096 allocated context positions plus checked dimension limits. It is slower than the winning staged path. Failed synchronization poisons the sequence rather than silently falling back. Unsupported higher-worker experiments failed numerical checks despite completion receipts; those results are not admitted.
-
-## What Lean proves—and does not
-
-See [proof documentation](proofs/README.md). Certificates cover execution-plan ordering, instruction/index bounds, guarded row coverage and uniqueness, INT4 reconstruction and ideal integer affine algebra, QKV tile selection, split-dense column ownership, split-attention token/state/sink ownership and index bounds, and an abstract arrival-counter transition under explicit distinct-worker premises. Generated constants/helpers bind the selected contracts to Zig and Metal.
-
-**They do not prove whole-shader correctness**, IEEE754 equivalence, Metal compiler or memory-model correctness, occupancy, fairness, liveness, or speed. Those remain assumptions and empirical verification obligations. Standard Lean logical axioms appear in some proofs; there are no added axioms, `sorry`, `admit`, or `native_decide` shortcuts.
-
-## Current limits
-
-No batched prefill, lazy tensor graph, autograd/training, batching, speculative decoding, native tokenizer/template renderer, HTTP server, tool-call parser, or multi-device execution. Generation currently implements greedy selection, not Flint's recommended stochastic sampling. mmap avoids an extra full weight copy but does not guarantee enough physical memory or device buffer capacity. Strict numerical checks cover the tested 4K/8K prefixes and the recorded multi-turn coding stream through 28,623 cached tokens against sequential FP32 MLX. The coding check compares every greedy choice and six all-vocabulary boundary rows, not every logit at every position. The separate 32K timing fixture has no additional full-model all-logit validation claim. Batched-reference equivalence, contexts beyond the measured range and broad task-quality parity remain unverified.
-
-## License and attribution
-
-Original code and contributions are licensed under the **MIT License** in [LICENSE](LICENSE). Adapted Recursive `rec` components retain their Apache-2.0 terms and notices; adapted MLX components retain their MIT terms and notices. The top-level MIT license does not replace those upstream obligations. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [PROVENANCE.md](PROVENANCE.md), and `licenses/`. Model weights are not bundled and remain separately licensed.
+<p align="center"><sub>Built in Zig · Executed on Metal · Contracts checked in Lean</sub></p>
