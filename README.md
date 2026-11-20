@@ -48,12 +48,21 @@ This repository is private; cloning requires access. The executable is
 
 ### 2. Get the weights
 
-Download the tested affine-INT4 checkpoint from
-[codegraff.com/flint](https://codegraff.com/flint). The download includes all five
-weight shards, tokenizer, chat template, configuration, license, and checksums.
-Allow roughly **22.58 GB of disk space**, plus enough unified memory for weights,
-working buffers, and your chosen context. The download does not install or start
-an inference server. Model weights are licensed separately from this engine.
+Flint is developed by **Recursive**. The official model and original BF16
+checkpoint are on [Hugging Face: RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint).
+The weights retain Recursive's **[Apache-2.0 license](https://huggingface.co/RecursiveSI/flint/blob/main/LICENSE)**;
+we do not relicense them under this engine's MIT license.
+
+[codegraff.com/flint](https://codegraff.com/flint) is an **unofficial download mirror**
+for the tested, modified MLX-style affine-INT4 export—not a byte-for-byte mirror of
+the original BF16 checkpoint or a model authored by us. It retains the same
+upstream Apache-2.0 terms, original license, attribution, and modification notice;
+no endorsement by Recursive is implied.
+
+The mirror includes all five weight shards, tokenizer, chat template,
+configuration, license, and checksums. Allow roughly **22.58 GB of disk space**,
+plus enough unified memory for weights, working buffers, and your chosen context.
+The download does not install or start an inference server.
 
 Point the commands below at the directory containing the complete checkpoint:
 
