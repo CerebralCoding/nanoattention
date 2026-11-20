@@ -1,4 +1,4 @@
-<h1 align="center">nanoattention2</h1>
+<h1 align="center">nanoattention</h1>
 
 <p align="center"><strong>Flint inference, close to the metal.</strong></p>
 
@@ -38,8 +38,8 @@ You need an Apple Silicon Mac, Xcode or Command Line Tools with the macOS SDK,
 `Std` only. Builds check the generated proof bindings before compiling the engine.
 
 ```sh
-git clone https://github.com/justrach/nanoattention2.git
-cd nanoattention2
+git clone https://github.com/justrach/nanoattention.git
+cd nanoattention
 zig build -Doptimize=ReleaseSafe
 ```
 
