@@ -44,4 +44,14 @@ iteration order. Explicit expert-weight rounding preserves a materialization
 boundary from MLX's separate multiply and reduction operations; it does not
 change model weights or expert selection semantics.
 
+## MLX batched quantized matrix multiply and Steel attention (`nano`)
+
+The `nano` prefill kernels in `src/mega/mlx.metal` and `src/mega/mlx2.metal`
+adapt MLX v0.32.4's batched quantized matrix multiply (`quantized.h`), the
+Steel GEMM loader, MMA and split-K reduction, and the Steel attention kernel,
+loader and MMA. The host dispatch and split-K policies in `src/mega/exec.zig`
+follow `mlx/backend/metal/quantized.cpp`. Buffer addressing, ring caches,
+scale-dtype specialization, multi-matrix dispatch and sliding-window key origin
+are adapted for this engine. The shaders retain Apple's copyright and MIT notices.
+
 MLX is copyright © 2023 Apple Inc. and licensed under the MIT License; a copy is included in `licenses/mlx-MIT.txt`. This engine does not link to or execute MLX. MLX is used separately only for optional reference comparisons and benchmarks. The integer proofs do not establish IEEE754 equivalence of MLX's or this implementation's reductions; unchanged numerical checks remain required.

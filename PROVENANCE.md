@@ -1,8 +1,10 @@
 # Source provenance and license scope
 
-This is the standalone native Zig/Metal Flint engine, exported from the verified
-engine source snapshot `56166c5` into a new repository without parent history,
-checkpoint files, build caches, or unrelated workspace components.
+This repository started as the standalone native Zig/Metal Flint engine, exported
+from the verified engine source snapshot `56166c5` without parent history or
+checkpoint files. The later Liquid AI port adds the `nano` executable and
+related sources, tools, and benchmark evidence without merging the earlier
+branch history or bundling model assets.
 
 The repository contains no Rust/CUDA implementation files or Rust/CUDA build
 dependencies from the earlier workspace. `build.zig` compiles local Zig entry

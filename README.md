@@ -216,6 +216,25 @@ bindings consumed by Zig and Metal. **It does not prove floating-point equivalen
 whole-shader correctness, GPU memory semantics, forward progress, or speed.**
 See [proof scope and assumptions](proofs/README.md).
 
+## Liquid AI models (`nano`)
+
+`zig build` also builds `zig-out/bin/nano`, a separate Zig/Metal inference engine
+for the tested 4-bit MLX checkpoints of Liquid AI's LFM3-1.7B and
+LFM2.5-1.2B-Instruct. It does not link MLX. Both models support raw-token
+inference; the native text and chat commands currently support LFM3 only.
+
+```sh
+zig-out/bin/nano inspect "$CHECKPOINT"
+zig-out/bin/nano generate "$CHECKPOINT" --tokens-file prompt.json --max-tokens 128 \
+  --knobs src/mega/presets/exact.json --knob decode_attention=3 \
+  --knob decode_q4_static=true --knob fuse_add_norm=true
+```
+
+The optimizations are opt-in. At a 4,096-token prompt on the tested M3 Ultra,
+LFM3 beat pipelined MLX on decode; LFM2.5 did not reliably beat it. MLX was
+faster on prefill for both. See [measurements and reproduction commands](benchmarks/liquid-attention.md),
+[the engine design](docs/MEGAKERNEL.md), and [LFM3 CLI usage](docs/CLI.md).
+
 ## Development
 
 Run from the repository root. NumPy is needed for synthetic numerical checks;
@@ -223,6 +242,7 @@ MLX/MLX-LM are optional reference-test dependencies, not runtime dependencies.
 
 ```sh
 zig build test -Doptimize=ReleaseSafe
+zig build test-mega -Doptimize=ReleaseSafe
 zig build proofs
 python3 -B proofs/test_verifier.py
 zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zig
@@ -243,11 +263,11 @@ python3 tools/verify.py zig-out/bin/flint --staged-row-tile 2
 ### Current boundaries
 
 Apple Silicon only. Single sequence, inference only. No training/autograd, general
-lazy tensor graph, multi-device execution, concurrent multi-user batching, or native
-tokenizer/template renderer. Ordinary generation is greedy, not Flint's recommended
-stochastic sampling. The Python adapter rejects unsupported sampling and reasoning
-controls rather than silently ignoring them. Full batched prefill and broad
-model-quality parity remain unverified. mmap avoids an extra full weight copy; it
+lazy tensor graph, multi-device execution, or concurrent multi-user batching.
+The Flint executable has no native tokenizer/template renderer. Its ordinary
+inference is greedy, not Flint's recommended stochastic sampling, and its Python
+adapter rejects unsupported sampling and reasoning controls. Full batched prefill
+for Flint and broad model-quality parity remain unverified. mmap avoids an extra full weight copy; it
 does not remove physical-memory or Metal-buffer limits.
 
 ## License
