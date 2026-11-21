@@ -21,6 +21,7 @@ const usage =
     \\  nano mlx-op linear --m M --k K --n N --group G --weights W --x X --out Y  (src/mega/mlxop.zig)
     \\  nano bench CHECKPOINT --prompt-tokens N [--decode-tokens 256] [--repeats 3] [--bench-tokens F]
     \\        [--decode-mode teacher-forced|greedy | --bench-greedy 1] [--profile-decode 1]
+    \\  nano attnbench [REPEATS] [KEYS...]  (Inkling relative attention on synthetic K/V)
     \\Common: --context N (default 4096), --knobs FILE.json, --knob name=value (repeatable,
     \\        applied after --knobs),
     \\        --sliding-visible N, --embed-round none|bf16.
@@ -70,6 +71,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "microbench")) {
         const reps = if (args.next()) |v| try std.fmt.parseInt(u32, v, 10) else 50;
         return @import("microbench.zig").run(a, reps);
+    }
+    // long-context decode: single-row relative attention variants on synthetic K/V (run under the lock).
+    if (std.mem.eql(u8, command, "attnbench")) {
+        var rest: std.ArrayList([]const u8) = .empty;
+        while (args.next()) |v| try rest.append(a, v);
+        return @import("attnbench.zig").run(a, rest.items);
     }
     // decode climb 2: dispatch, barrier and read-back costs (synthetic; run under the lock).
     if (std.mem.eql(u8, command, "d2-probe")) {

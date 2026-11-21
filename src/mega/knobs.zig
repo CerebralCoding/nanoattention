@@ -26,6 +26,14 @@ pub const Knobs = struct {
     relative_split_4: bool = false,
     /// Split long relative-bias attention in prefill (requires relative_split).
     relative_split_prefill: bool = false,
+    /// Single-row relative attention (head size 128, three query heads a KV head)
+    /// in stripes of keys over 16-bit mirrors of the K and V caches, the query
+    /// heads of a KV head sharing every load (inkling_long.metal). The mirrors
+    /// hold the caches' bfloat16 values exactly; the sum is associated per
+    /// stripe, so it is not bit-identical to the reference. Takes precedence
+    /// over relative_split for single rows. With relative_tile_prefill, batched
+    /// rows run that kernel's tiles in stripes of keys too, off the same mirrors.
+    relative_stripes: bool = false,
     /// FP16 matrix fragments in batched relative attention (different arithmetic).
     relative_tile_prefill: bool = false,
     /// Reuse BF16 weights and input lanes across a small dense tile.

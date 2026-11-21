@@ -14,6 +14,7 @@
 | `src/mega/kernels.metal` | the reference kernels, one generic kernel per operation |
 | `src/mega/fused.metal` | fused variants, each behind a knob |
 | `src/mega/decode.metal` | single-row variants (split attention, attention prep, two-stage argmax), each behind a knob |
+| `src/mega/inkling_long.metal`, `attnbench.zig` | Inkling's striped relative attention over 16-bit K and V mirrors (decode and prefill), behind `relative_stripes`; `nano attnbench` times it on synthetic caches |
 | `src/mega/prefill.metal` | exact multi-row variants (matrix-matrix 4-bit linear, gated conv over rows), each behind a knob |
 | `src/mega/decode2.metal` | decode climb 2: the gated pre-encoded decode (gate and gated embedding) and a register-resident sandwich norm, each behind a knob; `mk_d2_empty` for `nano d2-probe` |
 | `src/mega/decode2_probe.zig`, `decode2_tests.zig` | `nano d2-probe` (launch, barrier, submission and wake latency, matvec bandwidth); the headless bit tests of `decode2.metal` |
@@ -294,3 +295,30 @@ python3 tools/nano_inkling_bench.py zig-out/bin/nano "$CHECKPOINT" \
   --knob bf16_prefill_matrix=true --knob bf16_decode_vec=true --knob fuse_bf16_cast=true --knob concurrent_scratch=true \
   --knob relative_split=true --knob relative_split_4=true --knob relative_tile_prefill=true
 ```
+
+### Long-context attention (`relative_stripes`)
+
+`--knob relative_stripes=true`, added to the knobs above, mirrors every stored K
+and V row as its upper 16 bits (the rows are bfloat16 values, so nothing is lost)
+and reads relative attention from the mirrors (`src/mega/inkling_long.metal`).
+Single rows run in stripes of 128 to 512 keys, one threadgroup per KV head and
+stripe, the three query heads of a KV head sharing each load. Batched rows run
+`mk_relative_attention_prefill`'s tiles in two or four stripes of keys, loading
+K and V fragments straight from the mirrors. It needs head size 128 and three
+query heads per KV head; anything else keeps the existing kernels. The mirrors
+add 50% to K and V memory.
+
+At 4K to 32K prompt tokens on the M3 Ultra, native decode is 34.0 to 36.6 tokens a
+second against 26.2 to 28.9 for the pinned mlx-lm reference, and native prefill
+630 to 711 against 598 to 677; before the knob MLX led decode at 32K and prefill
+from 8K. Method, the exo comparison, and limits are in
+[benchmarks/inkling-long-context.md](../benchmarks/inkling-long-context.md).
+
+The knob changes the association of the dot products and the softmax sum, so it
+is not bit-identical to `relative_split` or `relative_tile_prefill`. On a
+420-token transcript its all-vocabulary logits differ from theirs by up to 3.5
+(RMS 0.4) with the same top token at every checked position, which is also how far
+those paths are from each other and from the reference kernel
+(`tools/nano_inkling_attention_check.py`). A real greedy reply can change wording
+after a few dozen tokens. `nano attnbench [repeats] [keys...]` times one layer's
+attention, each variant against the reference kernel, on synthetic caches.

@@ -116,6 +116,16 @@ pub const Engine = struct {
     x2att_rows: u32 = 0,
     expert_tiles: ?[2]metal.Buffer = null,
     relative_parts: ?metal.Buffer = null,
+    /// knobs.relative_stripes: per state, the 16-bit mirror of a K or V cache the
+    /// striped attention reads (written with every store), and its stripe records.
+    relative_half: ?[]?metal.Buffer = null,
+    stripe_parts: ?metal.Buffer = null,
+    /// Stripe records of the batched striped attention: batch x heads x max_prefill_stripes.
+    prefill_parts: ?metal.Buffer = null,
+    const max_prefill_stripes: u32 = 4;
+    const mirror_pad: u32 = 16; // MK_MIRROR_PAD
+    const max_stripe_parts: u32 = 1024; // MK_LONG_PARTS
+    const stripe_threads: usize = 512; // 16 SIMD groups (MK_LONG_SIMDS)
     const max_relative_parts: u32 = 64;
     const min_relative_split: u32 = 64;
     const relative_row_tile: u32 = 16;
@@ -300,6 +310,42 @@ pub const Engine = struct {
             };
             if (part_words != 0) relative_parts = try ctx.alloc(part_words);
         }
+        var relative_half: ?[]?metal.Buffer = null;
+        var stripe_parts: ?metal.Buffer = null;
+        var prefill_parts: ?metal.Buffer = null;
+        errdefer {
+            if (prefill_parts) |b| b.deinit();
+            if (relative_half) |hs| {
+                for (hs) |h| if (h) |b| b.deinit();
+                gpa.free(hs);
+            }
+            if (stripe_parts) |b| b.deinit();
+        }
+        if (knobs.relative_stripes) {
+            const halves = try gpa.alloc(?metal.Buffer, n);
+            @memset(halves, null);
+            relative_half = halves;
+            var part_words: usize = 0;
+            var striped_heads: usize = 0;
+            for (program.ops) |op| switch (op) {
+                .relative_attention => |a| if (a.dim == 128 and a.heads == 3 * a.kv_heads) {
+                    striped_heads = @max(striped_heads, a.heads);
+                    for ([_]ir.StateId{ a.keys, a.values }) |id| if (halves[id] == null) {
+                        const s = program.states[id];
+                        const buf = try ctx.alloc((@as(usize, s.capacity(batch, context) + mirror_pad) * s.width + 1) / 2);
+                        @memset(buf.floats(), 0);
+                        halves[id] = buf;
+                    };
+                    const visible = if (a.window == 0) context else @min(context, a.window);
+                    part_words = @max(part_words, @as(usize, a.heads) * 130 * @min(max_stripe_parts, maxStripeParts(visible)));
+                },
+                else => {},
+            };
+            if (part_words != 0) {
+                stripe_parts = try ctx.alloc(part_words);
+                if (knobs.relative_tile_prefill and batch >= 8) prefill_parts = try ctx.alloc(@as(usize, batch) * striped_heads * max_prefill_stripes * 130);
+            }
+        }
         return .{
             .gpa = gpa,
             .program = program,
@@ -330,7 +376,23 @@ pub const Engine = struct {
             .x2att_rows = x2att_rows,
             .expert_tiles = expert_tiles,
             .relative_parts = relative_parts,
+            .relative_half = relative_half,
+            .stripe_parts = stripe_parts,
+            .prefill_parts = prefill_parts,
         };
+    }
+
+    /// Stripes of the single-row striped attention over `visible` keys: 128 keys
+    /// a stripe up to 2,048 keys, 256 up to 16,384, then 512 (`nano attnbench`).
+    fn stripeParts(visible: u32) u32 {
+        const stripe: u32 = if (visible <= 2048) 128 else if (visible <= 16384) 256 else 512;
+        return (visible + stripe - 1) / stripe;
+    }
+    /// The most stripes any key count up to `visible` takes. The count drops where
+    /// the stripe widens, so the last count is not the largest: 16,384 keys take
+    /// 64 stripes and 16,385 take 33.
+    fn maxStripeParts(visible: u32) u32 {
+        return @max(stripeParts(visible), @max(stripeParts(@min(visible, 2048)), stripeParts(@min(visible, 16384))));
     }
 
     pub fn deinit(self: *Engine) void {
@@ -354,6 +416,12 @@ pub const Engine = struct {
         if (self.x2att) |bs| for (bs) |b| b.deinit();
         if (self.expert_tiles) |bs| for (bs) |b| b.deinit();
         if (self.relative_parts) |b| b.deinit();
+        if (self.relative_half) |hs| {
+            for (hs) |h| if (h) |b| b.deinit();
+            self.gpa.free(hs);
+        }
+        if (self.stripe_parts) |b| b.deinit();
+        if (self.prefill_parts) |b| b.deinit();
     }
 
     /// Logical reset: positions >= 0 are rewritten before any read, and conv
@@ -874,6 +942,9 @@ pub const Engine = struct {
                 p.n = s.src.width;
                 p.capacity = d.capacity(self.batch, self.context);
                 try gpu.dispatch(self.ctx, "mk_store", &.{ self.arena, self.caches[s.dst].? }, &p, @as(usize, rows) * p.n, 256);
+                if (self.relative_half) |hs| if (hs[s.dst]) |half| {
+                    try gpu.dispatch(self.ctx, "mk_pack_bf16", &.{ self.arena, half }, &p, @as(usize, rows) * p.n, 256);
+                };
             },
             .conv => |c| {
                 const w = self.bound[c.weight];
@@ -999,9 +1070,25 @@ pub const Engine = struct {
                 const end = self.position + row0 + rows;
                 const visible = if (p.window == 0) end else @min(end, p.window);
                 if (self.knobs.relative_tile_prefill and rows >= 8 and a.dim == 128) {
+                    if (self.prefill_parts) |records| if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| if (p.capacity >= mirror_pad) {
+                        // Two stripes occupy the GPU for a sliding window; an unwindowed walk takes four (`nano attnbench`).
+                        p.taps = if (a.window != 0) 2 else max_prefill_stripes;
+                        try gpu.dispatch(self.ctx, "mk_relative_prefill_stripes", &.{ self.arena, half_keys, hs[a.values].?, records }, &p, @as(usize, (rows + 31) / 32) * a.heads * p.taps * 128, 128);
+                        try gpu.dispatch(self.ctx, "mk_relative_prefill_merge", &.{ self.arena, records }, &p, @as(usize, rows) * a.heads * 128, 128);
+                        return;
+                    };
                     try gpu.dispatch(self.ctx, "mk_relative_attention_prefill", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, (rows + 31) / 32) * a.heads * 128, 128);
                     return;
                 }
+                if (rows == 1) if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| {
+                    p.taps = stripeParts(visible);
+                    if (p.taps <= max_stripe_parts) {
+                        const parts = self.stripe_parts.?;
+                        try gpu.dispatch(self.ctx, "mk_relative_long_keys", &.{ self.arena, half_keys, hs[a.values].?, parts }, &p, @as(usize, a.kv_heads) * p.taps * stripe_threads, stripe_threads);
+                        try gpu.dispatch(self.ctx, "mk_relative_long_merge", &.{ self.arena, parts }, &p, @as(usize, a.heads) * 128, 128);
+                        return;
+                    }
+                };
                 if (self.relative_parts) |parts| {
                     const split_decode = rows == 1 and visible >= min_relative_split;
                     const split_prefill = rows > 1 and self.knobs.relative_split_prefill and visible >= 256;
@@ -1585,6 +1672,15 @@ fn splitAcross(gpa: std.mem.Allocator, steps: []plan.Step, boundary: u32) ![]pla
         } else try out.append(gpa, st);
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "stripe records are sized for every key count up to the context" {
+    for ([_]u32{ 1, 127, 2048, 2049, 4120, 16384, 16385, 20000, 32792, 70000 }) |context| {
+        var most: u32 = 0;
+        var visible: u32 = 1;
+        while (visible <= context) : (visible += 1) most = @max(most, Engine.stripeParts(visible));
+        try std.testing.expectEqual(most, Engine.maxStripeParts(context));
+    }
 }
 
 test "head_trim: boundary after the last store; split steps cover every op once and straddle neither boundary" {

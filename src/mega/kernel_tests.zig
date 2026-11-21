@@ -1536,6 +1536,35 @@ test "tiled relative attention handles window wrap and a partial query tile" {
             try close(expected, actual, 0.0003);
         }
 
+        // The same tiles in stripes of keys, loaded from the 16-bit mirrors (padded
+        // with their first 16 rows, which the wrapped window's tiles read): one
+        // stripe, uneven stripes, and more stripes than a row tile has tiles.
+        const half_keys = try ctx.alloc((capacity + 16) * dim / 2);
+        defer half_keys.deinit();
+        const half_values = try ctx.alloc((capacity + 16) * dim / 2);
+        defer half_values.deinit();
+        for ([_][2]@TypeOf(keys){ .{ keys, half_keys }, .{ values, half_values } }) |pair| {
+            const half = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(pair[1].floats()));
+            for (pair[0].floats(), half[0 .. capacity * dim]) |v, *h| {
+                try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(v)) & 0xffff);
+                h.* = @intCast(@as(u32, @bitCast(v)) >> 16);
+            }
+            @memcpy(half[capacity * dim ..][0 .. 16 * dim], half[0 .. 16 * dim]);
+        }
+        const tiled = try std.testing.allocator.dupe(f32, f[p.y + first ..][0 .. rows * stride]);
+        defer std.testing.allocator.free(tiled);
+        for ([_]u32{ 1, 3, 16 }) |taps| {
+            const records = try ctx.alloc(rows * heads * taps * (dim + 2));
+            defer records.deinit();
+            p.taps = taps;
+            @memset(f[p.y..][0 .. (rows + row0) * stride], -7);
+            try gpu.dispatch(ctx, "mk_relative_prefill_stripes", &.{ arena, half_keys, half_values, records }, &p, 2 * heads * taps * 128, 128);
+            try gpu.dispatch(ctx, "mk_relative_prefill_merge", &.{ arena, records }, &p, rows * heads * 128, 128);
+            try ctx.finish();
+            for (f[p.y..][0..stride]) |v| try std.testing.expectEqual(@as(f32, -7), v);
+            for (tiled, f[p.y + first ..][0 .. rows * stride]) |expected, actual| try close(expected, actual, 0.0001);
+        }
+
         const parts = try ctx.alloc(heads * 3 * (dim + 2));
         defer parts.deinit();
         p.rows = 1;
@@ -1548,6 +1577,70 @@ test "tiled relative attention handles window wrap and a partial query tile" {
         try gpu.dispatch(ctx, "mk_relative_split_keys4", &.{ arena, keys, values, parts }, &p, heads * p.taps * 128, 128);
         try ctx.finish();
         try std.testing.expectEqualSlices(f32, &before, parts.floats()[0..before.len]);
+    }
+}
+
+test "striped relative attention matches the reference over 16-bit K and V, a wrapped window and uneven stripes" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const heads = 6;
+    const kv_heads = 2;
+    const dim = 128;
+    const stride = heads * dim;
+    const width = kv_heads * dim;
+    const extent = 9;
+    const row0 = 2;
+    const pos = 700;
+    const end = pos + row0 + 1;
+    const bias_off = (row0 + 1) * stride * 3;
+    const sink_off = bias_off + (row0 + 1) * heads * extent;
+    const arena = try ctx.alloc(sink_off + (row0 + 1) * heads);
+    defer arena.deinit();
+    const f = arena.floats();
+    for (f[0 .. (row0 + 1) * stride], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 5 % 23)) - 11)) * 0.0625;
+    for (f[bias_off..sink_off], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.125;
+    for (f[sink_off..], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.5;
+    const out_off = (row0 + 1) * stride;
+    for ([_][2]u32{ .{ 0, 3 }, .{ 0, 2 }, .{ 300, 2 }, .{ 300, 7 }, .{ 1, 1 } }) |case| {
+        const window = case[0];
+        const capacity: u32 = if (window == 0) end else window + 40;
+        const keys = try ctx.alloc(capacity * width);
+        defer keys.deinit();
+        const values = try ctx.alloc(capacity * width);
+        defer values.deinit();
+        const half_keys = try ctx.alloc((capacity + 16) * width / 2);
+        defer half_keys.deinit();
+        const half_values = try ctx.alloc((capacity + 16) * width / 2);
+        defer half_values.deinit();
+        // Stored through the engine's own kernels, a row at a time, so the mirror
+        // is checked as the float cache's upper halves.
+        var store: gpu.Params = .{ .rows = 1, .x = 0, .xs = width, .n = width, .capacity = capacity };
+        const row = try ctx.alloc(width);
+        defer row.deinit();
+        for ([_][2]@TypeOf(keys){ .{ keys, half_keys }, .{ values, half_values } }, 0..) |pair, which| {
+            for (end - @min(end, capacity)..end) |t| {
+                for (row.floats(), 0..) |*v, d| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((t * (7 - 2 * which) + d * 3) % (13 + 6 * which))) - 6)) * 0.0625;
+                store.pos = @intCast(t);
+                try gpu.dispatch(ctx, "mk_store", &.{ row, pair[0] }, &store, width, 256);
+                try gpu.dispatch(ctx, "mk_pack_bf16", &.{ row, pair[1] }, &store, width, 256);
+                try ctx.finish();
+            }
+            const half = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(pair[1].floats()));
+            for (pair[0].floats(), half[0 .. capacity * width]) |v, h| try std.testing.expectEqual(@as(u32, @bitCast(v)), @as(u32, h) << 16);
+            try std.testing.expectEqualSlices(u16, half[0 .. 16 * width], half[capacity * width ..][0 .. 16 * width]);
+        }
+        var p: gpu.Params = .{ .rows = 1, .row0 = row0, .pos = pos, .x = 0, .xs = stride, .y = out_off, .ys = stride, .z = bias_off, .zs = heads * extent, .s = sink_off, .every = heads, .m = extent, .heads = heads, .kv_heads = kv_heads, .dim = dim, .window = window, .capacity = capacity, .scale = 0.0883883476 };
+        try gpu.dispatch(ctx, "mk_relative_attention", &.{ arena, keys, values }, &p, heads * 32, 32);
+        p.y += out_off;
+        p.taps = case[1];
+        const parts = try ctx.alloc(heads * p.taps * 130);
+        defer parts.deinit();
+        @memset(f[p.y..][0 .. (row0 + 1) * stride], -7);
+        try gpu.dispatch(ctx, "mk_relative_long_keys", &.{ arena, half_keys, half_values, parts }, &p, kv_heads * p.taps * 512, 512);
+        try gpu.dispatch(ctx, "mk_relative_long_merge", &.{ arena, parts }, &p, heads * 128, 128);
+        try ctx.finish();
+        for (f[p.y..][0 .. row0 * stride]) |v| try std.testing.expectEqual(@as(f32, -7), v);
+        for (f[out_off + row0 * stride ..][0..stride], f[p.y + row0 * stride ..][0..stride]) |expected, actual| try close(expected, actual, 1e-5);
     }
 }
 
