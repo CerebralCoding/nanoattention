@@ -2,6 +2,7 @@
 //! names architectures; everything below a front end is model-agnostic.
 const std = @import("std");
 const ir = @import("ir.zig");
+const inkling2_loop = @import("inkling2_loop.zig");
 pub const lfm3 = @import("lfm3.zig");
 const lfm2 = @import("lfm2.zig");
 
@@ -16,6 +17,10 @@ pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []con
     const opts: lfm3.Options = .{ .sliding_visible = options.sliding_visible, .embed_round = options.embed_round };
     if (std.mem.eql(u8, model_type, "lfm3")) return lfm3.build(gpa, config_bytes, checkpoint, opts);
     if (std.mem.eql(u8, model_type, "lfm2")) return lfm2.build(gpa, config_bytes, checkpoint, opts);
+    if (std.mem.eql(u8, model_type, "inkling2_loop")) {
+        if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedInklingOptions;
+        return inkling2_loop.build(gpa, config_bytes);
+    }
     std.debug.print("No megakernel front end for model_type \"{s}\"\n", .{model_type});
     return error.UnsupportedModelType;
 }

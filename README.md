@@ -235,6 +235,10 @@ LFM3 beat pipelined MLX on decode; LFM2.5 did not reliably beat it. MLX was
 faster on prefill for both. See [measurements and reproduction commands](benchmarks/liquid-attention.md),
 [the engine design](docs/MEGAKERNEL.md), and [LFM3 CLI usage](docs/CLI.md).
 
+**Experimental: Inkling 2 Mini.** `nano` can inspect and run the original
+mixed-precision checkpoint with token IDs. MLX parity has not passed; see the
+[verified workflow and limits](docs/MEGAKERNEL.md#inkling-2-mini-experimental).
+
 ## Development
 
 Run from the repository root. NumPy is needed for synthetic numerical checks;

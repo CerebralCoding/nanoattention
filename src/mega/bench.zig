@@ -79,6 +79,8 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
     var prefill_dispatches: u64 = 0;
     var decode_dispatches: u64 = 0;
     var prefill_forwards: u64 = 0;
+    const predictions = try a.alloc(u32, decode.len + 1);
+    const warmup_predictions = try a.alloc(u32, predictions.len);
     var checksum: u64 = 0;
     for (0..input.repeats + 1) |rep| {
         engine.reset();
@@ -95,19 +97,19 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
             prefill_forwards += 1;
             i += n;
         }
-        var next = try engine.next(engine.out_end - 1);
-        var sum: u64 = next;
+        predictions[0] = try engine.next(engine.out_end - 1);
+        var sum: u64 = predictions[0];
         if (input.profile_decode and rep == input.repeats) try engine.ctx.beginProfile();
         const t1 = try io.now();
         var detail: [3]f64 = @splat(0); // decode climb 2: encode, wait, GPU seconds
-        for (decode) |t| {
-            try engine.forward(&.{if (input.greedy) next else t}, 0);
+        for (decode, predictions[1..], 0..) |t, *prediction, step| {
+            try engine.forward(&.{if (input.greedy) predictions[step] else t}, 0);
             decode_dispatches += engine.last.dispatches;
             detail[0] += engine.last.encode_seconds;
             detail[1] += engine.last.wait_seconds;
             detail[2] += engine.last.gpu_seconds;
-            next = try engine.next(0);
-            sum +%= next;
+            prediction.* = try engine.next(0);
+            sum +%= prediction.*;
         }
         const t2 = try io.now();
         try engine.d2Settle(); // decode climb 2 (d2_gate): nothing left at the gate before the next run
@@ -118,9 +120,10 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         }
         if (rep == 0) {
             checksum = sum;
+            @memcpy(warmup_predictions, predictions);
             continue;
         }
-        if (sum != checksum) return error.NondeterministicBenchmark;
+        if (!std.mem.eql(u32, predictions, warmup_predictions)) return error.NondeterministicBenchmark;
         prefill_s[rep - 1] = t1 - t0;
         decode_s[rep - 1] = t2 - t1;
     }
@@ -148,6 +151,7 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         .dispatches_per_prefill_forward = @as(f64, @floatFromInt(prefill_dispatches)) / @as(f64, @floatFromInt(prefill_forwards)),
         .dispatches_per_decode_token = if (input.decode_tokens == 0) 0 else @as(f64, @floatFromInt(decode_dispatches)) / @as(f64, @floatFromInt(input.decode_tokens)),
         .prediction_checksum = checksum,
+        .predictions = predictions,
     };
     try io.out(try std.json.Stringify.valueAlloc(a, result, .{}));
     try io.out("\n");
