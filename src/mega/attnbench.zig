@@ -1,11 +1,12 @@
-//! Decode attention: `nano attnbench [repeats] [keys...]`. GPU time of the
+//! Decode attention: `nano attnbench [repeats] [keys...] [rows=N]`. GPU time of the
 //! single-row relative attention of one Inkling layer (24 heads, 8 KV heads,
 //! head size 128, relative extent 1024) over synthetic bfloat16-valued K and V:
 //! a global layer at each key count, and the 1,024-key sliding window in a
 //! wrapped ring when the count is 1024. Variants: the reference kernel, the
 //! split the tuned knobs use today and the stripes at several geometries; then
-//! a 128-row prefill chunk ending at the last key, the tiled kernel against its
-//! tiles in stripes of keys loaded straight from the mirrors. Each variant's output is compared with the
+//! a prefill chunk of N rows (128 unless rows=N) ending at the last key, the tiled kernel against its
+//! tiles in stripes of keys loaded straight from the mirrors and against the
+//! staged tiles off the mirrors (inkling_tiles.metal). Each variant's output is compared with the
 //! reference kernel's. Timing guidance only; run it under the inference lock
 //! and confirm any gain with `nano bench`.
 const std = @import("std");
@@ -26,14 +27,19 @@ fn bf16(v: f32) f32 {
 pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
     const repeats: u32 = if (args.len > 0) try std.fmt.parseInt(u32, args[0], 10) else 20;
     var lengths: std.ArrayList(u32) = .empty;
-    for (args[@min(args.len, 1)..]) |v| try lengths.append(a, try std.fmt.parseInt(u32, v, 10));
+    var batch: u32 = 128; // rows of the prefill chunk; decode uses row 0
+    for (args[@min(args.len, 1)..]) |v| {
+        if (std.mem.startsWith(u8, v, "rows=")) {
+            batch = try std.fmt.parseInt(u32, v[5..], 10);
+            if (batch < 64 or batch % 32 != 0 or batch > 4096) return error.InvalidRows;
+        } else try lengths.append(a, try std.fmt.parseInt(u32, v, 10));
+    }
     if (lengths.items.len == 0) try lengths.appendSlice(a, &.{ 4096, 8192, 16384, 32768 });
     const ctx = try gpu.open();
     defer ctx.deinit();
     var prng = std.Random.DefaultPrng.init(7);
     const r = prng.random();
 
-    const batch = 128; // rows of the prefill chunk; decode uses row 0
     const q_off: u32 = 0;
     const bias_off: u32 = q_off + batch * heads * dim;
     const sink_off: u32 = bias_off + batch * heads * extent;
@@ -47,7 +53,7 @@ pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
 
     for (lengths.items) |keys| {
         const window: u32 = if (keys == 1024) 1024 else 0;
-        const capacity: u32 = if (window != 0) window - 1 + 128 else keys;
+        const capacity: u32 = if (window != 0) window - 1 + batch else keys;
         const k32 = try ctx.alloc(@as(usize, capacity) * width);
         defer k32.deinit();
         const v32 = try ctx.alloc(@as(usize, capacity) * width);
@@ -65,7 +71,7 @@ pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
             }
             @memcpy(half[@as(usize, capacity) * width ..][0 .. 16 * width], half[0 .. 16 * width]);
         }
-        var p: gpu.Params = .{ .rows = 1, .pos = if (window != 0) 5000 else keys - 1, .x = q_off, .xs = heads * dim, .y = out_off, .ys = heads * dim, .z = bias_off, .zs = heads * extent, .s = sink_off, .every = heads, .heads = heads, .kv_heads = kv_heads, .dim = dim, .m = extent, .window = window, .capacity = capacity, .scale = 1 / @sqrt(@as(f32, dim)) };
+        var p: gpu.Params = .{ .rows = 1, .pos = if (window != 0) 4 * batch + 904 else keys - 1, .x = q_off, .xs = heads * dim, .y = out_off, .ys = heads * dim, .z = bias_off, .zs = heads * extent, .s = sink_off, .every = heads, .heads = heads, .kv_heads = kv_heads, .dim = dim, .m = extent, .window = window, .capacity = capacity, .scale = 1 / @sqrt(@as(f32, dim)) };
         try gpu.dispatch(ctx, "mk_relative_attention", &.{ arena, k32, v32 }, &p, heads * 32, 32);
         try ctx.finish();
         const reference = try a.dupe(f32, f[out_off..][0 .. heads * dim]);
@@ -114,7 +120,7 @@ pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
             try Timer.report(a, name, us[1], reference, out);
         };
         // A prefill chunk: the last `batch` positions.
-        if (keys >= batch) {
+        if (p.pos + 1 >= batch) {
             p.rows = batch;
             p.pos -= batch - 1;
             const chunk = batch * heads * dim;
@@ -131,7 +137,7 @@ pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
             const want = f[out_off..][0..chunk];
             p.y = out_off + chunk;
             const got = f[p.y..][0..chunk];
-            for ([_]u32{ 1, 2, 4, 8, 16 }) |taps| {
+            for ([_]u32{ 1, 2, 4, 8 }) |taps| {
                 p.taps = taps;
                 const records = try ctx.alloc(@as(usize, batch) * heads * taps * 130);
                 defer records.deinit();
@@ -145,6 +151,15 @@ pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
                 const us = (ctx.stats().gpu_seconds - before.gpu_seconds) / @as(f64, @floatFromInt(repeats)) * 1e6;
                 const name = try std.fmt.allocPrint(a, "prefill, {d} stripes", .{taps});
                 try Timer.report(a, name, us, want, got);
+            }
+            {
+                // The reference's staged 16-key tiles off the mirrors (inkling_tiles.metal).
+                @memset(got, 0);
+                const before = ctx.stats();
+                for (0..repeats) |_| try gpu.dispatch(ctx, "mk_relative_prefill_tiles", &.{ arena, k16, v16 }, &p, @as(usize, batch / 32) * heads * 128, 128);
+                try ctx.finish();
+                const us = (ctx.stats().gpu_seconds - before.gpu_seconds) / @as(f64, @floatFromInt(repeats)) * 1e6;
+                try Timer.report(a, "prefill, staged tiles off mirrors", us, want, got);
             }
         }
     }

@@ -18,6 +18,11 @@ pub const Knobs = struct {
     expert_bf16_tiles: bool = false,
     /// Tile both packed formats, rounding dequantized weights to BF16 as in batched MLX.
     expert_mlx_scale: bool = false,
+    /// Token rows whose routes are listed and multiplied together (expert_prefill):
+    /// 0 keeps 512 with expert_mlx_scale and 128 without. Each of the 128 experts
+    /// sees about a sixteenth of the rows, so 512 leaves most of its 32-row tiles
+    /// partly empty; a few thousand rows fill them. Per-row arithmetic is unchanged.
+    expert_tile_rows: u32 = 0,
     /// Wider packed-expert K tile for prefill. Requires expert_prefill.
     expert_wide_k: bool = false,
     /// Parallel softmax over relative-bias decode partitions.
@@ -32,7 +37,8 @@ pub const Knobs = struct {
     /// hold the caches' bfloat16 values exactly; the sum is associated per
     /// stripe, so it is not bit-identical to the reference. Takes precedence
     /// over relative_split for single rows. With relative_tile_prefill, batched
-    /// rows run that kernel's tiles in stripes of keys too, off the same mirrors.
+    /// rows read the same mirrors: under 512 rows that kernel's tiles in stripes
+    /// of keys, from 512 rows the staged tiles of inkling_tiles.metal.
     relative_stripes: bool = false,
     /// FP16 matrix fragments in batched relative attention (different arithmetic).
     relative_tile_prefill: bool = false,
@@ -40,12 +46,22 @@ pub const Knobs = struct {
     bf16_linear_tile: bool = false,
     /// Matrix tiles for large BF16 projections with BF16-valued inputs.
     bf16_prefill_matrix: bool = false,
+    /// With bf16_prefill_matrix: the matrix tiles also take projections with as few
+    /// as 64 outputs or 32 inputs (the relative, router and controller projections),
+    /// which otherwise run one small tile kernel launch each. The sums are
+    /// associated as the matrix tiles associate them, so the bits differ.
+    bf16_matrix_small: bool = false,
     /// Fully unrolled BF16 prefill tile; zero selects the original tail-safe kernel.
     bf16_prefill_tile: u32 = 0,
     /// Vector loads for the BF16 decode tile (different summation order).
     bf16_decode_vec: bool = false,
     /// Fold an in-place BF16 cast into its producer without changing arithmetic.
     fuse_bf16_cast: bool = false,
+    /// Pack scratch states whose lifetimes do not meet into the same arena words
+    /// (exec.packScratch) instead of giving every state its own. No arithmetic
+    /// changes; the arena shrinks by an order of magnitude on programs with many
+    /// short-lived states, which is what lets Inkling take batches above 512.
+    scratch_reuse: bool = false,
     /// Allow adjacent independent scratch kernels to overlap.
     concurrent_scratch: bool = false,
     /// Affine 4-bit linear: output rows and token rows per SIMD group,
@@ -182,6 +198,7 @@ pub const Knobs = struct {
     pub fn validate(self: Knobs) !void {
         if (self.bf16_prefill_tile != 0 and self.bf16_prefill_tile != 8 and self.bf16_prefill_tile != 16 and self.bf16_prefill_tile != 32) return error.InvalidBf16PrefillTile;
         if (self.batch == 0 or self.batch > 4096) return error.InvalidBatch;
+        if (self.expert_tile_rows != 0 and (self.expert_tile_rows < 8 or self.expert_tile_rows > 4096)) return error.InvalidExpertTileRows;
         for ([_]u32{ self.decode_rows, self.prefill_rows }) |r| if (r != 1 and r != 2 and r != 4 and r != 8) return error.InvalidLinearRows;
         for ([_]u32{ self.decode_tokens, self.prefill_tokens }) |t| if (t != 1 and t != 2 and t != 4) return error.InvalidLinearTokens;
         if (self.linear_group == 0 or self.linear_group % 32 != 0 or self.linear_group > 1024) return error.InvalidLinearGroup;

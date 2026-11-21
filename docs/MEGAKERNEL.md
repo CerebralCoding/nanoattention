@@ -296,29 +296,47 @@ python3 tools/nano_inkling_bench.py zig-out/bin/nano "$CHECKPOINT" \
   --knob relative_split=true --knob relative_split_4=true --knob relative_tile_prefill=true
 ```
 
-### Long-context attention (`relative_stripes`)
+### Long context and large batches
 
-`--knob relative_stripes=true`, added to the knobs above, mirrors every stored K
-and V row as its upper 16 bits (the rows are bfloat16 values, so nothing is lost)
-and reads relative attention from the mirrors (`src/mega/inkling_long.metal`).
-Single rows run in stripes of 128 to 512 keys, one threadgroup per KV head and
-stripe, the three query heads of a KV head sharing each load. Batched rows run
-`mk_relative_attention_prefill`'s tiles in two or four stripes of keys, loading
-K and V fragments straight from the mirrors. It needs head size 128 and three
-query heads per KV head; anything else keeps the existing kernels. The mirrors
-add 50% to K and V memory.
+Four more knobs, added to those above, for 4K to 32K prompts:
 
-At 4K to 32K prompt tokens on the M3 Ultra, native decode is 34.0 to 36.6 tokens a
-second against 26.2 to 28.9 for the pinned mlx-lm reference, and native prefill
-630 to 711 against 598 to 677; before the knob MLX led decode at 32K and prefill
-from 8K. Method, the exo comparison, and limits are in
-[benchmarks/inkling-long-context.md](../benchmarks/inkling-long-context.md).
+- `relative_stripes=true` mirrors every stored K and V row as its upper 16 bits
+  (the rows are bfloat16 values, so nothing is lost) and reads relative
+  attention from the mirrors (`src/mega/inkling_long.metal`). Single rows run in
+  stripes of 128 to 512 keys, one threadgroup per KV head and stripe, the three
+  query heads of a KV head sharing each load. Batched rows under 512 run
+  `mk_relative_attention_prefill`'s tiles in two or four stripes of keys; from
+  512 rows they run the staged tiles of `src/mega/inkling_tiles.metal`, adapted
+  from mlx-lm's kernel. It needs head size 128 and three query heads per KV
+  head; anything else keeps the existing kernels. The mirrors add 50% to K and
+  V memory.
+- `scratch_reuse=true` packs scratch states whose lifetimes do not meet into
+  the same arena words (`exec.packScratch`). Without it an Inkling batch above
+  512 rows fails with `ArenaTooLarge`. No arithmetic changes.
+- `expert_tile_rows=4096` lists and multiplies the expert routes of that many
+  token rows together, which fills the 32-row expert tiles. Per-row arithmetic
+  is unchanged.
+- `bf16_matrix_small=true` sends the small relative, router and controller
+  projections through the BF16 matrix tiles. The sums are associated
+  differently, so the bits differ.
 
-The knob changes the association of the dot products and the softmax sum, so it
-is not bit-identical to `relative_split` or `relative_tile_prefill`. On a
-420-token transcript its all-vocabulary logits differ from theirs by up to 3.5
-(RMS 0.4) with the same top token at every checked position, which is also how far
-those paths are from each other and from the reference kernel
-(`tools/nano_inkling_attention_check.py`). A real greedy reply can change wording
-after a few dozen tokens. `nano attnbench [repeats] [keys...]` times one layer's
-attention, each variant against the reference kernel, on synthetic caches.
+On twelve distinct real prompts at 4K to 32K, each from an empty cache on the M3
+Ultra, native decodes at 35.0 to 37.8 tokens a second against 28.3 to 30.6 for
+the pinned mlx-lm reference and 23.0 to 26.5 for exo's MLX adapter. Native
+reaches the first token 24 to 26% sooner than the adapter and 0.6 to 4.1% sooner
+than mlx-lm at its default 2,048-token prefill chunk, but 0.5 to 4.4% later than
+mlx-lm set to 4,096-token chunks. Method, per-task rows and limits are in
+[benchmarks/inkling-long-context.md](../benchmarks/inkling-long-context.md);
+`tools/nano_inkling_tasks.py` is the runner.
+
+`relative_stripes` and `bf16_matrix_small` are not bit-identical to the paths
+they replace. On a 420-token transcript the striped kernels' all-vocabulary
+logits differ from `relative_split` and `relative_tile_prefill` by up to 3.5
+(RMS 0.4) with the same top token at every checked position, which is also how
+far those paths are from each other and from the reference kernel
+(`tools/nano_inkling_attention_check.py`). `bf16_matrix_small` moved logits on a
+4,096-token prompt by up to 13.6 (RMS 2.5) with the same top token at the five
+checked positions; changing only the feed size moves them as far. A real greedy
+reply can change wording after a few dozen tokens. `nano attnbench [repeats]
+[keys...] [rows=N]` times one layer's attention, each variant against the
+reference kernel, on synthetic caches.

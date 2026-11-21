@@ -21,7 +21,7 @@ const usage =
     \\  nano mlx-op linear --m M --k K --n N --group G --weights W --x X --out Y  (src/mega/mlxop.zig)
     \\  nano bench CHECKPOINT --prompt-tokens N [--decode-tokens 256] [--repeats 3] [--bench-tokens F]
     \\        [--decode-mode teacher-forced|greedy | --bench-greedy 1] [--profile-decode 1]
-    \\  nano attnbench [REPEATS] [KEYS...]  (Inkling relative attention on synthetic K/V)
+    \\  nano attnbench [REPEATS] [KEYS...] [rows=N]  (Inkling relative attention on synthetic K/V)
     \\Common: --context N (default 4096), --knobs FILE.json, --knob name=value (repeatable,
     \\        applied after --knobs),
     \\        --sliding-visible N, --embed-round none|bf16.

@@ -1565,6 +1565,17 @@ test "tiled relative attention handles window wrap and a partial query tile" {
             for (tiled, f[p.y + first ..][0 .. rows * stride]) |expected, actual| try close(expected, actual, 0.0001);
         }
 
+        // The reference's staged tiles off the same mirrors: the tiled kernel's bits on an
+        // unwindowed cache; on the wrapped window its tiles start at position 0, not at the
+        // window's first key.
+        @memset(f[p.y..][0 .. (rows + row0) * stride], -7);
+        try gpu.dispatch(ctx, "mk_relative_prefill_tiles", &.{ arena, half_keys, half_values }, &p, 2 * heads * 128, 128);
+        try ctx.finish();
+        for (f[p.y..][0..stride]) |v| try std.testing.expectEqual(@as(f32, -7), v);
+        if (window == 0) {
+            try std.testing.expectEqualSlices(f32, tiled, f[p.y + first ..][0 .. rows * stride]);
+        } else for (tiled, f[p.y + first ..][0 .. rows * stride]) |expected, actual| try close(expected, actual, 0.0001);
+
         const parts = try ctx.alloc(heads * 3 * (dim + 2));
         defer parts.deinit();
         p.rows = 1;

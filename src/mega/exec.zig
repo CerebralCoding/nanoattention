@@ -123,6 +123,8 @@ pub const Engine = struct {
     /// Stripe records of the batched striped attention: batch x heads x max_prefill_stripes.
     prefill_parts: ?metal.Buffer = null,
     const max_prefill_stripes: u32 = 4;
+    /// Rows from which a chunk runs mk_relative_prefill_tiles instead of stripes.
+    const min_tile_rows: u32 = 512;
     const mirror_pad: u32 = 16; // MK_MIRROR_PAD
     const max_stripe_parts: u32 = 1024; // MK_LONG_PARTS
     const stripe_threads: usize = 512; // 16 SIMD groups (MK_LONG_SIMDS)
@@ -144,10 +146,12 @@ pub const Engine = struct {
             gpa.free(caches);
         }
         var total: usize = 0;
+        const packed_scratch = knobs.scratch_reuse;
+        if (packed_scratch) total = try packScratch(gpa, program, batch, context, offsets);
         for (program.states, 0..) |s, i| {
-            offsets[i] = 0;
+            if (!packed_scratch) offsets[i] = 0;
             switch (s.kind) {
-                .tokens, .scratch => {
+                .tokens, .scratch => if (!packed_scratch) {
                     offsets[i] = std.math.cast(u32, total) orelse return error.ArenaTooLarge;
                     total += @as(usize, s.capacity(batch, context)) * s.width;
                     total = (total + 63) / 64 * 64;
@@ -343,7 +347,7 @@ pub const Engine = struct {
             };
             if (part_words != 0) {
                 stripe_parts = try ctx.alloc(part_words);
-                if (knobs.relative_tile_prefill and batch >= 8) prefill_parts = try ctx.alloc(@as(usize, batch) * striped_heads * max_prefill_stripes * 130);
+                if (knobs.relative_tile_prefill and batch >= 8) prefill_parts = try ctx.alloc(@as(usize, @min(batch, min_tile_rows)) * striped_heads * max_prefill_stripes * 130);
             }
         }
         return .{
@@ -619,10 +623,27 @@ pub const Engine = struct {
     }
 
     fn expertTileRows(knobs: knobs_mod.Knobs) u32 {
+        if (knobs.expert_tile_rows != 0) return knobs.expert_tile_rows;
         return if (knobs.expert_mlx_scale) 512 else 128;
     }
 
     fn expertProjection(self: *Engine, kernel: [:0]const u8, bank: ir.PackedProjection, x: ir.View, routes: ir.View, out: ir.View, p: *gpu.ExpertParams, count: usize, input_bf16: bool) !void {
+        // More rows than the route lists and partial sums hold: a tile of rows at a time.
+        const tile_rows = expertTileRows(self.knobs);
+        if (self.expert_tiles != null and p.rows > tile_rows) {
+            const row0 = p.row0;
+            const rows = p.rows;
+            var off: u32 = 0;
+            while (off < rows) : (off += tile_rows) {
+                p.row0 = row0 + off;
+                p.rows = @min(tile_rows, rows - off);
+                try self.expertProjection(kernel, bank, x, routes, out, p, count, input_bf16);
+            }
+            p.row0 = row0;
+            p.rows = rows;
+            self.expert_routes = null; // the lists now hold the last tile's routes only
+            return;
+        }
         const prev_routes = self.expert_routes;
         self.expert_routes = null;
         const v = self.words(x);
@@ -786,7 +807,8 @@ pub const Engine = struct {
                         tileKernel("mk_linear_q4", R, TT);
                     try gpu.dispatch(self.ctx, kernel, &.{ qb[0], qb[1], qb[2], self.arena }, &p, simds * 32, self.knobs.linear_group);
                 } else if (self.knobs.bf16_prefill_matrix and rows >= 16 and l.input_bf16 and
-                    w.tensor.dtype == .bf16 and w.quant == null and p.m >= 512 and p.m % 64 == 0 and p.n >= 512 and p.n % 32 == 0 and
+                    w.tensor.dtype == .bf16 and w.quant == null and p.m >= @as(u32, if (self.knobs.bf16_matrix_small) 64 else 512) and p.m % 64 == 0 and
+                    p.n >= @as(u32, if (self.knobs.bf16_matrix_small) 32 else 512) and p.n % 32 == 0 and
                     w.tensor.offset % 8 == 0 and p.x % 4 == 0 and p.xs % 4 == 0)
                 {
                     const tile: u32 = if (rows >= 128) 32 else 16;
@@ -1070,6 +1092,11 @@ pub const Engine = struct {
                 const end = self.position + row0 + rows;
                 const visible = if (p.window == 0) end else @min(end, p.window);
                 if (self.knobs.relative_tile_prefill and rows >= 8 and a.dim == 128) {
+                    // Chunks that occupy the GPU: the reference's staged tiles, off the mirrors.
+                    if (rows >= min_tile_rows) if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| {
+                        try gpu.dispatch(self.ctx, "mk_relative_prefill_tiles", &.{ self.arena, half_keys, hs[a.values].? }, &p, @as(usize, (rows + 31) / 32) * a.heads * 128, 128);
+                        return;
+                    };
                     if (self.prefill_parts) |records| if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| if (p.capacity >= mirror_pad) {
                         // Two stripes occupy the GPU for a sliding window; an unwindowed walk takes four (`nano attnbench`).
                         p.taps = if (a.window != 0) 2 else max_prefill_stripes;
@@ -1644,6 +1671,159 @@ fn d2EncodeEmbed(self: *Engine, e: @FieldType(ir.Op, "embed"), gen: u32) !void {
 }
 
 // ---- prefill-mlx (exact) ----
+
+/// knobs.scratch_reuse: arena offsets (words) for the tokens and scratch states,
+/// sharing words between states that are never live together; returns the arena
+/// length. A state is live from the first op that touches it to the last, plus
+/// `reuse_margin` ops: with knobs.concurrent_scratch up to 16 single-launch steps
+/// (at most two ops each) run without a barrier between them, so a state's words
+/// are handed on only once every launch that could still be using them has been
+/// ordered before the next writer. The token ids, the logits and the argmax are
+/// read by the host after the forward and keep their own words. Offsets stay
+/// multiples of 64 words, as the unpacked layout's are.
+pub fn packScratch(gpa: std.mem.Allocator, program: *const ir.Program, batch: u32, context: u32, offsets: []u32) !usize {
+    const reuse_margin: u32 = 40;
+    const never: u32 = std.math.maxInt(u32);
+    const n = program.states.len;
+    const first = try gpa.alloc(u32, n);
+    defer gpa.free(first);
+    const last = try gpa.alloc(u32, n);
+    defer gpa.free(last);
+    @memset(first, never);
+    @memset(last, 0);
+    for (program.ops, 0..) |op, i| {
+        var reads: [3]?ir.View = undefined;
+        var write: ?ir.View = null;
+        plan.access(op, &reads, &write);
+        for ([_]?ir.View{ reads[0], reads[1], reads[2], write }) |view| if (view) |v| {
+            first[v.state] = @min(first[v.state], @as(u32, @intCast(i)));
+            last[v.state] = @intCast(i);
+        };
+    }
+    for ([_]ir.StateId{ program.tokens.state, program.logits.state, program.next.state }) |id| {
+        first[id] = 0;
+        last[id] = never;
+    }
+    for (program.traces) |t| last[t.view.state] = never; // read by the host during traced forwards
+    const order = try gpa.alloc(u32, n);
+    defer gpa.free(order);
+    var count: usize = 0;
+    for (program.states, 0..) |s, i| {
+        offsets[i] = 0;
+        if (s.kind == .tokens or s.kind == .scratch) {
+            if (first[i] == never) { // touched by no op: its own words from op 0
+                first[i] = 0;
+                last[i] = never;
+            }
+            order[count] = @intCast(i);
+            count += 1;
+        }
+    }
+    const Ctx = struct {
+        first: []const u32,
+        fn lessThan(c: @This(), a: u32, b: u32) bool {
+            return if (c.first[a] != c.first[b]) c.first[a] < c.first[b] else a < b;
+        }
+    };
+    std.mem.sort(u32, order[0..count], Ctx{ .first = first }, Ctx.lessThan);
+    const Block = struct { off: usize, len: usize, free_from: u32 };
+    var live: std.ArrayList(Block) = .empty; // free_from: the first op that may take the words
+    defer live.deinit(gpa);
+    var free: std.ArrayList(Block) = .empty;
+    defer free.deinit(gpa);
+    var total: usize = 0;
+    for (order[0..count]) |id| {
+        const s = program.states[id];
+        const need = (@as(usize, s.capacity(batch, context)) * s.width + 63) / 64 * 64;
+        var k: usize = 0;
+        while (k < live.items.len) {
+            if (live.items[k].free_from <= first[id]) {
+                try free.append(gpa, live.swapRemove(k));
+            } else k += 1;
+        }
+        var best: ?usize = null;
+        for (free.items, 0..) |b, j| {
+            if (b.len >= need and (best == null or b.len < free.items[best.?].len)) best = j;
+        }
+        var off: usize = undefined;
+        if (best) |j| {
+            off = free.items[j].off;
+            if (free.items[j].len == need) {
+                _ = free.swapRemove(j);
+            } else {
+                free.items[j].off += need;
+                free.items[j].len -= need;
+            }
+        } else {
+            off = total;
+            total += need;
+        }
+        offsets[id] = std.math.cast(u32, off) orelse return error.ArenaTooLarge;
+        if (last[id] != never) try live.append(gpa, .{ .off = off, .len = need, .free_from = last[id] +| (reuse_margin + 1) });
+    }
+    if (total > std.math.maxInt(u32)) return error.ArenaTooLarge;
+    return total;
+}
+
+test "packed scratch: states share words only when their lifetimes are a margin apart" {
+    const inkling = @import("inkling2_loop.zig");
+    var p = try inkling.build(std.testing.allocator, inkling.test_config);
+    defer p.deinit();
+    const gpa = std.testing.allocator;
+    const offsets = try gpa.alloc(u32, p.states.len);
+    defer gpa.free(offsets);
+    const batch = 8;
+    const total = try packScratch(gpa, &p, batch, 64, offsets);
+    var plain: usize = 0;
+    for (p.states) |s| if (s.kind == .tokens or s.kind == .scratch) {
+        plain += (@as(usize, s.capacity(batch, 64)) * s.width + 63) / 64 * 64;
+    };
+    try std.testing.expect(total * 4 < plain);
+    // Recompute every state's op span and check each pair that shares words.
+    const first = try gpa.alloc(u32, p.states.len);
+    defer gpa.free(first);
+    const last = try gpa.alloc(u32, p.states.len);
+    defer gpa.free(last);
+    @memset(first, std.math.maxInt(u32));
+    @memset(last, 0);
+    for (p.ops, 0..) |op, i| {
+        var reads: [3]?ir.View = undefined;
+        var write: ?ir.View = null;
+        plan.access(op, &reads, &write);
+        for ([_]?ir.View{ reads[0], reads[1], reads[2], write }) |view| if (view) |v| {
+            first[v.state] = @min(first[v.state], @as(u32, @intCast(i)));
+            last[v.state] = @intCast(i);
+        };
+    }
+    // Sweep by offset: an interval tree is not needed, the live set at any word is small.
+    const Span = struct { off: usize, end: usize, id: u32 };
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+    for (p.states, 0..) |s, i| if (s.kind == .tokens or s.kind == .scratch) {
+        const len = @as(usize, s.capacity(batch, 64)) * s.width;
+        try std.testing.expect(offsets[i] % 64 == 0 and offsets[i] + len <= total);
+        try spans.append(gpa, .{ .off = offsets[i], .end = offsets[i] + len, .id = @intCast(i) });
+    };
+    const byOff = struct {
+        fn lessThan(_: void, a: Span, b: Span) bool {
+            return a.off < b.off;
+        }
+    }.lessThan;
+    std.mem.sort(Span, spans.items, {}, byOff);
+    var shared: usize = 0;
+    for (spans.items, 0..) |a, i| {
+        for (spans.items[i + 1 ..]) |b| {
+            if (b.off >= a.end) break;
+            shared += 1;
+            for ([_]ir.StateId{ p.tokens.state, p.logits.state, p.next.state }) |keep| {
+                try std.testing.expect(a.id != keep and b.id != keep);
+            }
+            const gap = if (first[a.id] > last[b.id]) first[a.id] - last[b.id] else if (first[b.id] > last[a.id]) first[b.id] - last[a.id] else 0;
+            try std.testing.expect(gap > 40);
+        }
+    }
+    try std.testing.expect(shared > 0);
+}
 
 /// knobs.head_trim: one past the last op that writes a persistent state (a store):
 /// what follows feeds only the logits, so rows without logits can skip it (stock

@@ -54,4 +54,14 @@ follow `mlx/backend/metal/quantized.cpp`. Buffer addressing, ring caches,
 scale-dtype specialization, multi-matrix dispatch and sliding-window key origin
 are adapted for this engine. The shaders retain Apple's copyright and MIT notices.
 
+## mlx-lm Inkling 2 relative attention (`nano`)
+
+`src/mega/inkling_tiles.metal` adapts the batched relative attention kernel of
+mlx-lm's Inkling 2 model (`mlx_lm/models/inkling2/kernels.py`, at `0c4c99192230`
+of `jundot/mlx-lm`; MIT, copyright © 2026 Apple Inc.). The tile loop is the
+source's; operand addressing (arena words, position-major 16-bit K and V
+mirrors, ring slots) and run-time head counts, relative extent and window are
+this engine's. `mk_relative_attention_prefill` in `src/mega/inkling_ops.metal`
+follows the same kernel. The shader retains the copyright and MIT notice.
+
 MLX is copyright © 2023 Apple Inc. and licensed under the MIT License; a copy is included in `licenses/mlx-MIT.txt`. This engine does not link to or execute MLX. MLX is used separately only for optional reference comparisons and benchmarks. The integer proofs do not establish IEEE754 equivalence of MLX's or this implementation's reductions; unchanged numerical checks remain required.

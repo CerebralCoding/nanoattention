@@ -249,7 +249,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Config {
     return c;
 }
 
-const test_config =
+pub const test_config =
     \\{"model_type":"inkling2_loop","dtype":"bfloat16","eos_token_id":200006,
     \\"text_config":{"model_type":"inkling2_loop_text","torch_dtype":"bfloat16",
     \\"model_max_length":1048576,

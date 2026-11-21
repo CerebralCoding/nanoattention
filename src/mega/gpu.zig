@@ -106,7 +106,7 @@ comptime {
     if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 4 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
 }
 
-pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
     // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
     // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
     "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");

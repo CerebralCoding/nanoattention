@@ -77,7 +77,7 @@ fn covers(a: ir.View, b: ir.View) bool {
 }
 
 /// Views an op reads and writes (scratch/tokens only; caches are persistent).
-fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
+pub fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
     reads.* = .{ null, null, null };
     writes.* = null;
     switch (op) {

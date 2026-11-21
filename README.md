@@ -238,8 +238,10 @@ faster on prefill for both. See [measurements and reproduction commands](benchma
 **Experimental: Inkling 2 Mini.** `nano` can inspect and run the original
 mixed-precision checkpoint with token IDs. MLX parity has not passed; see the
 [verified workflow and limits](docs/MEGAKERNEL.md#inkling-2-mini-experimental).
-With the opt-in knobs it decodes and prefills faster than the pinned MLX
-reference at 4K to 32K prompt tokens on the tested M3 Ultra
+With the opt-in knobs, on twelve real prompts of 4K to 32K tokens on the tested
+M3 Ultra, it decodes 22 to 25% faster than the pinned MLX reference. It reaches
+the first token sooner than MLX at MLX's default prefill chunk, and later (0.5
+to 4.4%) than MLX with a tuned chunk
 ([measurements](benchmarks/inkling-long-context.md)).
 
 ## Development

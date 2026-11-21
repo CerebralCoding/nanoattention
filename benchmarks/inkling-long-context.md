@@ -1,137 +1,232 @@
-# Inkling 2 Mini: striped relative attention at 4K to 32K
+# Inkling 2 Mini at 4K to 32K: twelve real tasks, cold cache
 
-`--knob relative_stripes=true` (on top of the tuned Inkling knobs in
-[docs/MEGAKERNEL.md](../docs/MEGAKERNEL.md#inkling-2-mini-experimental)) changes how
-relative attention reads its K and V caches. Before it, native decode fell from 31
-to 23 tokens a second between 4K and 32K prompt tokens and lost to the pinned
-mlx-lm reference at 32K; native prefill trailed it from 8K up. With it, native
-leads both references at every measured length, on decode and on prefill.
+Twelve different prompts built from real text (Zig source, Python tools, Markdown
+documentation, each at 4,096, 8,192, 16,384 and 32,768 prompt tokens, each with
+its own instruction), every one timed from an empty cache. With the opt-in knobs
+in [docs/MEGAKERNEL.md](../docs/MEGAKERNEL.md#inkling-2-mini-experimental):
+
+- **Decode:** native is 22 to 25% faster than the pinned mlx-lm reference and 43
+  to 53% faster than exo's MLX adapter, in every paired sample.
+- **First token against exo's adapter:** native is 24 to 26% sooner, in every
+  pair.
+- **First token against mlx-lm depends on mlx-lm's prefill chunk.** At its
+  default of 2,048 tokens native is 0.6 to 4.1% sooner, in all 36 pairs. With
+  mlx-lm set to 4,096-token chunks, its best size here, native is **0.5 to 4.4%
+  later** and wins 2 of 24 pairs. Native does not beat a tuned mlx-lm on prefill.
 
 One Apple M3 Ultra (60 GPU cores, 256 GB), the original
 `thinkingmachines/Inkling-2-Mini` checkpoint (`ed40e7da625f`), `nano` built
-ReleaseSafe. Seeded token IDs, a cold cache, 128-token prefill chunks, then 25
-greedy tokens; decode rates time the 24 intervals after the first. Each engine
-runs in its own process under one inference lock, one warmup then one timed run a
-process, engine order alternating between rounds. Tokens a second, medians.
-Raw samples: [`inkling-long-context.json`](inkling-long-context.json).
+ReleaseSafe, `mlx==0.32.4`, `mlx-lm` at `0c4c99192230`. Pooled samples:
+[`inkling-long-context.json`](inkling-long-context.json).
 
-## Against mlx-lm, run directly
+## Protocol
 
-`tools/nano_inkling_bench.py --decode-mode greedy`; `mlx==0.32.4`, `mlx-lm` at
-`0c4c99192230`. MLX enqueues the next step before reading back the previous token.
+`tools/nano_inkling_tasks.py`. `build` cuts the repository's own text into
+twelve prompts that share no document text, renders each with the checkpoint's
+chat template, and writes a 4,400-token warm-up prompt from a fourth kind of
+text (the Lean proofs) that no task uses. `run` gives every (task, engine) its
+own process under one inference lock, engine order rotating from task to task:
 
-| Prompt | Native decode | MLX decode | Lead | Native prefill | MLX prefill | Lead | Rounds |
+- **native:** `nano session` answers the warm-up prompt, then the task with
+  `reset: true`. The runner fails unless the reply reports zero reused prefix
+  tokens and an empty cache. 4,096-row prefill batches.
+- **mlx:** the warm-up prompt on its own cache, then the task on a new
+  `make_cache()`. Prefill is mlx-lm's own loop (chunks evaluated for cache state,
+  then the last token alone for logits); decode enqueues the next step before
+  reading back the previous token, as mlx-lm's generation loop does.
+- **exo:** exo `a60b95698ca8` serving a local text-only MLX-VLM adapter
+  (`434a1bedd1e8`) with `--no-batch` and direct cold prefill, through its HTTP
+  benchmark route with the prefix cache off. That route cannot warm up on a
+  different prompt, so exo warms up on the prompt it is then timed on, which can
+  only help exo. Stock exo does not load this checkpoint; this is not a
+  comparison with an exo release.
+
+Each sample is the seconds from the request to the first generated token and
+the decode rate over the 31 single-token forwards after it. Greedy. Five rounds
+of native; mlx-lm at its default chunk in rounds 1 to 3 and at 4,096 in rounds 4
+and 5; exo in round 1.
+
+## Results
+
+Medians over a length's three tasks and all rounds: seconds to first token /
+decode tokens a second. The last three columns are native's first-token time and
+decode rate relative to that engine (negative time is sooner).
+
+| Prompt | Native | MLX, 2,048 chunk | MLX, 4,096 chunk | exo adapter | vs MLX 2,048 | vs MLX 4,096 | vs exo |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4,096 | 36.61 | 28.36 | +29% | 710.7 | 676.7 | +5.0% | 5 |
-| 8,192 | 36.00 | 28.65 | +26% | 695.0 | 662.8 | +4.9% | 5 |
-| 16,384 | 35.16 | 28.89 | +22% | 672.6 | 640.3 | +5.0% | 5 |
-| 32,768 | 33.99 | 26.21 | +30% | 630.0 | 597.7 | +5.4% | 2 |
+| 4,096 | 3.30 s / 37.8 | 3.44 s / 30.6 | 3.28 s / 30.5 | 4.45 s / 26.5 | -4.1% / +24% | +0.5% / +24% | -26.0% / +43% |
+| 8,192 | 6.74 s / 37.4 | 6.95 s / 30.2 | 6.60 s / 29.9 | 8.89 s / 25.6 | -3.0% / +24% | +2.2% / +25% | -24.1% / +46% |
+| 16,384 | 14.06 s / 36.5 | 14.28 s / 29.9 | 13.62 s / 29.7 | 18.56 s / 24.9 | -1.6% / +22% | +3.2% / +23% | -24.3% / +46% |
+| 32,768 | 30.24 s / 35.0 | 30.41 s / 28.3 | 28.96 s / 28.4 | 40.53 s / 23.0 | -0.6% / +24% | +4.4% / +23% | -25.4% / +53% |
 
-Native won decode in all 17 rounds and prefill in 16; the one prefill loss was a
-16K round where native took 26.1 s instead of its usual 24.3 s. At 8K, 16K and
-32K both engines produced the same 25 token IDs in every round. **At 4K they did
-not**: MLX's IDs differ from native's from the first generated token, as they did
-before this change, so the 4K row compares speed on different outputs.
+| Against | Paired samples | Native sooner to first token | Native faster decode | Tasks with the same first 31 IDs |
+| --- | ---: | ---: | ---: | ---: |
+| MLX, 2,048 chunk | 36 | 36 | 36 | 8 of 12 |
+| MLX, 4,096 chunk | 24 | 2 | 24 | 6 of 12 |
+| exo adapter | 12 | 12 | 12 | 7 of 12 |
 
-The same workload before the change (same checkpoint, machine and protocol, two
-rounds, an earlier session): native decode 31.33 / 29.69 / 26.89 / 22.78 and
-prefill 670.9 / 640.9 / 599.1 / 531.6, against MLX decode 30.35 / 29.94 / 27.17 /
-27.57 and prefill 679.0 / 664.4 / 641.4 / 599.5. MLX's decode figures move by a
-few percent between sessions (27.57, then 26.21, at 32K).
+The two first-token wins against 4,096-chunk MLX are both at 4K. The narrowest
+win against 2,048-chunk MLX is at 32K, where native's slowest sample on a task
+is 0.2% ahead of MLX's fastest.
 
-## Against exo's MLX adapter
+Per task, medians of that task's samples:
 
-exo `a60b95698ca8` serving a local text-only MLX-VLM adapter (`434a1bedd1e8`) with
-`--no-batch` and direct cold prefill, through its HTTP benchmark endpoint; token
-IDs and timing are recorded inside its request runner. Stock exo does not load
-this checkpoint, so this is not a comparison with an exo release. "First token"
-is prompt execution to the first generated token; the two prefills hand off their
-last two tokens differently.
+| Task | Native | MLX, 2,048 chunk | MLX, 4,096 chunk | exo adapter |
+| --- | ---: | ---: | ---: | ---: |
+| zig-4096 | 3.28 / 37.9 | 3.44 / 30.1 | 3.31 / 30.2 | 4.44 / 26.5 |
+| zig-8192 | 6.73 / 37.4 | 6.93 / 30.2 | 6.60 / 29.1 | 8.92 / 25.6 |
+| zig-16384 | 14.05 / 36.4 | 14.30 / 29.3 | 13.61 / 24.0 | 18.56 / 24.9 |
+| zig-32768 | 30.24 / 35.0 | 30.40 / 28.1 | 28.96 / 26.6 | 40.47 / 23.0 |
+| python-4096 | 3.30 / 37.8 | 3.44 / 30.6 | 3.29 / 31.0 | 4.45 / 25.8 |
+| python-8192 | 6.74 / 37.4 | 6.93 / 29.5 | 6.59 / 29.5 | 8.89 / 25.6 |
+| python-16384 | 14.06 / 36.5 | 14.26 / 30.0 | 13.59 / 30.1 | 18.49 / 24.9 |
+| python-32768 | 30.17 / 35.0 | 30.62 / 28.3 | 28.96 / 28.6 | 40.53 / 22.6 |
+| docs-4096 | 3.31 / 37.8 | 3.45 / 31.0 | 3.28 / 30.0 | 4.45 / 26.5 |
+| docs-8192 | 6.76 / 37.4 | 6.95 / 30.2 | 6.60 / 30.6 | 8.87 / 25.9 |
+| docs-16384 | 14.10 / 36.5 | 14.28 / 30.1 | 13.69 / 23.9 | 18.96 / 25.1 |
+| docs-32768 | 30.27 / 35.0 | 30.40 / 28.5 | 29.06 / 28.4 | 40.83 / 23.0 |
 
-| Prompt | Native decode | exo decode | Lead | Native first token | exo first token | Pairs |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4,096 | 36.50 | 25.27 | +44% | 5.76 s | 6.86 s | 2 |
-| 8,192 | 35.72 | 25.09 | +42% | 11.81 s | 13.77 s | 2 |
-| 16,384 | 35.09 | 24.54 | +43% | 24.43 s | 28.66 s | 3 |
-| 32,768 | 33.69 | 21.01 | +60% | 52.48 s | 64.51 s | 2 |
+The 4,096-chunk MLX arm has two samples a task; its 24.0 and 23.9 at 16K are
+medians of one ordinary and one slow sample.
 
-Native won decode and first token in all nine pairs, and all 25 token IDs matched
-in every pair at every length. exo's 16K decode samples were 24.54, 16.00 and
-24.65; the third pair was added because of the slow one, and the median keeps all
-three.
+**Outputs.** Native produced the same 32 IDs for a task in all five rounds. The
+engines agree on the first 31 IDs for only some tasks (table above), and
+mlx-lm's own output changes with its chunk size on five of them. Every reply
+decodes to on-topic reasoning text about the task; where they differ they
+differ in wording a few tokens in ("Need answer review of Zig code. Need
+inspect carefully. User asks…" against "…Need list three most likely bugs…").
+So these rows compare speed on outputs that are not always the same tokens.
+
+### Chunk sizes
+
+Each engine was swept before the rounds, on one or two tasks:
+
+| Engine | Chunk | Result |
+| --- | ---: | --- |
+| native | 128 | 606 tok/s prefill, python-16384 |
+| native | 512 | 924 tok/s, docs-4096 |
+| native | 4,096 | 1,243 tok/s (3.30 s), 4K tasks |
+| mlx-lm | 1,024 | 31.71 s to first token, zig-32768 |
+| mlx-lm | 2,048 (default) | about 30.4 s |
+| mlx-lm | 2,560 / 3,584 | 30.13 s / 29.30 s |
+| mlx-lm | 4,096 | 29.04 s |
+| mlx-lm | 8,192 | 29.17 s |
+| exo adapter | 2,048 | 4.52 s docs-4096, 18.58 s python-16384 |
+| exo adapter | 4,096 | 4.89 s, 20.27 s |
+
+Native could not take batches above 512 rows before `scratch_reuse` (the
+scratch arena exceeded its limit).
+
+### Where native's prefill time goes
+
+A profiled 32K prefill in 4,096-row chunks (3.84 s a chunk on average):
+`mk_expert_block_up_nv` 30%, `mk_bf16_prefill_matrix32` 18%,
+`mk_relative_prefill_tiles` 17%, `mk_expert_block_down_nv` 16%. Fitting the four
+lengths, native's cost per chunk is about 2.5% above 4,096-chunk MLX's and its
+cost that grows with context (global-layer attention) about 19% above, which is
+why the gap widens from 0.5% at 4K to 4.4% at 32K.
 
 ## What changed
 
-Every K and V row Inkling stores is a bfloat16 value held in a float. With the
-knob, each store also writes the row's upper 16 bits to a mirror, and attention
-reads the mirror: the same numbers at half the memory traffic.
+All opt-in; the reference executor's defaults are unchanged.
 
-- **Decode** (`mk_relative_long_keys`, `mk_relative_long_merge`): the keys a row
-  sees are cut into stripes of 128 to 512, one threadgroup of 16 SIMD groups per
-  (KV head, stripe). The three query heads of a KV head share every key and value
-  load. A stripe is reduced against its own maximum and the stripes are merged
-  against the global one.
-- **Prefill** (`mk_relative_prefill_stripes`, `mk_relative_prefill_merge`): the
-  16-key tiles of `mk_relative_attention_prefill`, cut into two stripes of keys
-  for a sliding window and four for a global layer, with the K and V fragments
-  loaded straight from the mirrors as bfloat16 matrices instead of being staged
-  through threadgroup memory as FP16.
+- **`relative_stripes`** (decode): every stored K and V row is a bfloat16 value
+  held in a float, so each store also writes its upper 16 bits to a mirror and
+  attention reads the mirror, the same numbers at half the memory traffic. A
+  single row's keys are cut into stripes of 128 to 512, one threadgroup of 16
+  SIMD groups per (KV head, stripe), the three query heads of a KV head sharing
+  every load (`mk_relative_long_keys`, `mk_relative_long_merge`).
+- **`relative_stripes`** (prefill): under 512 rows, the 16-key tiles of
+  `mk_relative_attention_prefill` in two or four stripes of keys, fragments
+  loaded straight from the mirrors (`mk_relative_prefill_stripes`). From 512
+  rows, `mk_relative_prefill_tiles` (`src/mega/inkling_tiles.metal`), adapted
+  from mlx-lm's batched relative attention kernel (MIT; see
+  `THIRD_PARTY_NOTICES.md`) to read the mirrors and the ring-cache layout.
+- **`scratch_reuse`**: scratch states whose lifetimes do not meet share arena
+  words (`exec.packScratch`). No arithmetic changes. It is what lets Inkling
+  take batches above 512 rows.
+- **`expert_tile_rows`**: how many token rows have their expert routes listed
+  and multiplied together. Each of the 128 experts sees about a sixteenth of the
+  rows, so 512 rows leave most 32-row tiles partly empty; 4,096 fill them.
+- **`bf16_matrix_small`**: the BF16 matrix tiles also take the small
+  projections (relative, router, controller) that otherwise each launch a small
+  tile kernel.
 
-`nano attnbench` times one layer's attention on synthetic K and V. On this
-machine, a single decode row over a global layer went from 318 to 60 us at 4,096
-keys and from 2,234 to 305 us at 32,768; over a full sliding window from 100 to
-27 us. A 128-row prefill chunk went from 1,740 to 895 us at 4,096 keys, from
-14,018 to 6,487 us at 32,768, and from 506 to 276 us on a sliding window. A
-decode-only profile at a 4K prompt put attention at 17% of GPU time before the
-change, so most of a token is still the dense projections, experts and norms.
+`nano attnbench` times one layer's attention on synthetic K and V. A single
+decode row over a global layer went from 318 to 60 us at 4,096 keys and from
+2,234 to 305 us at 32,768; over a full sliding window from 100 to 27 us. A
+4,096-row prefill chunk over 32,768 keys takes 320 ms with the tiled kernel,
+165 ms in stripes and 115 ms with the staged tiles; mlx-lm's own operation takes
+108 ms on the same shapes.
+
+Tried and removed, none faster on a real task: 64-row and 64-column expert
+tiles, paired expert weight fragments, a 16-row dense matrix tile, and for
+prefill attention 32-key tiles, 64 or 128 query rows a threadgroup, FP16 against
+bfloat16 fragments, a head-major mirror layout, and one staged tile shared by
+the three query heads of a KV head.
 
 ## Correctness
 
-- `zig build test` and `zig build test-mega` pass. The new kernel tests compare
-  the striped kernels with `mk_relative_attention` over mirrors written by
-  `mk_pack_bf16`: a wrapped sliding window, uneven stripes, more stripes than a
-  row tile has tiles, a partial query tile, and a one-key window (decode within 1e-5, prefill
-  within 1e-4 of the tiled kernel).
-- The knob is **not bit-identical** to the paths it replaces: the dot products
-  and the softmax sum are associated differently. On a 420-token chat transcript
-  (`tools/nano_inkling_attention_check.py`, all-vocabulary logits at 24
-  positions), striped decode differs from split decode by at most 3.53 (RMS
-  0.36) and striped prefill from tiled prefill by at most 3.06 (RMS 0.38), with
-  the top token equal at 24 of 24 positions. The existing paths differ from each
-  other by as much on the same transcript: the reference kernel against split
-  decode by 4.69 (RMS 0.39), split decode against tiled prefill by 5.73 (RMS
-  0.45). Small differences are amplified by bfloat16 rounding and expert routing.
-- On the seeded fixtures the 25 greedy IDs are those of the previous tuned path
-  at all four lengths. On a real prompt they are not: a greedy reply to "Write an
-  LRU cache in Python..." matched the previous path's for its first 20 tokens and
-  then took different wording (639 tokens instead of 744, both ending on EOS,
-  both correct code).
+- `zig build test` and `zig build test-mega` pass. Kernel tests compare the
+  striped kernels with `mk_relative_attention` over mirrors written by
+  `mk_pack_bf16` (a wrapped sliding window, uneven stripes, more stripes than a
+  row tile has tiles, a partial query tile, a one-key window), and the staged
+  tiles with `mk_relative_attention_prefill` (bit-identical on an unwrapped
+  cache, within 1e-4 on a wrapped window). `packScratch` has its own test.
+- **Bit-identical to the path they replace:** `scratch_reuse` (logits at feeds
+  512 and 1) and `expert_tile_rows`.
+- **Not bit-identical:** `relative_stripes` and `bf16_matrix_small`; both
+  associate sums differently. On a 420-token transcript
+  (`tools/nano_inkling_attention_check.py`, 24 positions), striped decode
+  differs from split decode by at most 3.53 (RMS 0.36) and striped prefill from
+  tiled prefill by at most 3.06 (RMS 0.38), top token equal at 24 of 24; the
+  existing paths differ from each other by as much. `bf16_matrix_small` on a
+  4,096-token prompt at five positions: maximum logit differences from 0.15 to
+  13.6 (RMS 2.5), top token equal at 5 of 5; changing only the feed size from
+  128 to 4,096 moves the logits as far (maximum 13.1). Small differences are
+  amplified by bfloat16 rounding and expert routing.
+- A real greedy reply changes wording: "Write an LRU cache in Python..." matched
+  the previous tuned path for 20 tokens, then diverged (639 tokens instead of
+  744, both ending on EOS, both correct code).
 - MLX logits parity for Inkling remains unestablished, as before.
+
+## Superseded: seeded prompts
+
+The first version of this file reported native ahead of mlx-lm on prefill by
+about 5% at every length. That measurement fed both engines one seeded
+pseudo-random token stream per length in 128-token chunks and warmed each
+process up on the prompt it then timed. It held for that setup only: mlx-lm
+prefills about 1.8 times faster in 2,048-token chunks than in 128-token ones
+(1,147 against 640 tokens a second at 16K), and random IDs are not a task.
+Those samples are kept in
+[`inkling-long-context-seeded.json`](inkling-long-context-seeded.json); the
+decode leads they showed (22 to 30% over mlx-lm, 42 to 60% over exo's adapter)
+are in line with the real-task ones above, the prefill lead is not.
 
 ## Limits
 
-One Mac, one request at a time, seeded prompts, 25 generated tokens, no sampling.
-The knob needs head size 128 and three query heads per KV head (Inkling's
-geometry); other shapes fall back to the existing kernels. The mirrors add 50% to
-K and V memory. The 32K MLX row has two rounds. Nothing here measures serving, streaming
-or multi-node exo.
+One Mac, one request at a time, greedy, 32 generated tokens, text from one
+repository. exo is exo's server around a local adapter, warmed on the timed
+prompt, with one round. The 4,096-chunk MLX arm has two rounds. Token IDs
+differ between engines on a third to a half of the tasks. `relative_stripes`
+needs head size 128 and three query heads per KV head (other shapes keep the
+existing kernels) and its mirrors add 50% to K and V memory. Nothing here
+measures sampling, serving, streaming or multi-node exo.
 
 ## Reproduce
 
 ```sh
-python3 tools/nano_inkling_bench.py zig-out/bin/nano "$CHECKPOINT" \
-  --mlx-python "$MLX_PYTHON" --lock "$NANO_LOCK" --prompt 16384 --batch 128 --decode 24 \
-  --decode-mode greedy --rounds 3 --timeout 720 \
-  --knob expert_simd=true --knob expert_wide_dot=true --knob expert_gate_pair=true \
-  --knob expert_prefill=true --knob expert_wide_k=true --knob expert_bf16_tiles=true \
-  --knob expert_mlx_scale=true --knob bf16_linear_tile=true --knob bf16_prefill_tile=8 \
-  --knob bf16_prefill_matrix=true --knob bf16_decode_vec=true --knob fuse_bf16_cast=true \
-  --knob concurrent_scratch=true --knob relative_split=true --knob relative_split_4=true \
-  --knob relative_tile_prefill=true --knob relative_stripes=true
-python3 tools/guarded_run.py --lock "$NANO_LOCK" --timeout 300 -- zig-out/bin/nano attnbench 20 1024 4096 32768
-python3 tools/guarded_run.py --lock "$NANO_LOCK" --timeout 900 -- \
-  python3 tools/nano_inkling_attention_check.py zig-out/bin/nano "$CHECKPOINT" ids.json /tmp/attention-check
+python3 tools/nano_inkling_tasks.py build "$CHECKPOINT" tasks.json   # needs transformers
+python3 tools/nano_inkling_tasks.py run zig-out/bin/nano "$CHECKPOINT" tasks.json r1.json \
+  --mlx-python "$MLX_PYTHON" --lock "$NANO_LOCK" --engines native,mlx
+python3 tools/nano_inkling_tasks.py run zig-out/bin/nano "$CHECKPOINT" tasks.json r4.json \
+  --mlx-python "$MLX_PYTHON" --lock "$NANO_LOCK" --engines native,mlx --mlx-chunk 4096
+python3 tools/nano_inkling_tasks_summary.py tasks.json summary.json r1.json r4.json
+python3 tools/guarded_run.py --lock "$NANO_LOCK" --timeout 300 -- \
+  zig-out/bin/nano attnbench 20 1024 4096 32768 rows=4096
 ```
 
-The exo arm needs the pinned exo checkout, its environment and the local adapter;
-it is not part of this repository.
+`build` reads the repository it is run in, so prompts built at another commit
+contain different text. The knob list is `KNOBS` in the tool. The exo arm
+(`--engines native,mlx,exo --exo-runner ...`) needs the pinned exo checkout, its
+environment and the local adapter; they are not part of this repository.
