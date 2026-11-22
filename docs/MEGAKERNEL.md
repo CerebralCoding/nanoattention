@@ -351,7 +351,13 @@ output gate), and per router the 8 chosen experts and their weights
 router and disables `tail_trim` and concurrent launches for the forward; it
 changes no arithmetic (tapped and untapped all-vocabulary logits of a real
 5,500-token sequence were compared with `cmp`, same chunking: identical, and
-the fixture test checks the same). `--heads-from` alone gives the same
+the fixture test checks the same). `--attention-out PATH` (with `--heads-out`) also records where the attention looks:
+per forward, visit and row the weight every key position gets, averaged over the
+24 heads (`PATH`, `[forward][visit][row][context]` floats) and the share the sink
+takes (`PATH.sink`), recomputed on the host in f64 from the engine's own queries,
+distance bias, sink and cached keys. `tap_attention_worst` in the summary is the
+largest difference between the host's weighted sum of values and the engine's
+output. `--heads-from` alone gives the same
 chunking with the tap off. Every head's norm is at most 11.31, the norm of one
 unit-RMS value vector. `video/agent/make_heads.py` turns it into the data of the
 video's heads shot.

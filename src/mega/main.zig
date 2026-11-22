@@ -15,7 +15,7 @@ const usage =
     \\nano: model-agnostic Zig + Metal megakernel (Apple Silicon)
     \\  nano inspect CHECKPOINT
     \\  nano eval CHECKPOINT --tokens-file F [--feed T] [--positions-file F | --positions all|i,j,..]
-    \\        [--logits-out PATH] [--hidden-out PATH] [--greedy N] [--heads-out PATH [--heads-from POS]]
+    \\        [--logits-out PATH] [--hidden-out PATH] [--greedy N] [--heads-out PATH [--heads-from POS] [--attention-out PATH]]
     \\  nano generate CHECKPOINT --tokens-file F [--max-tokens N]
     \\  nano session CHECKPOINT [--context N]
     \\  nano mlx-op linear --m M --k K --n N --group G --weights W --x X --out Y  (src/mega/mlxop.zig)
@@ -107,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     var greedy: u32 = 0;
     var heads_out: ?[]const u8 = null;
     var heads_from: u32 = 0;
+    var attention_out: ?[]const u8 = null;
     var max_tokens: u32 = 32;
     var bench_input: bench.Input = .{};
     // --knob flags apply after --knobs FILE whatever their order on the line.
@@ -142,6 +143,8 @@ pub fn main(init: std.process.Init) !void {
             feed = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--heads-out")) {
             heads_out = value;
+        } else if (std.mem.eql(u8, flag, "--attention-out")) {
+            attention_out = value;
         } else if (std.mem.eql(u8, flag, "--heads-from")) {
             heads_from = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--greedy")) {
@@ -200,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
             while (iter.next()) |item| try list.append(a, try std.fmt.parseInt(u32, item, 10));
             positions = list.items;
         }
-        return evaluate(&loaded.engine, a, prompt, positions, feed, logits_out, hidden_out, greedy, heads_out, heads_from);
+        return evaluate(&loaded.engine, a, prompt, positions, feed, logits_out, hidden_out, greedy, heads_out, heads_from, attention_out);
     }
     return error.UnknownCommand;
 }
@@ -275,7 +278,7 @@ fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max
     try io.out("\n");
 }
 
-fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, positions: []const u32, feed_arg: u32, logits_out: ?[]const u8, hidden_out: ?[]const u8, greedy: u32, heads_out: ?[]const u8, heads_from: u32) !void {
+fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, positions: []const u32, feed_arg: u32, logits_out: ?[]const u8, hidden_out: ?[]const u8, greedy: u32, heads_out: ?[]const u8, heads_from: u32, attention_out: ?[]const u8) !void {
     // A feed beyond a context-clamped batch (engine.batch == context >= prompt)
     // means the whole prompt in one forward; it was rejected as InvalidFeed,
     // which made QD admission reject every batch > context (prefill search).
@@ -301,7 +304,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
     var i: u32 = 0;
     // --heads-out: from position `heads_from` on, one row a forward with the engine's tap on
     // (what each attention visit's heads and each router did); before it, the usual feed.
-    var tap: exec.Tap = .{ .gpa = a };
+    var tap: exec.Tap = .{ .gpa = a, .attention = attention_out != null, .context = T };
     defer engine.tap = null;
     while (i < T) {
         var n = @min(feed, T - i);
@@ -343,8 +346,14 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
         try io.writeFile(a, path, std.mem.sliceAsBytes(tap.norms.items));
         try io.writeFile(a, try std.fmt.allocPrint(a, "{s}.routes", .{path}), std.mem.sliceAsBytes(tap.routes.items));
     }
+    if (attention_out) |path| {
+        try io.writeFile(a, path, std.mem.sliceAsBytes(tap.weights.items));
+        try io.writeFile(a, try std.fmt.allocPrint(a, "{s}.sink", .{path}), std.mem.sliceAsBytes(tap.sinks.items));
+    }
     const summary = .{
         .tap_forwards = tap.forwards,
+        .tap_context = tap.context,
+        .tap_attention_worst = tap.worst,
         .tap_heads = tap.heads,
         .tap_top_k = tap.top_k,
         .tap_windows = tap.windows.items,

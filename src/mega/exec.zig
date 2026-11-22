@@ -56,8 +56,23 @@ pub const Tap = struct {
     norms: std.ArrayList(f32) = .empty,
     routes: std.ArrayList(f32) = .empty,
     windows: std.ArrayList(u32) = .empty,
+    /// `nano eval --attention-out`: also record, per forward, attention visit and row,
+    /// `context` floats (the weight each key position gets, averaged over the heads; zero
+    /// where a key is not visible) in `weights`, and the average share the sink takes in
+    /// `sinks`. Recomputed on the host from the engine's own queries, bias, sink and
+    /// cached keys; `worst` is the largest difference between the host's weighted sum of
+    /// values and the engine's output over everything recorded.
+    attention: bool = false,
+    context: u32 = 0,
+    weights: std.ArrayList(f32) = .empty,
+    sinks: std.ArrayList(f32) = .empty,
+    scratch: std.ArrayList(f64) = .empty,
+    worst: f32 = 0,
 
     pub fn deinit(self: *Tap) void {
+        self.weights.deinit(self.gpa);
+        self.sinks.deinit(self.gpa);
+        self.scratch.deinit(self.gpa);
         self.norms.deinit(self.gpa);
         self.routes.deinit(self.gpa);
         self.windows.deinit(self.gpa);
@@ -663,6 +678,7 @@ pub const Engine = struct {
                     for (floats[o.off + r * o.stride + h * a.dim ..][0..a.dim]) |x| sum += @as(f64, x) * x;
                     try tap.norms.append(tap.gpa, @floatCast(@sqrt(sum)));
                 };
+                if (tap.attention) try self.tapAttention(tap, a, T);
             },
             .route_topk => |r| {
                 try self.ctx.finish();
@@ -672,6 +688,65 @@ pub const Engine = struct {
                 for (0..T) |row| try tap.routes.appendSlice(tap.gpa, floats[o.off + row * o.stride ..][0 .. 2 * r.top_k]);
             },
             else => {},
+        }
+    }
+
+    /// Tap.attention: what mk_relative_attention computes for each row and head, again on
+    /// the host in f64: the softmax over the visible keys and the sink, its weighted sum of
+    /// values (compared with the engine's output), and the weights averaged over the heads.
+    fn tapAttention(self: *Engine, tap: *Tap, a: anytype, T: u32) !void {
+        const arena = self.arena.floats();
+        const q = self.words(a.q);
+        const bias = self.words(a.bias);
+        const sink = self.words(a.sink);
+        const o = self.words(a.out);
+        const capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+        const keys = self.caches[a.keys].?.floats();
+        const values = self.caches[a.values].?.floats();
+        const width = a.kv_heads * a.dim;
+        const group = a.heads / a.kv_heads;
+        const first_weight = tap.weights.items.len;
+        const first_sink = tap.sinks.items.len;
+        try tap.weights.appendNTimes(tap.gpa, 0, @as(usize, T) * tap.context);
+        try tap.sinks.appendNTimes(tap.gpa, 0, T);
+        const per_head = 1.0 / @as(f64, @floatFromInt(a.heads));
+        for (0..T) |r| {
+            const position: u32 = self.position + @as(u32, @intCast(r));
+            if (position >= tap.context) return error.TapContextTooSmall;
+            const first: u32 = if (a.window != 0 and position + 1 > a.window) position + 1 - a.window else 0;
+            const count = position + 1 - first;
+            try tap.scratch.resize(tap.gpa, count);
+            const scores = tap.scratch.items;
+            const row_weights = tap.weights.items[first_weight + r * tap.context ..][0..tap.context];
+            for (0..a.heads) |h| {
+                const kvh = h / group;
+                const qp = arena[q.off + r * q.stride + h * a.dim ..][0..a.dim];
+                const sink_logit: f64 = arena[sink.off + r * sink.stride + h];
+                var maximum = sink_logit;
+                for (0..count) |j| {
+                    const slot = (first + j) % capacity;
+                    const kp = keys[slot * width + kvh * a.dim ..][0..a.dim];
+                    var dot: f64 = 0;
+                    for (qp, kp) |x, y| dot += @as(f64, x) * y;
+                    const distance = position - (first + @as(u32, @intCast(j)));
+                    const relative: f64 = if (distance < a.relative_extent) arena[bias.off + r * bias.stride + h * a.relative_extent + distance] else 0;
+                    scores[j] = dot * a.scale + relative;
+                    maximum = @max(maximum, scores[j]);
+                }
+                var denominator = @exp(sink_logit - maximum);
+                for (scores) |*s| {
+                    s.* = @exp(s.* - maximum);
+                    denominator += s.*;
+                }
+                tap.sinks.items[first_sink + r] += @floatCast(@exp(sink_logit - maximum) / denominator * per_head);
+                for (0..count) |j| row_weights[first + j] += @floatCast(scores[j] / denominator * per_head);
+                const out = arena[o.off + r * o.stride + h * a.dim ..][0..a.dim];
+                for (0..a.dim) |d| {
+                    var acc: f64 = 0;
+                    for (0..count) |j| acc += scores[j] / denominator * values[((first + j) % capacity) * width + kvh * a.dim + d];
+                    tap.worst = @max(tap.worst, @as(f32, @floatCast(@abs(acc - out[d]))));
+                }
+            }
         }
     }
 

@@ -781,7 +781,7 @@ test "native Inkling fixture matches sequential, batched and continued replay pa
         defer plain.deinit();
         var tapped = try Engine.init(gpa, &p, ctx, &store, .{ .batch = 8 }, 16);
         defer tapped.deinit();
-        var tap: @import("exec.zig").Tap = .{ .gpa = gpa };
+        var tap: @import("exec.zig").Tap = .{ .gpa = gpa, .attention = true, .context = 4 };
         defer tap.deinit();
         tapped.tap = &tap;
         try plain.forward(tokens[0..3], 0);
@@ -807,6 +807,31 @@ test "native Inkling fixture matches sequential, batched and continued replay pa
         }
         try std.testing.expect(lit > tap.norms.items.len / 2);
         try std.testing.expectEqual(@as(usize, 48 * (3 + 1) * 2 * tap.top_k), tap.routes.items.len);
+        // Attention weights: one row of `context` per visit and row; each row with its sink sums to
+        // one, nothing beyond the row's position or outside a sliding window, and the host's
+        // weighted sum of values is the engine's output.
+        try std.testing.expectEqual(@as(usize, 48 * (3 + 1) * 4), tap.weights.items.len);
+        try std.testing.expectEqual(@as(usize, 48 * (3 + 1)), tap.sinks.items.len);
+        try std.testing.expect(tap.worst < 1e-3);
+        var block: usize = 0;
+        for (0..2) |forward| {
+            const rows: usize = if (forward == 0) 3 else 1;
+            const base: usize = if (forward == 0) 0 else 48 * 3;
+            for (0..48) |visit| for (0..rows) |row| {
+                const at = (base + visit * rows + row);
+                const position = row + (if (forward == 0) @as(usize, 0) else 3);
+                var total: f64 = tap.sinks.items[at];
+                for (tap.weights.items[at * 4 ..][0..4], 0..) |w, key| {
+                    total += w;
+                    if (key > position) try std.testing.expectEqual(@as(f32, 0), w);
+                    const window = tap.windows.items[visit];
+                    if (window != 0 and key + window <= position) try std.testing.expectEqual(@as(f32, 0), w);
+                }
+                try std.testing.expectApproxEqAbs(@as(f64, 1), total, 1e-4);
+                block += 1;
+            };
+        }
+        try std.testing.expectEqual(@as(usize, 48 * 4), block);
         var at: usize = 0;
         while (at < tap.routes.items.len) : (at += 2 * tap.top_k) {
             for (tap.routes.items[at..][0..tap.top_k]) |id| try std.testing.expect(id >= 0 and id < @as(f32, @floatFromInt(c.experts)));
