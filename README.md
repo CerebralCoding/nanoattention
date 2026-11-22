@@ -239,9 +239,9 @@ faster on prefill for both. See [measurements and reproduction commands](benchma
 mixed-precision checkpoint with token IDs. MLX parity has not passed; see the
 [verified workflow and limits](docs/MEGAKERNEL.md#inkling-2-mini-experimental).
 With the opt-in knobs, on twelve real prompts of 4K to 32K tokens on the tested
-M3 Ultra, it decodes 22 to 25% faster than the pinned MLX reference. It reaches
-the first token sooner than MLX at MLX's default prefill chunk, and later (0.5
-to 4.4%) than MLX with a tuned chunk
+M3 Ultra, it decodes 29 to 36% faster than the pinned MLX reference and reaches
+the first token 2.7 to 4.6% sooner than MLX at MLX's best prefill chunk (7.6 to
+9.6% sooner at its default)
 ([measurements](benchmarks/inkling-long-context.md)).
 
 ## Development

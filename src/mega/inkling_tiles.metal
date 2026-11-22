@@ -27,7 +27,7 @@
 // share each staged 16-key tile, FP16 fragments, FP32 online normalization in
 // log2 units. Changed here, and only here: the queries, the distance bias and the
 // sink are read from the arena and the result is written to it (float32 words
-// holding bfloat16 values); K and V are read from this engine's position-major
+// holding bfloat16 values, or with MK_BIAS16 the bias as 16-bit words); K and V are read from this engine's position-major
 // 16-bit mirrors (inkling_long.metal), a key's slot being its position modulo
 // the cache's capacity; heads, relative extent and window are run-time values.
 // On an unwindowed cache it computes mk_relative_attention_prefill's bits; on a
@@ -96,6 +96,9 @@ kernel void mk_relative_prefill_tiles(device float *arena [[buffer(0)]], device 
     float row_sum = 1.0f;
     const int bias_row = batch * L + (row_ok ? row : 0);
     const device float* bias = arena + p.z + size_t(p.row0 + bias_row) * p.zs + head * R;
+    // MK_BIAS16: the row's bias as 16-bit words (mk_grouped_project_bf16x4_pack).
+    const bool bias_packed = (p.flags & MK_BIAS16) != 0;
+    const device bfloat* bias16 = reinterpret_cast<const device bfloat*>(arena + p.z + size_t(p.row0 + bias_row) * p.zs) + head * R;
 
     const int first_diag = S - L + q0;
     const int last_diag = S - L + min(q0 + BQ, L) - 1;
@@ -104,7 +107,12 @@ kernel void mk_relative_prefill_tiles(device float *arena [[buffer(0)]], device 
     const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
     const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
 
-    for (int k0 = first_key / BK * BK; k0 <= last_diag; k0 += BK) {
+    // The slot of a tile's first key, carried from tile to tile: a division only
+    // where the ring wraps instead of one for every staged vector.
+    const uint capacity = p.capacity;
+    uint slot0 = uint(first_key / BK * BK) % capacity;
+    for (int k0 = first_key / BK * BK; k0 <= last_diag; k0 += BK, slot0 += BK) {
+        if (slot0 >= capacity) slot0 %= capacity;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int c = tid; c < BK * D / 8; c += TG) {
             const int r = c / (D / 8);
@@ -113,8 +121,10 @@ kernel void mk_relative_prefill_tiles(device float *arena [[buffer(0)]], device 
             vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
             vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
             if (key < S) {
-                auto kp = (const device vec<T, 4>*)(k_head + size_t(uint(key) % p.capacity) * k_strides[2] + col);
-                auto vp = (const device vec<T, 4>*)(v_head + size_t(uint(key) % p.capacity) * v_strides[2] + col);
+                uint slot = slot0 + uint(r);
+                if (slot >= capacity) slot %= capacity;
+                auto kp = (const device vec<T, 4>*)(k_head + size_t(slot) * k_strides[2] + col);
+                auto vp = (const device vec<T, 4>*)(v_head + size_t(slot) * v_strides[2] + col);
                 kv[0] = kp[0];
                 kv[1] = kp[1];
                 vv[0] = vp[0];
@@ -151,7 +161,9 @@ kernel void mk_relative_prefill_tiles(device float *arena [[buffer(0)]], device 
                 if (visible) {
                     s = scores[kb].thread_elements()[e] * qscale;
                     if (d < R) {
-                        s += float(bias[d]) * LOG2E;
+                        float b;
+                        if (bias_packed) b = float(bias16[d]); else b = bias[d];
+                        s += b * LOG2E;
                     }
                 }
                 scores[kb].thread_elements()[e] = s;

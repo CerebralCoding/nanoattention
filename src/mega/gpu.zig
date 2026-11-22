@@ -99,6 +99,8 @@ pub const flag_fast_trig: u32 = 4;
 /// decode search: mk_dec_chain_block applies the attention gate epilogue.
 pub const flag_dec_gated: u32 = 8;
 pub const flag_round_out: u32 = 16;
+/// mk_relative_prefill_tiles: the distance bias is 16-bit (knobs.relative_bias16).
+pub const flag_bias16: u32 = 32;
 
 comptime {
     if (@sizeOf(ExpertParams) != 96) @compileError("ExpertParams must match MKExpert in inkling_ops.metal");

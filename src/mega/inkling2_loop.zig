@@ -358,10 +358,14 @@ const Lowering = struct {
         try self.b.op(.{ .binary = .{ .kind = kind, .a = x, .b = y, .b_act = y_act, .out = out } });
         return self.rounded(out, rounding);
     }
-    fn concat(self: Lowering, x: ir.View, y: ir.View) !ir.View {
-        const out = try self.scratch("concat", x.width + y.width);
-        try self.b.op(.{ .concat = .{ .a = x, .b = y, .out = out } });
-        return out;
+    /// Two row vectors side by side, each written where it is read: `out` is one
+    /// state and its halves are the producers' outputs, so nothing is copied.
+    fn pair(self: Lowering, width: u32) ![2]ir.View {
+        const out = try self.scratch("pair", 2 * width);
+        return .{ slice(out, 0, width), slice(out, 1, width) };
+    }
+    fn joined(halves: [2]ir.View) ir.View {
+        return .{ .state = halves[0].state, .col = halves[0].col, .width = halves[0].width + halves[1].width };
     }
     fn depth(self: Lowering, bank: ir.View, partial: ir.View, query: ir.WeightId, index: u32) !ir.View {
         const out = try self.scratch("depth", partial.width);
@@ -436,12 +440,21 @@ const Lowering = struct {
         const w = try self.weight(if (key_value) "middle_cycle_cross_pass_kv_queries" else "middle_cycle_cross_pass_queries", &.{ 2 * (c.loop_end - c.loop_start), c.hidden });
         const msg = try self.depth(bank.blocks, bank.last, w, 2 * local + @as(u32, @intFromBool(stream >= 2)));
         const stem = [_][]const u8{ "attn", "k", "v", "mlp" };
-        const cat = try self.concat(try self.norm(input, null, c.hidden, .none), try self.norm(msg, null, c.hidden, .none));
-        const d = try self.layerDense(v.weight_layer, try self.rounded(cat, .bf16), try self.b.print("controllers.{s}.down_weight", .{stem[stream]}), c.gate_rank, .bf16);
-        const f = try self.layerDense(v.weight_layer, d, try self.b.print("controllers.{s}.forget_weight", .{stem[stream]}), c.hidden, .none);
-        const g = try self.layerDense(v.weight_layer, d, try self.b.print("controllers.{s}.gain_weight", .{stem[stream]}), c.hidden, .none);
+        // [norm(input), norm(message)] rounded to BF16, then [forget, gain]: each half
+        // is normalized, rounded or projected in place in its pair.
+        const cat = try self.pair(c.hidden);
+        for ([_]ir.View{ input, msg }, cat) |x, half| {
+            try self.b.op(.{ .rmsnorm = .{ .x = x, .weight = null, .out = half, .group = c.hidden, .eps = c.eps } });
+            _ = try self.rounded(half, .bf16);
+        }
+        const d = try self.layerDense(v.weight_layer, joined(cat), try self.b.print("controllers.{s}.down_weight", .{stem[stream]}), c.gate_rank, .bf16);
+        const gates = try self.pair(c.hidden);
+        for ([_][]const u8{ "forget_weight", "gain_weight" }, gates) |name, half| {
+            const gate_w = try self.layerWeight(v.weight_layer, try self.b.print("controllers.{s}.{s}", .{ stem[stream], name }), &.{ c.hidden, d.width });
+            try self.b.op(.{ .linear = .{ .w = gate_w, .x = d, .out = half, .input_bf16 = true } });
+        }
         const out = try self.scratch("message_merge", c.hidden);
-        try self.b.op(.{ .inkling_message_merge = .{ .hidden = input, .message = msg, .gates = try self.concat(f, g), .out = out } });
+        try self.b.op(.{ .inkling_message_merge = .{ .hidden = input, .message = msg, .gates = joined(gates), .out = out } });
         return out;
     }
     fn visit(self: Lowering, v: Visit, hidden: ir.View, blocks: ir.View, count: *u32, prior: ?Bank) !ir.View {
@@ -732,5 +745,33 @@ test "native Inkling fixture matches sequential, batched and continued replay pa
     try concurrent.forward(&tokens, 0);
     for (0..tokens.len) |row| {
         try std.testing.expectEqualSlices(f32, try wide.logits(@intCast(row)), try concurrent.logits(@intCast(row)));
+    }
+
+    // Row liveness: the last visit's attention output and feed-forward run on the
+    // rows its convolution caches and the head read. A chunk without logits, a
+    // chunk with logits on its last row and a single row must each leave the
+    // logits the untrimmed engine computes, reference kernels and tuned ones.
+    const prompt = [_]u32{ 1, 4, 11, 2, 3, 6, 9, 1, 5, 7, 2, 12, 8, 3, 10, 6 };
+    for ([_]@import("knobs.zig").Knobs{ .{ .batch = 8 }, concurrent.knobs }) |base| {
+        var trimmed_knobs = base;
+        trimmed_knobs.tail_trim = 1;
+        trimmed_knobs.scratch_reuse = true;
+        var whole = try Engine.init(gpa, &p, ctx, &store, base, 16);
+        defer whole.deinit();
+        var trimmed = try Engine.init(gpa, &p, ctx, &store, trimmed_knobs, 16);
+        defer trimmed.deinit();
+        const start = ctx.stats();
+        try whole.forward(prompt[0..8], 8);
+        const middle = ctx.stats();
+        try trimmed.forward(prompt[0..8], 8);
+        const end = ctx.stats();
+        // The last visit's final residual add has no reader in a chunk without logits.
+        try std.testing.expect(end.dispatches - middle.dispatches < middle.dispatches - start.dispatches);
+        try whole.forward(prompt[8..15], 6);
+        try trimmed.forward(prompt[8..15], 6);
+        try std.testing.expectEqualSlices(f32, try whole.logits(6), try trimmed.logits(6));
+        try whole.forward(prompt[15..], 0);
+        try trimmed.forward(prompt[15..], 0);
+        try std.testing.expectEqualSlices(f32, try whole.logits(0), try trimmed.logits(0));
     }
 }

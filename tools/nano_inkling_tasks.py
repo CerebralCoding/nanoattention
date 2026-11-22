@@ -75,7 +75,8 @@ KNOBS = ("expert_simd=true expert_wide_dot=true expert_gate_pair=true expert_pre
          "expert_bf16_tiles=true expert_mlx_scale=true bf16_linear_tile=true bf16_prefill_tile=8 "
          "bf16_prefill_matrix=true bf16_decode_vec=true fuse_bf16_cast=true concurrent_scratch=true "
          "relative_split=true relative_split_4=true relative_tile_prefill=true relative_stripes=true "
-         "scratch_reuse=true expert_tile_rows=4096 bf16_matrix_small=true").split()
+         "scratch_reuse=true expert_tile_rows=4096 bf16_matrix_small=true tail_trim=512 relative_bias16=true "
+         "relative_bias_d8=true conv_ring=true expert_lists_split=true").split()
 MARK = "@@DOCUMENT@@"
 
 

@@ -298,7 +298,7 @@ python3 tools/nano_inkling_bench.py zig-out/bin/nano "$CHECKPOINT" \
 
 ### Long context and large batches
 
-Four more knobs, added to those above, for 4K to 32K prompts:
+Nine more knobs, added to those above, for 4K to 32K prompts:
 
 - `relative_stripes=true` mirrors every stored K and V row as its upper 16 bits
   (the rows are bfloat16 values, so nothing is lost) and reads relative
@@ -319,13 +319,27 @@ Four more knobs, added to those above, for 4K to 32K prompts:
 - `bf16_matrix_small=true` sends the small relative, router and controller
   projections through the BF16 matrix tiles. The sums are associated
   differently, so the bits differ.
+- `tail_trim=512` runs every op on the rows something still reads
+  (`exec.rowNeeds`): the last layer's attention output and feed-forward, of
+  which the caches keep three rows and the head the rows with logits, run on a
+  chunk's last 512 rows. Bit-identical at 512 with these knobs; a smaller tail
+  selects the smaller-batch kernels and is not.
+- `relative_bias16=true` writes and reads a layer's distance bias as 16-bit
+  words, and `relative_bias_d8=true` projects it eight distances a thread.
+- `conv_ring=true` steps the short convolutions' ring slot from tap to tap.
+- `expert_lists_split=true` builds each expert's route list from 32 segments
+  at once.
+
+The last five change no bits (checked together on real logits and by their own
+tests).
 
 On twelve distinct real prompts at 4K to 32K, each from an empty cache on the M3
-Ultra, native decodes at 35.0 to 37.8 tokens a second against 28.3 to 30.6 for
-the pinned mlx-lm reference and 23.0 to 26.5 for exo's MLX adapter. Native
-reaches the first token 24 to 26% sooner than the adapter and 0.6 to 4.1% sooner
-than mlx-lm at its default 2,048-token prefill chunk, but 0.5 to 4.4% later than
-mlx-lm set to 4,096-token chunks. Method, per-task rows and limits are in
+Ultra, native decodes at 36.4 to 39.6 tokens a second against 27.6 to 29.5 for
+the pinned mlx-lm reference and 22.3 to 25.6 for exo's MLX adapter. Native
+reaches the first token 29 to 31% sooner than the adapter, 7.6 to 9.6% sooner
+than mlx-lm at its default 2,048-token prefill chunk and 2.7 to 4.6% sooner than
+mlx-lm set to 4,096-token chunks, its best size; that last lead narrows with
+context and nothing past 32K was measured. Method, per-task rows and limits are in
 [benchmarks/inkling-long-context.md](../benchmarks/inkling-long-context.md);
 `tools/nano_inkling_tasks.py` is the runner.
 

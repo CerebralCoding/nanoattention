@@ -25,6 +25,10 @@ pub const Knobs = struct {
     expert_tile_rows: u32 = 0,
     /// Wider packed-expert K tile for prefill. Requires expert_prefill.
     expert_wide_k: bool = false,
+    /// With expert_mlx_scale: each expert's route list from 32 segments of the
+    /// routes scanned at once (mk_expert_row_counts, mk_expert_row_fill) instead
+    /// of one scan end to end. The same lists in the same order.
+    expert_lists_split: bool = false,
     /// Parallel softmax over relative-bias decode partitions.
     relative_split: bool = false,
     /// Four simultaneous score dots per decode partition; requires relative_split.
@@ -42,6 +46,15 @@ pub const Knobs = struct {
     relative_stripes: bool = false,
     /// FP16 matrix fragments in batched relative attention (different arithmetic).
     relative_tile_prefill: bool = false,
+    /// With relative_stripes and relative_tile_prefill, from 512 rows: the distance
+    /// bias of a layer, which is rounded to bfloat16 and read only by that layer's
+    /// staged-tile attention, is written and read as 16-bit words
+    /// (mk_grouped_project_bf16x4_pack). The same values in half the bytes.
+    relative_bias16: bool = false,
+    /// With bf16_prefill_tile: a layer's distance bias through
+    /// mk_grouped_project_bf16d8, two queries and eight distances a thread, each
+    /// input loaded once instead of once per distance. The same FMA chains.
+    relative_bias_d8: bool = false,
     /// Reuse BF16 weights and input lanes across a small dense tile.
     bf16_linear_tile: bool = false,
     /// Matrix tiles for large BF16 projections with BF16-valued inputs.
@@ -57,6 +70,10 @@ pub const Knobs = struct {
     bf16_decode_vec: bool = false,
     /// Fold an in-place BF16 cast into its producer without changing arithmetic.
     fuse_bf16_cast: bool = false,
+    /// Inkling's short convolutions step the ring slot from tap to tap
+    /// (mk_inkling_short_conv_ring, mk_inkling_dynamic_conv_ring) instead of taking
+    /// a 64-bit remainder per tap. No arithmetic changes.
+    conv_ring: bool = false,
     /// Pack scratch states whose lifetimes do not meet into the same arena words
     /// (exec.packScratch) instead of giving every state its own. No arithmetic
     /// changes; the arena shrinks by an order of magnitude on programs with many
@@ -119,6 +136,17 @@ pub const Knobs = struct {
     /// the last layer's conv output, out_proj and feed-forward run for the logits
     /// rows only, as in stock MLX's chunked prefill. Same arithmetic per row run.
     head_trim: bool = false,
+    /// Row liveness (exec.rowNeeds). Nothing reads most rows of the last layer's
+    /// attention output and feed-forward: the caches after it keep only a short
+    /// convolution's last few rows, and the head reads the rows with logits. With a
+    /// nonzero value every op runs on the rows something still reads, and an op that
+    /// is trimmed keeps at least this many of the forward's last rows. Rows nothing
+    /// reads are not computed. With the reference kernels a stored row holds the
+    /// bits it would without the knob for any value. Knobs that pick a kernel by
+    /// row count (matrix tiles, staged attention tiles) pick another one for a
+    /// short tail, so with them the bits are kept only from 512, where a trimmed
+    /// op still runs the kernels a full chunk does; 1 moved real logits by 0.1.
+    tail_trim: u32 = 0,
     // ---- prefill-mlx (mlx-arith tier) ----
     /// NOT the reference arithmetic: multi-row affine 4-bit linears (group a
     /// multiple of 32, at least MLX's vector limit of rows) through the port of

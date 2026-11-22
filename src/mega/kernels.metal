@@ -22,6 +22,7 @@ constant uint MK_ROUND_BF16 = 1u;
 constant uint MK_HAS_WEIGHT = 2u;
 constant uint MK_FAST_TRIG = 4u;
 constant uint MK_ROUND_OUT = 16u;
+constant uint MK_BIAS16 = 32u;
 
 inline float mk_load(device const uchar *base, ulong offset, uint dtype, ulong i) {
     if (dtype == 0) return ((device const float *)(base + offset))[i];

@@ -1484,14 +1484,21 @@ test "tiled relative attention handles window wrap and a partial query tile" {
     const seq_end = pos + row0 + rows;
     const bias_off = (rows + row0) * stride * 3;
     const sink_off = bias_off + (rows + row0) * heads * extent;
-    const arena = try ctx.alloc(sink_off + (rows + row0) * heads);
+    const packed_off = sink_off + (rows + row0) * heads;
+    const arena = try ctx.alloc(packed_off + (rows + row0) * heads * extent);
     defer arena.deinit();
     const f = arena.floats();
     for (f[0 .. (rows + row0) * stride], 0..) |*v, i| {
         v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.125;
     }
-    for (f[bias_off..], 0..) |*v, i| {
+    for (f[bias_off..packed_off], 0..) |*v, i| {
         v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.0625;
+    }
+    // The same bias as 16-bit words, each row's at the start of its own words.
+    for (0..rows + row0) |r| {
+        const src = f[bias_off + r * heads * extent ..][0 .. heads * extent];
+        const dst = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(f[packed_off + r * heads * extent ..][0 .. heads * extent]));
+        for (src, dst[0..src.len]) |v, *h| h.* = @intCast(@as(u32, @bitCast(v)) >> 16);
     }
     for ([_]u32{ 0, 21 }) |window| {
         const capacity = if (window == 0) seq_end else window + rows - 1;
@@ -1575,6 +1582,17 @@ test "tiled relative attention handles window wrap and a partial query tile" {
         if (window == 0) {
             try std.testing.expectEqualSlices(f32, tiled, f[p.y + first ..][0 .. rows * stride]);
         } else for (tiled, f[p.y + first ..][0 .. rows * stride]) |expected, actual| try close(expected, actual, 0.0001);
+        // The bias read as 16-bit words gives the same bits.
+        const unpacked = try std.testing.allocator.dupe(f32, f[p.y + first ..][0 .. rows * stride]);
+        defer std.testing.allocator.free(unpacked);
+        @memset(f[p.y..][0 .. (rows + row0) * stride], -7);
+        p.z = packed_off;
+        p.flags = gpu.flag_bias16;
+        try gpu.dispatch(ctx, "mk_relative_prefill_tiles", &.{ arena, half_keys, half_values }, &p, 2 * heads * 128, 128);
+        try ctx.finish();
+        try std.testing.expectEqualSlices(f32, unpacked, f[p.y + first ..][0 .. rows * stride]);
+        p.z = bias_off;
+        p.flags = 0;
 
         const parts = try ctx.alloc(heads * 3 * (dim + 2));
         defer parts.deinit();
@@ -1588,6 +1606,89 @@ test "tiled relative attention handles window wrap and a partial query tile" {
         try gpu.dispatch(ctx, "mk_relative_split_keys4", &.{ arena, keys, values, parts }, &p, heads * p.taps * 128, 128);
         try ctx.finish();
         try std.testing.expectEqualSlices(f32, &before, parts.floats()[0..before.len]);
+    }
+}
+
+test "the packed distance bias holds the tiled projection's bfloat16 values" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const rows = 8;
+    const row0 = 4;
+    const heads = 3;
+    const extent = 7;
+    const taps = 5; // a causal prefix: distances beyond the last query position are not written
+    const x_off = 0;
+    const out_off = (rows + row0) * heads * 16;
+    const packed_off = out_off + (rows + row0) * heads * extent;
+    const arena = try ctx.alloc(packed_off + (rows + row0) * heads * extent);
+    defer arena.deinit();
+    const f = arena.floats();
+    for (f[0..out_off], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 7 % 23)) - 11)) * 0.03125;
+    @memset(f[out_off..], -7);
+    const weights = try ctx.alloc(16 * extent / 2 + 1);
+    defer weights.deinit();
+    const w16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(weights.floats()));
+    for (w16[0 .. 16 * extent], 0..) |*h, i| {
+        const v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i * 5 % 29)) - 14)) * 0.0078125;
+        h.* = @intCast(@as(u32, @bitCast(v)) >> 16);
+    }
+    var p: gpu.Params = .{ .rows = rows, .row0 = row0, .x = x_off, .xs = heads * 16, .y = out_off, .ys = heads * extent, .n = heads * extent, .m = extent, .dim = 16, .dtype = 2, .taps = taps, .flags = gpu.flag_round_bf16 };
+    try gpu.dispatch(ctx, "mk_grouped_project_bf16x4", &.{ arena, weights }, &p, rows / 4 * heads * taps, 256);
+    p.y = packed_off;
+    try gpu.dispatch(ctx, "mk_grouped_project_bf16x4_pack", &.{ arena, weights }, &p, rows / 4 * heads * taps, 256);
+    try ctx.finish();
+    var nonzero: usize = 0;
+    for (0..rows + row0) |r| {
+        const plain = f[out_off + r * heads * extent ..][0 .. heads * extent];
+        const halves = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(f[packed_off + r * heads * extent ..][0 .. heads * extent]));
+        for (plain, 0..) |v, i| {
+            const written = r >= row0 and i % extent < taps;
+            if (!written) {
+                try std.testing.expectEqual(@as(f32, -7), v);
+                continue;
+            }
+            try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(v)) & 0xffff);
+            try std.testing.expectEqual(@as(u16, @intCast(@as(u32, @bitCast(v)) >> 16)), halves[i]);
+            nonzero += @intFromBool(v != 0);
+        }
+    }
+    try std.testing.expect(nonzero > rows * heads * taps / 2);
+}
+
+test "eight distances a thread give the tiled distance bias's bits, plain and packed" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const rows = 8;
+    const row0 = 2;
+    const heads = 3;
+    const extent = 24;
+    const out_off = (rows + row0) * heads * 16;
+    const region = (rows + row0) * heads * extent;
+    const arena = try ctx.alloc(out_off + 4 * region);
+    defer arena.deinit();
+    const f = arena.floats();
+    for (f[0..out_off], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 7 % 23)) - 11)) * 0.03125;
+    const weights = try ctx.alloc(16 * extent / 2);
+    defer weights.deinit();
+    const w16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(weights.floats()));
+    for (w16[0 .. 16 * extent], 0..) |*h, i| {
+        const v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(i * 5 % 29)) - 14)) * 0.0078125;
+        h.* = @intCast(@as(u32, @bitCast(v)) >> 16);
+    }
+    // A full extent, and causal prefixes that end inside and at the end of a block of eight.
+    for ([_]u32{ 24, 13, 16, 1 }) |taps| {
+        @memset(f[out_off..], -7);
+        var p: gpu.Params = .{ .rows = rows, .row0 = row0, .x = 0, .xs = heads * 16, .y = out_off, .ys = heads * extent, .n = heads * extent, .m = extent, .dim = 16, .dtype = 2, .taps = taps, .flags = gpu.flag_round_bf16 };
+        const kernels = [_][:0]const u8{ "mk_grouped_project_bf16x4", "mk_grouped_project_bf16d8", "mk_grouped_project_bf16x4_pack", "mk_grouped_project_bf16d8_pack" };
+        for (kernels, 0..) |kernel, k| {
+            p.y = out_off + @as(u32, @intCast(k)) * region;
+            const threads: usize = if (k % 2 == 0) rows / 4 * heads * taps else rows / 2 * heads * ((taps + 7) / 8);
+            try gpu.dispatch(ctx, kernel, &.{ arena, weights }, &p, threads, 256);
+        }
+        try ctx.finish();
+        try std.testing.expectEqualSlices(f32, f[out_off..][0..region], f[out_off + region ..][0..region]);
+        try std.testing.expectEqualSlices(f32, f[out_off + 2 * region ..][0..region], f[out_off + 3 * region ..][0..region]);
+        try std.testing.expect(f[out_off + row0 * heads * extent] != -7);
     }
 }
 
@@ -1885,6 +1986,50 @@ test "Inkling dynamic convolution matches per-head taps, static taps, and revers
     };
 }
 
+test "ring-stepped short convolutions give the reference kernels' bits on a wrapped ring" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const C = 4;
+    const heads = 2;
+    const taps = 4;
+    const rows = 6;
+    const row0 = 1;
+    const capacity = 8;
+    const ring = try ctx.alloc(capacity * C);
+    defer ring.deinit();
+    for (ring.floats(), 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 5 % 13)) - 6)) * 0.0625;
+    // Short: one weight per (channel, tap). Dynamic: one static weight per (tap, channel).
+    const w = try ctx.alloc(C * taps);
+    defer w.deinit();
+    for (w.floats(), 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 3 % 11)) - 5)) * 0.125;
+    const T = rows + row0;
+    const residual_off = 0;
+    const dynamic_off = T * C;
+    const out_off = dynamic_off + T * heads * taps;
+    const buf = try ctx.alloc(out_off + 2 * T * C);
+    defer buf.deinit();
+    const f = buf.floats();
+    for (f[0..out_off], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 7 % 17)) - 8)) * 0.03125;
+    // Position 0 (taps before the sequence read zeros), then positions whose taps wrap the ring.
+    for ([_]u32{ 0, 13 }) |pos| {
+        for ([_][2][:0]const u8{ .{ "mk_inkling_short_conv", "mk_inkling_short_conv_ring" }, .{ "mk_inkling_dynamic_conv", "mk_inkling_dynamic_conv_ring" } }, 0..) |pair, kind| {
+            for (pair, 0..) |kernel, which| {
+                @memset(f[out_off + which * T * C ..][0 .. T * C], -7);
+                var p: gpu.Params = if (kind == 0)
+                    .{ .rows = rows, .row0 = row0, .pos = pos, .x = residual_off, .xs = C, .z = out_off + @as(u32, @intCast(which)) * T * C, .zs = C, .n = C, .taps = taps, .capacity = capacity, .scale = 0.4472136, .flags = 1 }
+                else
+                    .{ .rows = rows, .row0 = row0, .pos = pos, .x = dynamic_off, .xs = heads * taps, .y = residual_off, .ys = C, .z = out_off + @as(u32, @intCast(which)) * T * C, .zs = C, .n = C, .heads = heads, .taps = taps, .capacity = capacity, .scale = 0.3333333, .flags = 1 };
+                try gpu.dispatch(ctx, kernel, &.{ ring, w, buf }, &p, rows * C, 32);
+            }
+            try ctx.finish();
+            const reference = f[out_off..][0 .. T * C];
+            for (reference[0 .. row0 * C]) |v| try std.testing.expectEqual(@as(f32, -7), v);
+            for (reference[row0 * C ..]) |v| try std.testing.expect(v != -7 and std.math.isFinite(v));
+            try std.testing.expectEqualSlices(f32, reference, f[out_off + T * C ..][0 .. T * C]);
+        }
+    }
+}
+
 test "Inkling message gate merge matches controller formula" {
     const ctx = try gpu.open();
     defer ctx.deinit();
@@ -1999,6 +2144,43 @@ test "packed experts decode both formats and combine selected routes" {
             for ([_]f64{ 1, 1.5, 2, 3 }, f[204..208]) |factor, actual| try close(combined * factor, actual, 8e-5);
             try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, f[200..204]);
         }
+    }
+}
+
+test "route lists built from segments equal the end-to-end scan's" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const experts = 7;
+    const top_k = 3;
+    const row0 = 2;
+    // Segments of one block of 32, a last segment that is short, and segments past the end.
+    for ([_]u32{ 300, 11, 1 }) |rows| {
+        const total = rows * top_k;
+        const arena = try ctx.alloc((rows + row0) * 2 * top_k);
+        defer arena.deinit();
+        for (0..rows + row0) |r| for (0..top_k) |s| {
+            arena.floats()[r * 2 * top_k + s] = @floatFromInt((r * 5 + s * 3 + r / 7) % experts);
+        };
+        const words = experts * (total + 1 + 32);
+        const scan = try ctx.alloc(words);
+        defer scan.deinit();
+        const split = try ctx.alloc(words);
+        defer split.deinit();
+        @memset(scan.structs(u32), 0xffffffff);
+        @memset(split.structs(u32), 0xffffffff);
+        var p: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .routes = 0, .rs = 2 * top_k, .experts = experts, .top_k = top_k };
+        try gpu.dispatch(ctx, "mk_expert_row_lists_simd", &.{ arena, scan }, &p, experts * 32, 128);
+        try gpu.dispatch(ctx, "mk_expert_row_counts", &.{ arena, split }, &p, experts * 32 * 32, 128);
+        try gpu.dispatch(ctx, "mk_expert_row_fill", &.{ arena, split }, &p, experts * 32 * 32, 128);
+        try ctx.finish();
+        var listed: usize = 0;
+        for (0..experts) |e| {
+            const a = scan.structs(u32)[e * (total + 1) ..][0 .. total + 1];
+            const b = split.structs(u32)[e * (total + 1) ..][0 .. total + 1];
+            try std.testing.expectEqualSlices(u32, a[0 .. a[0] + 1], b[0 .. a[0] + 1]);
+            listed += a[0];
+        }
+        try std.testing.expectEqual(@as(usize, total), listed);
     }
 }
 

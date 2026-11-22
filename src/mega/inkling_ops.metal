@@ -302,6 +302,59 @@ kernel void mk_inkling_short_conv(device const float *ring [[buffer(0)]], device
     arena[p.z + row * p.zs + c] = output;
 }
 
+// knobs.conv_ring: the two short convolutions with the ring slot of the row's own
+// position found once (a 32-bit remainder) and stepped back a tap at a time,
+// where the kernels above take a 64-bit remainder for every tap of every channel.
+// Needs capacity >= taps. Every tap, product and sum is the reference's.
+inline uint mk_ring_back(uint slot, uint back, uint capacity) {
+    return slot >= back ? slot - back : slot + capacity - back;
+}
+
+kernel void mk_inkling_dynamic_conv_ring(device const float *ring [[buffer(0)]], device const uchar *w [[buffer(1)]],
+                                           device float *arena [[buffer(2)]], constant MK &p [[buffer(8)]],
+                                           uint i [[thread_position_in_grid]]) {
+    uint r = i / p.n, c = i % p.n;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    const uint position = p.pos + row, slot = position % p.capacity;
+    uint channels_per_head = p.n / p.heads;
+    uint head = c / channels_per_head;
+    float acc = 0.0f;
+    for (uint k = 0; k < p.taps; ++k) {
+        float value = k > position ? 0.0f : ring[ulong(mk_ring_back(slot, k, p.capacity)) * p.n + c];
+        float static_tap = mk_load(w, p.w, p.dtype, ulong(k) * p.n + c);
+        float dynamic_tap = arena[p.x + row * p.xs + head * p.taps + k];
+        acc += value * (static_tap + dynamic_tap);
+    }
+    float residual = arena[p.y + row * p.ys + c];
+    float output = (acc + residual) * p.scale;
+    if (p.flags & MK_ROUND_BF16) output = mk_bf16(output);
+    arena[p.z + row * p.zs + c] = output;
+}
+
+kernel void mk_inkling_short_conv_ring(device const float *ring [[buffer(0)]], device const uchar *w [[buffer(1)]],
+                                        device float *arena [[buffer(2)]], constant MK &p [[buffer(8)]],
+                                        uint i [[thread_position_in_grid]]) {
+    uint r = i / p.n, c = i % p.n;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    const uint position = p.pos + row, slot = position % p.capacity;
+    float acc = 0.0f;
+    for (uint k = 0; k < p.taps; ++k) {
+        const uint back = p.taps - 1 - k;
+        float value = back > position ? 0.0f : ring[ulong(mk_ring_back(slot, back, p.capacity)) * p.n + c];
+        if (p.dtype == 1) value = float(half(value));
+        else if (p.dtype == 2) value = mk_bf16(value);
+        acc += mk_load(w, p.w, p.dtype, ulong(c) * p.taps + k) * value;
+    }
+    if (p.dtype == 1) acc = float(half(acc));
+    else if (p.dtype == 2) acc = mk_bf16(acc);
+    float residual = arena[p.x + row * p.xs + c];
+    float output = (acc + residual) * p.scale;
+    if (p.flags & MK_ROUND_BF16) output = mk_bf16(output);
+    arena[p.z + row * p.zs + c] = output;
+}
+
 kernel void mk_l2_clip(device float *arena [[buffer(0)]], device const uchar *scale [[buffer(1)]],
                        constant MK &p [[buffer(8)]], uint tid [[thread_index_in_threadgroup]],
                        uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
@@ -474,6 +527,77 @@ kernel void mk_grouped_project_bf16x4(device float *arena [[buffer(0)]], device 
     #pragma unroll
     for (uint t=0; t<4; ++t)
         arena[p.y + (row+t)*p.ys + h*p.m+d] = (p.flags & MK_ROUND_BF16) ? mk_bf16(sum[t]) : sum[t];
+}
+
+// The same sums rounded to bfloat16 and stored as their upper 16 bits: element
+// h * m + d of the row's words taken as 16-bit, half the bytes to write here and
+// to read in mk_relative_prefill_tiles (MK_BIAS16).
+kernel void mk_grouped_project_bf16x4_pack(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
+                                           constant MK &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    const uint width = p.n / p.m * p.taps, r = i / width * 4;
+    if (r >= p.rows) return;
+    const uint row = p.row0 + r, h = i % width / p.taps, d = i % p.taps;
+    const device float *x = arena + p.x + row * p.xs + h * 16;
+    const device ushort *weight = reinterpret_cast<const device ushort *>(w + p.w) + d;
+    float4 sum = 0;
+    #pragma unroll
+    for (uint k = 0; k < 16; ++k) {
+        const float wi = as_type<float>(uint(weight[k * p.m]) << 16);
+        const float4 xi(x[k], x[p.xs+k], x[p.xs*2+k], x[p.xs*3+k]);
+        sum = fma(xi, float4(wi), sum);
+    }
+    #pragma unroll
+    for (uint t=0; t<4; ++t)
+        reinterpret_cast<device ushort *>(arena + p.y + (row+t)*p.ys)[h*p.m+d] = ushort(as_type<uint>(mk_bf16(sum[t])) >> 16);
+}
+
+// knobs.relative_bias_d8: two causal queries and eight distances a thread. A
+// query's 16 inputs are loaded once for the eight sums and the weights eight at
+// a time, where the kernels above load them again for every distance. Each sum
+// is mk_grouped_project's FMA chain in its order. Needs m % 8 == 0 and an even
+// number of rows. Pack stores the rounded sums as 16-bit words (MK_BIAS16).
+template <bool Pack>
+inline void mk_grouped_project_d8(device float *arena, device const uchar *w, constant MK &p, uint i) {
+    const uint blocks = (p.taps + 7) / 8, width = p.n / p.m * blocks, r = i / width * 2;
+    if (r >= p.rows) return;
+    const uint row = p.row0 + r, h = i % width / blocks, d0 = i % blocks * 8;
+    const device float *x = arena + p.x + row * p.xs + h * 16;
+    const device ushort *weight = reinterpret_cast<const device ushort *>(w + p.w) + d0;
+    float2 sum[8];
+    #pragma unroll
+    for (uint j = 0; j < 8; ++j) sum[j] = float2(0);
+    #pragma unroll
+    for (uint k = 0; k < 16; ++k) {
+        const float2 xi(x[k], x[p.xs + k]);
+        const device packed_ushort4 *wp = reinterpret_cast<const device packed_ushort4 *>(weight + k * p.m);
+        const float4 w0 = as_type<float4>(uint4(ushort4(wp[0])) << 16), w1 = as_type<float4>(uint4(ushort4(wp[1])) << 16);
+        #pragma unroll
+        for (uint j = 0; j < 4; ++j) {
+            sum[j] = fma(xi, float2(w0[j]), sum[j]);
+            sum[4 + j] = fma(xi, float2(w1[j]), sum[4 + j]);
+        }
+    }
+    #pragma unroll
+    for (uint j = 0; j < 8; ++j) {
+        if (d0 + j < p.taps) {
+            #pragma unroll
+            for (uint t = 0; t < 2; ++t) {
+                if constexpr (Pack) {
+                    reinterpret_cast<device ushort *>(arena + p.y + (row + t) * p.ys)[h * p.m + d0 + j] = ushort(as_type<uint>(mk_bf16(sum[j][t])) >> 16);
+                } else {
+                    arena[p.y + (row + t) * p.ys + h * p.m + d0 + j] = (p.flags & MK_ROUND_BF16) ? mk_bf16(sum[j][t]) : sum[j][t];
+                }
+            }
+        }
+    }
+}
+kernel void mk_grouped_project_bf16d8(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
+                                      constant MK &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    mk_grouped_project_d8<false>(arena, w, p, i);
+}
+kernel void mk_grouped_project_bf16d8_pack(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
+                                           constant MK &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    mk_grouped_project_d8<true>(arena, w, p, i);
 }
 
 // Packed SIMD candidate: lanes load contiguous packed bytes and accumulate
@@ -959,6 +1083,56 @@ kernel void mk_expert_row_lists_simd(device const float *arena [[buffer(0)]], de
         n += simd_sum(match);
     }
     if (lane == 0) entries[0] = n;
+}
+
+// knobs.expert_lists_split: mk_expert_row_lists_simd's lists from MK_LIST_SEGS
+// segments of the routes scanned at once. A SIMD group per (expert, segment)
+// counts its matches into the words after the lists; a second launch places each
+// segment's matches after those of the segments before it. The same entries in
+// the same order.
+constant uint MK_LIST_SEGS = 32;
+inline uint mk_list_span(uint total) {
+    return ((total + MK_LIST_SEGS - 1) / MK_LIST_SEGS + 31) / 32 * 32;
+}
+inline uint mk_list_match(device const float *arena, constant MKExpert &p, uint i, uint total, uint expert) {
+    if (i >= total) return 0;
+    const uint row = p.row0 + i / p.top_k;
+    return uint(uint(arena[p.routes + row * p.rs + i % p.top_k]) == expert);
+}
+kernel void mk_expert_row_counts(device const float *arena [[buffer(0)]], device uint *lists [[buffer(1)]],
+                                 constant MKExpert &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    const uint expert = gid / 32 / MK_LIST_SEGS, seg = gid / 32 % MK_LIST_SEGS;
+    if (expert >= p.experts) return;
+    const uint total = p.rows * p.top_k, span = mk_list_span(total);
+    const uint first = seg * span, last = min(total, first + span);
+    uint n = 0;
+    for (uint block = first; block < last; block += 32) n += simd_sum(mk_list_match(arena, p, block + lane, total, expert));
+    if (lane == 0) lists[p.experts * (total + 1) + expert * MK_LIST_SEGS + seg] = n;
+}
+kernel void mk_expert_row_fill(device const float *arena [[buffer(0)]], device uint *lists [[buffer(1)]],
+                               constant MKExpert &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const uint expert = gid / 32 / MK_LIST_SEGS, seg = gid / 32 % MK_LIST_SEGS;
+    if (expert >= p.experts) return;
+    const uint total = p.rows * p.top_k, span = mk_list_span(total);
+    const uint first = seg * span, last = min(total, first + span);
+    device uint *entries = lists + expert * (total + 1);
+    device const uint *counts = lists + p.experts * (total + 1) + expert * MK_LIST_SEGS;
+    uint n = 0;
+    for (uint s = 0; s < seg; ++s) n += counts[s];
+    if (seg == 0 && lane == 0) {
+        uint all = 0;
+        for (uint s = 0; s < MK_LIST_SEGS; ++s) all += counts[s];
+        entries[0] = all;
+    }
+    for (uint block = first; block < last; block += 32) {
+        const uint i = block + lane;
+        const uint match = mk_list_match(arena, p, i, total, expert);
+        const uint rank = simd_prefix_exclusive_sum(match);
+        if (match) entries[1 + n + rank] = i;
+        n += simd_sum(match);
+    }
 }
 
 // One workgroup per expert/32 output rows. Its four SIMD groups share a

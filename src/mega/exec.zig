@@ -67,6 +67,13 @@ pub const Engine = struct {
     /// Ops at index >= head_start run only on rows with logits: the program's
     /// head_start, or earlier with knobs.head_trim (traced forwards use the program's).
     head_start: u32,
+    /// knobs.tail_trim: per step, the rows of a forward something still reads.
+    row_needs: ?[]RowNeed = null,
+    /// knobs.relative_bias16: the distance-bias states one grouped projection writes
+    /// and one staged-tile attention reads, and the rows of the one written 16-bit
+    /// in this forward until its attention has read them.
+    bias16_ok: ?[]bool = null,
+    bias16: ?struct { state: u32, row0: u32, rows: u32 } = null,
     position: u32 = 0,
     failed: bool = false,
     last: Stats = .{},
@@ -123,6 +130,7 @@ pub const Engine = struct {
     /// Stripe records of the batched striped attention: batch x heads x max_prefill_stripes.
     prefill_parts: ?metal.Buffer = null,
     const max_prefill_stripes: u32 = 4;
+    const list_segments: u32 = 32; // MK_LIST_SEGS
     /// Rows from which a chunk runs mk_relative_prefill_tiles instead of stripes.
     const min_tile_rows: u32 = 512;
     const mirror_pad: u32 = 16; // MK_MIRROR_PAD
@@ -200,6 +208,18 @@ pub const Engine = struct {
         var steps = try plan.build(gpa, &planned, knobs.fusion(), info);
         errdefer gpa.free(steps);
         if (head_start != program.head_start) steps = try splitAcross(gpa, steps, program.head_start);
+        var row_needs: ?[]RowNeed = null;
+        errdefer if (row_needs) |v| gpa.free(v);
+        if (knobs.tail_trim != 0) {
+            const per_op = try rowNeeds(gpa, program);
+            defer gpa.free(per_op);
+            const per_step = try gpa.alloc(RowNeed, steps.len);
+            for (steps, per_step) |st, *need| {
+                need.* = .{};
+                for (per_op[st.first()..][0..st.len()]) |op_need| need.* = need.merge(op_need);
+            }
+            row_needs = per_step;
+        }
         const independent_launches = if (knobs.concurrent_scratch) try plan.independentLaunches(gpa, steps, program, info) else null;
         errdefer if (independent_launches) |v| gpa.free(v);
         // prefill objective (prefill search): room for the widest q4 linear input.
@@ -288,9 +308,10 @@ pub const Engine = struct {
             var lists: usize = 0;
             var values: usize = 0;
             for (program.ops) |op| switch (op) {
-                .expert_gate_up => |e| lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1)),
+                // After the lists: 32 segment counts an expert (knobs.expert_lists_split, MK_LIST_SEGS).
+                .expert_gate_up => |e| lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1 + list_segments)),
                 .expert_down => |e| {
-                    lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1));
+                    lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1 + list_segments));
                     values = @max(values, @as(usize, e.top_k) * e.out.width * tile_rows);
                 },
                 else => {},
@@ -350,6 +371,33 @@ pub const Engine = struct {
                 if (knobs.relative_tile_prefill and batch >= 8) prefill_parts = try ctx.alloc(@as(usize, @min(batch, min_tile_rows)) * striped_heads * max_prefill_stripes * 130);
             }
         }
+        // knobs.relative_bias16: a bias state qualifies when exactly two ops touch it,
+        // the projection that writes it and an attention the staged tiles can run.
+        var bias16_ok: ?[]bool = null;
+        errdefer if (bias16_ok) |v| gpa.free(v);
+        if (knobs.relative_bias16 and knobs.relative_tile_prefill) if (relative_half) |hs| {
+            const ok = try gpa.alloc(bool, n);
+            @memset(ok, false);
+            bias16_ok = ok;
+            const users = try gpa.alloc(u32, n);
+            defer gpa.free(users);
+            @memset(users, 0);
+            for (program.ops) |op| {
+                var reads: [3]?ir.View = undefined;
+                var write: ?ir.View = null;
+                plan.access(op, &reads, &write);
+                for ([_]?ir.View{ reads[0], reads[1], reads[2], write }) |view| if (view) |v| {
+                    users[v.state] += 1;
+                };
+            }
+            for (program.traces) |t| users[t.view.state] += 1;
+            for (program.ops) |op| switch (op) {
+                .relative_attention => |a| if (a.dim == 128 and hs[a.keys] != null and hs[a.values] != null and users[a.bias.state] == 2) {
+                    ok[a.bias.state] = true;
+                },
+                else => {},
+            };
+        };
         return .{
             .gpa = gpa,
             .program = program,
@@ -367,6 +415,8 @@ pub const Engine = struct {
             .steps = steps,
             .independent_launches = independent_launches,
             .head_start = head_start,
+            .row_needs = row_needs,
+            .bias16_ok = bias16_ok,
             .prep = prep,
             .prep_xsum = prep_xsum,
             .scores = scores,
@@ -412,6 +462,8 @@ pub const Engine = struct {
         self.gpa.free(self.bound);
         self.gpa.free(self.steps);
         if (self.independent_launches) |v| self.gpa.free(v);
+        if (self.row_needs) |v| self.gpa.free(v);
+        if (self.bias16_ok) |v| self.gpa.free(v);
         if (self.prep) |b| b.deinit();
         if (self.scores) |b| b.deinit();
         if (self.partials) |b| b.deinit();
@@ -497,11 +549,23 @@ pub const Engine = struct {
         self.prep_key = null;
         self.x2_key = null; // climb 2, exact prefill
         self.expert_routes = null;
+        self.bias16 = null;
+        var skipped_barrier = false;
         for (self.steps, 0..) |step, step_i| {
             const first = step.first();
             const head = first >= (if (trace != null) self.program.head_start else self.head_start);
             if (head and out_first == T) break;
-            const row0: u32 = if (head) out_first else 0;
+            var row0: u32 = if (head) out_first else 0;
+            // knobs.tail_trim: a step runs on the rows something reads (traced forwards on all).
+            if (!head and trace == null) if (self.row_needs) |needs| {
+                row0 = needs[step_i].firstRow(T, out_first, self.knobs.tail_trim);
+                if (row0 == T) {
+                    // A skipped step that would have ended a run of overlapping launches
+                    // still has to end it: the next launch was only checked against it.
+                    if (self.independent_launches) |v| skipped_barrier = skipped_barrier or !v[step_i];
+                    continue;
+                }
+            };
             // prefill objective (prefill search): only consecutive linears keep the prepared input.
             switch (step) {
                 .op => |i| if (self.program.ops[i] != .linear) {
@@ -520,8 +584,9 @@ pub const Engine = struct {
             }
             {
                 if (trace == null) if (self.independent_launches) |v| {
-                    if (step_i == 0 or v[step_i]) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
+                    if ((step_i == 0 or v[step_i]) and !skipped_barrier) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
                 };
+                skipped_barrier = false;
                 defer self.ctx.nano_dispatch_flags = null;
                 switch (step) {
                     .op => |i| try self.encode(self.program.ops[i], row0, T - row0),
@@ -679,7 +744,10 @@ pub const Engine = struct {
             const key: @TypeOf(self.expert_routes.?) = .{ .off = r.off, .stride = r.stride, .row0 = p.row0, .rows = p.rows, .experts = p.experts, .top_k = p.top_k };
             const reusable = if (prev_routes) |prev| std.meta.eql(prev, key) else false;
             if (!reusable) {
-                if (block)
+                if (block and self.knobs.expert_lists_split and p.rows >= 256) {
+                    try gpu.dispatch(self.ctx, "mk_expert_row_counts", &.{ self.arena, tile[0] }, p, @as(usize, p.experts) * list_segments * 32, 128);
+                    try gpu.dispatch(self.ctx, "mk_expert_row_fill", &.{ self.arena, tile[0] }, p, @as(usize, p.experts) * list_segments * 32, 128);
+                } else if (block)
                     try gpu.dispatch(self.ctx, "mk_expert_row_lists_simd", &.{ self.arena, tile[0] }, p, @as(usize, p.experts) * 32, 128)
                 else
                     try gpu.dispatch(self.ctx, "mk_expert_row_lists", &.{ self.arena, tile[0] }, p, p.experts, 32);
@@ -890,9 +958,14 @@ pub const Engine = struct {
                 p.flags = @backingInt(g.round);
                 // Only distances at or below the last query position can be read.
                 p.taps = if (g.causal_prefix) @min(p.m, self.position + row0 + rows) else p.m;
-                if (self.knobs.bf16_prefill_tile != 0 and rows % 4 == 0 and p.dim == 16 and w.tensor.dtype == .bf16 and p.w % 2 == 0)
-                    try gpu.dispatch(self.ctx, "mk_grouped_project_bf16x4", &.{ self.arena, w.buffer }, &p, @as(usize, rows / 4) * g.groups * p.taps, 256)
-                else
+                if (self.knobs.bf16_prefill_tile != 0 and rows % 4 == 0 and p.dim == 16 and w.tensor.dtype == .bf16 and p.w % 2 == 0) {
+                    // knobs.relative_bias16: a chunk's bias for the staged tiles, as 16-bit words.
+                    const pack16 = if (self.bias16_ok) |ok| ok[g.out.state] and g.causal_prefix and g.round == .bf16 and rows >= min_tile_rows else false;
+                    if (pack16) self.bias16 = .{ .state = g.out.state, .row0 = row0, .rows = rows };
+                    if (self.knobs.relative_bias_d8 and p.m % 8 == 0) {
+                        try gpu.dispatch(self.ctx, if (pack16) "mk_grouped_project_bf16d8_pack" else "mk_grouped_project_bf16d8", &.{ self.arena, w.buffer }, &p, @as(usize, rows / 2) * g.groups * ((p.taps + 7) / 8), 256);
+                    } else try gpu.dispatch(self.ctx, if (pack16) "mk_grouped_project_bf16x4_pack" else "mk_grouped_project_bf16x4", &.{ self.arena, w.buffer }, &p, @as(usize, rows / 4) * g.groups * p.taps, 256);
+                } else
                     try gpu.dispatch(self.ctx, "mk_grouped_project", &.{ self.arena, w.buffer }, &p, @as(usize, rows) * g.groups * p.taps, 256);
             },
             .concat => |c| {
@@ -997,7 +1070,8 @@ pub const Engine = struct {
                 p.capacity = src.capacity(self.batch, self.context);
                 p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.taps + 1)));
                 p.flags = if (c.round == .bf16) 1 else 0;
-                try gpu.dispatch(self.ctx, "mk_inkling_short_conv", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+                const kernel: [:0]const u8 = if (self.knobs.conv_ring and p.capacity >= p.taps) "mk_inkling_short_conv_ring" else "mk_inkling_short_conv";
+                try gpu.dispatch(self.ctx, kernel, &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
             },
             .inkling_dynamic_conv => |c| {
                 const w = self.bound[c.static_weight];
@@ -1019,7 +1093,8 @@ pub const Engine = struct {
                 p.capacity = src.capacity(self.batch, self.context);
                 p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(2 * c.taps + 1)));
                 p.flags = if (c.round == .bf16) 1 else 0;
-                try gpu.dispatch(self.ctx, "mk_inkling_dynamic_conv", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+                const kernel: [:0]const u8 = if (self.knobs.conv_ring and p.capacity >= p.taps) "mk_inkling_dynamic_conv_ring" else "mk_inkling_dynamic_conv";
+                try gpu.dispatch(self.ctx, kernel, &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
             },
             .inkling_message_merge => |m| {
                 const hidden = self.words(m.hidden);
@@ -1091,6 +1166,15 @@ pub const Engine = struct {
                 p.capacity = k.capacity(self.batch, self.context);
                 const end = self.position + row0 + rows;
                 const visible = if (p.window == 0) end else @min(end, p.window);
+                // knobs.relative_bias16: a bias written 16-bit is read by the staged tiles
+                // over the rows it was written for, or the forward fails.
+                if (self.bias16) |b| if (b.state == a.bias.state) {
+                    self.bias16 = null;
+                    const tiles = self.knobs.relative_tile_prefill and rows >= min_tile_rows and a.dim == 128 and
+                        (if (self.relative_half) |hs| hs[a.keys] != null else false);
+                    if (!tiles or b.row0 != row0 or b.rows != rows) return error.RelativeBiasLayout;
+                    p.flags |= gpu.flag_bias16;
+                };
                 if (self.knobs.relative_tile_prefill and rows >= 8 and a.dim == 128) {
                     // Chunks that occupy the GPU: the reference's staged tiles, off the mirrors.
                     if (rows >= min_tile_rows) if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| {
@@ -1823,6 +1907,142 @@ test "packed scratch: states share words only when their lifetimes are a margin 
         }
     }
     try std.testing.expect(shared > 0);
+}
+
+/// knobs.tail_trim: the rows of a forward of T rows that an op has to compute: the
+/// last `tail`, and, with `logits`, the rows with logits and `before` rows ahead of
+/// the first of them.
+pub const RowNeed = struct {
+    tail: u32 = 0,
+    logits: bool = false,
+    before: u32 = 0,
+
+    pub const all: RowNeed = .{ .tail = std.math.maxInt(u32) };
+
+    pub fn merge(a: RowNeed, b: RowNeed) RowNeed {
+        return .{ .tail = @max(a.tail, b.tail), .logits = a.logits or b.logits, .before = @max(if (a.logits) a.before else 0, if (b.logits) b.before else 0) };
+    }
+    /// The need of an input an op reads up to `rows` rows behind each row it computes.
+    pub fn back(a: RowNeed, rows: u32) RowNeed {
+        return .{ .tail = if (a.tail == 0) 0 else a.tail +| rows, .logits = a.logits, .before = if (a.logits) a.before +| rows else 0 };
+    }
+    /// The first row to compute (T: none) when rows [out_first, T) have logits and a
+    /// trimmed op keeps at least `floor` of the last rows.
+    pub fn firstRow(a: RowNeed, T: u32, out_first: u32, floor: u32) u32 {
+        const from_tail = if (a.tail == 0) T else T -| @max(a.tail, floor);
+        return @min(from_tail, if (a.logits) out_first -| a.before else T);
+    }
+};
+
+/// knobs.tail_trim: per op, the rows something still reads. Walking the program
+/// backwards, a state's need is the largest any later reader has of it; an op needs
+/// what its output's state does. A sequence cache needs every row. A ring cache
+/// needs its horizon's worth of the last rows for the forwards that follow, and what
+/// this forward's own readers reach back to: a convolution reads `taps - 1` rows
+/// behind each row it computes, windowed attention `window - 1`. Head ops run on the
+/// rows with logits. Any other op computes each row from the same row of its inputs;
+/// an op kind not listed here keeps every row, and so do its inputs.
+pub fn rowNeeds(gpa: std.mem.Allocator, p: *const ir.Program) ![]RowNeed {
+    const needs = try gpa.alloc(RowNeed, p.ops.len);
+    errdefer gpa.free(needs);
+    const demand = try gpa.alloc(RowNeed, p.states.len);
+    defer gpa.free(demand);
+    for (p.states, demand) |s, *d| d.* = switch (s.kind) {
+        .sequence => RowNeed.all,
+        .ring => .{ .tail = s.horizon },
+        else => .{},
+    };
+    for ([_]ir.View{ p.logits, p.next }) |v| demand[v.state] = demand[v.state].merge(.{ .logits = true });
+    var i = p.ops.len;
+    while (i > 0) {
+        i -= 1;
+        const op = p.ops[i];
+        var reads: [3]?ir.View = undefined;
+        var write: ?ir.View = null;
+        plan.access(op, &reads, &write);
+        const row_wise = switch (op) {
+            .embed, .rmsnorm, .linear, .binary, .concat, .activate, .row_transform, .grouped_project, .softcapped_swiglu, .l2_clip, .depth_attention, .inkling_message_merge, .rope, .route_topk, .expert_gate_up, .expert_down, .argmax => true,
+            else => false,
+        };
+        var need: RowNeed = if (write) |w| demand[w.state] else .{};
+        if (i >= p.head_start) need = if (row_wise) .{ .logits = true } else RowNeed.all;
+        switch (op) {
+            .store => |s| need = demand[s.dst],
+            .inkling_short_conv => |c| demand[c.src] = demand[c.src].merge(need.back(c.taps - 1)),
+            .inkling_dynamic_conv => |c| demand[c.src] = demand[c.src].merge(need.back(c.taps - 1)),
+            .relative_attention => |a| for ([_]ir.StateId{ a.keys, a.values }) |id| {
+                demand[id] = demand[id].merge(if (a.window == 0) RowNeed.all else need.back(a.window - 1));
+            },
+            .conv => |c| {
+                need = RowNeed.all;
+                demand[c.src] = RowNeed.all;
+            },
+            .attention => |a| {
+                need = RowNeed.all;
+                demand[a.keys] = RowNeed.all;
+                demand[a.values] = RowNeed.all;
+            },
+            else => if (!row_wise) {
+                need = RowNeed.all;
+            },
+        }
+        needs[i] = need;
+        for (reads) |r| if (r) |v| {
+            demand[v.state] = demand[v.state].merge(need);
+        };
+    }
+    return needs;
+}
+
+test "tail_trim: only the last visit's attention output and feed-forward are trimmed" {
+    const inkling = @import("inkling2_loop.zig");
+    var p = try inkling.build(std.testing.allocator, inkling.test_config);
+    defer p.deinit();
+    const needs = try rowNeeds(std.testing.allocator, &p);
+    defer std.testing.allocator.free(needs);
+    const all = std.math.maxInt(u32);
+    var attentions: usize = 0;
+    var feed_forwards: usize = 0;
+    var first_trimmed: ?usize = null;
+    var last_cache_store: usize = 0;
+    for (p.ops, needs, 0..) |op, need, i| {
+        if (i < p.head_start and need.tail != all and first_trimmed == null) first_trimmed = i;
+        switch (op) {
+            .store => |s| if (p.states[s.dst].kind == .sequence) {
+                try std.testing.expectEqual(@as(u32, all), need.tail);
+                last_cache_store = i;
+            },
+            .relative_attention => {
+                attentions += 1;
+                // 48 visits: the last one's output feeds a 4-tap convolution whose
+                // output feeds the feed-forward's, so six rows back from each end.
+                if (attentions == 48) try std.testing.expectEqual(RowNeed{ .tail = 6, .logits = true, .before = 6 }, need) else try std.testing.expectEqual(@as(u32, all), need.tail);
+            },
+            .expert_down => {
+                feed_forwards += 1;
+                if (feed_forwards == 48) try std.testing.expectEqual(RowNeed{ .tail = 3, .logits = true, .before = 3 }, need) else try std.testing.expectEqual(@as(u32, all), need.tail);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 48), attentions);
+    // Nothing is trimmed before the last visit: its first trimmed op comes after
+    // the 47th visit's feed-forward, and its K and V are stored for every row.
+    var seen: usize = 0;
+    for (p.ops[0..first_trimmed.?]) |op| seen += @intFromBool(op == .expert_down);
+    try std.testing.expectEqual(@as(usize, 47), seen);
+    try std.testing.expect(last_cache_store > first_trimmed.?);
+    // The first row an op computes: a chunk without logits, the last chunk of a
+    // prompt, a single decode row, and a floor that keeps full-chunk kernels.
+    const need: RowNeed = .{ .tail = 6, .logits = true, .before = 6 };
+    try std.testing.expectEqual(@as(u32, 4090), need.firstRow(4096, 4096, 1));
+    try std.testing.expectEqual(@as(u32, 4089), need.firstRow(4096, 4095, 1));
+    try std.testing.expectEqual(@as(u32, 0), need.firstRow(1, 0, 1));
+    try std.testing.expectEqual(@as(u32, 3584), need.firstRow(4096, 4095, 512));
+    try std.testing.expectEqual(@as(u32, 0), need.firstRow(4096, 0, 512));
+    try std.testing.expectEqual(@as(u32, 0), RowNeed.all.firstRow(4096, 4096, 1));
+    try std.testing.expectEqual(@as(u32, 4096), (RowNeed{}).firstRow(4096, 4096, 512));
+    try std.testing.expectEqual(@as(u32, 7), (RowNeed{ .logits = true }).firstRow(8, 7, 512));
 }
 
 /// knobs.head_trim: one past the last op that writes a persistent state (a store):
