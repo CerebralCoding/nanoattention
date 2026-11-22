@@ -343,6 +343,19 @@ context and nothing past 32K was measured. Method, per-task rows and limits are 
 [benchmarks/inkling-long-context.md](../benchmarks/inkling-long-context.md);
 `tools/nano_inkling_tasks.py` is the runner.
 
+**Head tap.** `nano eval --heads-out PATH [--heads-from POS]` records, from
+position `POS` on, one forward a row with `Engine.tap` set (`exec.Tap`): per
+attention visit the L2 norm of each head's output over its 128 values (before the
+output gate), and per router the 8 chosen experts and their weights
+(`PATH.routes`). The tap finishes the command buffer after each attention and
+router and disables `tail_trim` and concurrent launches for the forward; it
+changes no arithmetic (tapped and untapped all-vocabulary logits of a real
+5,500-token sequence were compared with `cmp`, same chunking: identical, and
+the fixture test checks the same). `--heads-from` alone gives the same
+chunking with the tap off. Every head's norm is at most 11.31, the norm of one
+unit-RMS value vector. `video/agent/make_heads.py` turns it into the data of the
+video's heads shot.
+
 `relative_stripes` and `bf16_matrix_small` are not bit-identical to the paths
 they replace. On a 420-token transcript the striped kernels' all-vocabulary
 logits differ from `relative_split` and `relative_tile_prefill` by up to 3.5

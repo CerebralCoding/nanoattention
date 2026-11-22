@@ -774,4 +774,42 @@ test "native Inkling fixture matches sequential, batched and continued replay pa
         try trimmed.forward(prompt[15..], 0);
         try std.testing.expectEqualSlices(f32, try whole.logits(0), try trimmed.logits(0));
     }
+
+    // The head tap changes nothing the engine computes and records one block a visit and forward.
+    {
+        var plain = try Engine.init(gpa, &p, ctx, &store, .{ .batch = 8 }, 16);
+        defer plain.deinit();
+        var tapped = try Engine.init(gpa, &p, ctx, &store, .{ .batch = 8 }, 16);
+        defer tapped.deinit();
+        var tap: @import("exec.zig").Tap = .{ .gpa = gpa };
+        defer tap.deinit();
+        tapped.tap = &tap;
+        try plain.forward(tokens[0..3], 0);
+        try tapped.forward(tokens[0..3], 0);
+        for (0..3) |row| try std.testing.expectEqualSlices(f32, try plain.logits(@intCast(row)), try tapped.logits(@intCast(row)));
+        try plain.forward(tokens[3..4], 0);
+        try tapped.forward(tokens[3..4], 0);
+        try std.testing.expectEqualSlices(f32, try plain.logits(0), try tapped.logits(0));
+        try std.testing.expectEqual(@as(u32, 2), tap.forwards);
+        try std.testing.expectEqual(@as(u32, 2), tap.heads);
+        try std.testing.expectEqual(@as(usize, 48), tap.windows.items.len);
+        var global: usize = 0;
+        for (tap.windows.items) |w| {
+            try std.testing.expect(w == 0 or w == 4);
+            global += @intFromBool(w == 0);
+        }
+        try std.testing.expect(global > 0 and global < 48);
+        try std.testing.expectEqual(@as(usize, 48 * 2 * (3 + 1)), tap.norms.items.len);
+        var lit: usize = 0;
+        for (tap.norms.items) |x| {
+            try std.testing.expect(std.math.isFinite(x) and x >= 0);
+            lit += @intFromBool(x > 0);
+        }
+        try std.testing.expect(lit > tap.norms.items.len / 2);
+        try std.testing.expectEqual(@as(usize, 48 * (3 + 1) * 2 * tap.top_k), tap.routes.items.len);
+        var at: usize = 0;
+        while (at < tap.routes.items.len) : (at += 2 * tap.top_k) {
+            for (tap.routes.items[at..][0..tap.top_k]) |id| try std.testing.expect(id >= 0 and id < @as(f32, @floatFromInt(c.experts)));
+        }
+    }
 }

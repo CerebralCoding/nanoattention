@@ -208,3 +208,54 @@ The passing run used the corrected sandbox and CLI configuration. No global
 Codegraff provider settings were changed.
 
 [Sanitized result and source fingerprints](../benchmarks/codegraff-adapter.json).
+
+## Inkling 2 Mini as a coding agent (experimental)
+
+`tools/inkling_adapter.py` is the same loopback OpenAI chat adapter for Inkling
+2 Mini, on `nano session` (`--engine native`, the knob set of
+`tools/nano_inkling_tasks.py`) or on mlx-lm (`--engine mlx`, through
+`tools/inkling_mlx_session.py`, a worker with `nano session`'s JSONL protocol on
+mlx-lm's own prefill and decode). It imports `codegraff_adapter.py` and changes
+four things: the worker; the parser for the model's turns
+(`tools/inkling_tool_protocol.py`: `<|content_invoke_tool_json|>{"name":..,"args":{..}}`,
+arguments checked against the offered schemas, a malformed or unoffered call
+comes back as text and runs nothing); a previous model turn the client echoes
+back is spliced into the prompt as the IDs the engine generated, so a follow-up
+turn finds its prefix in the KV cache; and a warm-up request before the first
+one. Graff's built-in `nanoattention` provider asks for the model name `flint`,
+so that stays the route id; the engine behind it is Inkling.
+`tools/inkling_agent.py` launches Graff on it as `graff_native.py` does, and
+`--sandbox` runs Graff under `sandbox-exec` (writes only in the workspace and
+temporary folders, credentials folders unreadable, loopback the only network).
+`--record` appends the IDs of every request to a local file.
+
+`tools/inkling_agent_replay.py` replays a recording on either engine: the same
+suffixes and KV reuse, as many generated tokens as recorded, each request timed.
+When an engine's own tokens differ from the recording its cache is rebuilt,
+untimed, from the recorded prefix before the next request, so both engines time
+identical work.
+
+One result, on one task (a six-test Python package with one bug; Graff's shell
+and file tools; `video/agent/` in the video folder), one M3 Ultra, greedy:
+
+| | Native | mlx-lm (4,096-token chunks) |
+| --- | ---: | ---: |
+| Own session: requests, generated tokens, tests after | 4, 350, 6 of 6 pass | 4, 395, 6 of 6 pass |
+| Native's four recorded requests, replayed 3 times (median) | 13.4 s | 16.6 s |
+| of which prefill / decode | 4.6 s / 8.8 s (39.7 tok/s) | 4.8 s / 11.8 s (29.6 tok/s) |
+
+Limits: "tests after" was checked by a script after each session, not taken
+from the model's claim; the task wording is the one of three tried that passed
+on native (the original, "find the bug, fix it and run the tests until they
+pass", and a third made native write a malformed tool call on its second request
+and stop; the one used passed on both engines); the two engines' own sessions took
+different turns, which is why the comparison is the replay. exo was not run: stock exo does not load this
+checkpoint and the local adapter has no tool-call route.
+
+Finding on the way: on that second request's prompt (4,972 tokens) native's
+first 12 greedy tokens were the same from an empty cache and after KV reuse,
+and the same as mlx-lm's from an empty cache, but mlx-lm's own multi-turn
+session (single-token decode, then a multi-token continuation of the same
+cache) produced different tokens there and so a different trajectory. The cause
+(this worker or mlx-lm's continuation of a rotating cache) was not
+investigated.

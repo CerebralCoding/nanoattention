@@ -43,6 +43,27 @@ pub const Stats = struct {
     wait_seconds: f64 = 0,
 };
 
+/// What `Engine.tap` collects, in the order the forwards ran: per forward, per
+/// attention visit, per row, `heads` floats (the L2 norm of each head's attention
+/// output over its `dim` values, before the output gate); and per forward, per
+/// router (one a visit), per row, `top_k` expert ids and then their `top_k` route
+/// weights. `windows` has each visit's sliding window (0 = global), from the first forward.
+pub const Tap = struct {
+    gpa: std.mem.Allocator,
+    heads: u32 = 0,
+    top_k: u32 = 0,
+    forwards: u32 = 0,
+    norms: std.ArrayList(f32) = .empty,
+    routes: std.ArrayList(f32) = .empty,
+    windows: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(self: *Tap) void {
+        self.norms.deinit(self.gpa);
+        self.routes.deinit(self.gpa);
+        self.windows.deinit(self.gpa);
+    }
+};
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     program: *const ir.Program,
@@ -69,6 +90,9 @@ pub const Engine = struct {
     head_start: u32,
     /// knobs.tail_trim: per step, the rows of a forward something still reads.
     row_needs: ?[]RowNeed = null,
+    /// Diagnostics (`nano eval --heads-out`): while set, every forward also records what
+    /// each attention visit and each router did. Null in normal runs; no arithmetic changes.
+    tap: ?*Tap = null,
     /// knobs.relative_bias16: the distance-bias states one grouped projection writes
     /// and one staged-tile attention reads, and the rows of the one written 16-bit
     /// in this forward until its attention has read them.
@@ -557,7 +581,7 @@ pub const Engine = struct {
             if (head and out_first == T) break;
             var row0: u32 = if (head) out_first else 0;
             // knobs.tail_trim: a step runs on the rows something reads (traced forwards on all).
-            if (!head and trace == null) if (self.row_needs) |needs| {
+            if (!head and trace == null and self.tap == null) if (self.row_needs) |needs| {
                 row0 = needs[step_i].firstRow(T, out_first, self.knobs.tail_trim);
                 if (row0 == T) {
                     // A skipped step that would have ended a run of overlapping launches
@@ -583,7 +607,7 @@ pub const Engine = struct {
                 else => self.x2_key = null,
             }
             {
-                if (trace == null) if (self.independent_launches) |v| {
+                if (trace == null and self.tap == null) if (self.independent_launches) |v| {
                     if ((step_i == 0 or v[step_i]) and !skipped_barrier) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
                 };
                 skipped_barrier = false;
@@ -597,6 +621,7 @@ pub const Engine = struct {
                 }
             }
             const end = first + step.len();
+            if (self.tap) |tap| try self.tapStep(tap, step, T);
             if (trace) |t| while (next_trace < self.program.traces.len and self.program.traces[next_trace].after_op < end) : (next_trace += 1) {
                 try self.ctx.finish();
                 const v = self.program.traces[next_trace].view;
@@ -614,8 +639,40 @@ pub const Engine = struct {
         const after = self.ctx.stats();
         self.last = .{ .dispatches = after.dispatches - before.dispatches, .submissions = after.submissions - before.submissions, .gpu_seconds = after.gpu_seconds - before.gpu_seconds, .encode_seconds = t_encoded - t_begin, .wait_seconds = t_done - t_encoded };
         self.position += T;
+        if (self.tap) |tap| tap.forwards += 1;
         self.out_first = out_first;
         self.out_end = T;
+    }
+
+    /// Copy what a tapped step produced (see `Tap`). Steps other than an attention or
+    /// a router are not looked at.
+    fn tapStep(self: *Engine, tap: *Tap, step: plan.Step, T: u32) !void {
+        const i = switch (step) {
+            .op => |i| i,
+            else => return,
+        };
+        switch (self.program.ops[i]) {
+            .relative_attention => |a| {
+                try self.ctx.finish();
+                const o = self.words(a.out);
+                const floats = self.arena.floats();
+                if (tap.forwards == 0) try tap.windows.append(tap.gpa, a.window);
+                tap.heads = a.heads;
+                for (0..T) |r| for (0..a.heads) |h| {
+                    var sum: f64 = 0;
+                    for (floats[o.off + r * o.stride + h * a.dim ..][0..a.dim]) |x| sum += @as(f64, x) * x;
+                    try tap.norms.append(tap.gpa, @floatCast(@sqrt(sum)));
+                };
+            },
+            .route_topk => |r| {
+                try self.ctx.finish();
+                const o = self.words(r.out);
+                const floats = self.arena.floats();
+                tap.top_k = r.top_k;
+                for (0..T) |row| try tap.routes.appendSlice(tap.gpa, floats[o.off + row * o.stride ..][0 .. 2 * r.top_k]);
+            },
+            else => {},
+        }
     }
 
     /// All-vocabulary logits of batch row `row` of the last forward.

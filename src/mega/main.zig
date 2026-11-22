@@ -15,7 +15,7 @@ const usage =
     \\nano: model-agnostic Zig + Metal megakernel (Apple Silicon)
     \\  nano inspect CHECKPOINT
     \\  nano eval CHECKPOINT --tokens-file F [--feed T] [--positions-file F | --positions all|i,j,..]
-    \\        [--logits-out PATH] [--hidden-out PATH] [--greedy N]
+    \\        [--logits-out PATH] [--hidden-out PATH] [--greedy N] [--heads-out PATH [--heads-from POS]]
     \\  nano generate CHECKPOINT --tokens-file F [--max-tokens N]
     \\  nano session CHECKPOINT [--context N]
     \\  nano mlx-op linear --m M --k K --n N --group G --weights W --x X --out Y  (src/mega/mlxop.zig)
@@ -105,6 +105,8 @@ pub fn main(init: std.process.Init) !void {
     var hidden_out: ?[]const u8 = null;
     var feed: u32 = 1;
     var greedy: u32 = 0;
+    var heads_out: ?[]const u8 = null;
+    var heads_from: u32 = 0;
     var max_tokens: u32 = 32;
     var bench_input: bench.Input = .{};
     // --knob flags apply after --knobs FILE whatever their order on the line.
@@ -138,6 +140,10 @@ pub fn main(init: std.process.Init) !void {
             hidden_out = value;
         } else if (std.mem.eql(u8, flag, "--feed")) {
             feed = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--heads-out")) {
+            heads_out = value;
+        } else if (std.mem.eql(u8, flag, "--heads-from")) {
+            heads_from = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--greedy")) {
             greedy = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--max-tokens")) {
@@ -194,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
             while (iter.next()) |item| try list.append(a, try std.fmt.parseInt(u32, item, 10));
             positions = list.items;
         }
-        return evaluate(&loaded.engine, a, prompt, positions, feed, logits_out, hidden_out, greedy);
+        return evaluate(&loaded.engine, a, prompt, positions, feed, logits_out, hidden_out, greedy, heads_out, heads_from);
     }
     return error.UnknownCommand;
 }
@@ -269,7 +275,7 @@ fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max
     try io.out("\n");
 }
 
-fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, positions: []const u32, feed_arg: u32, logits_out: ?[]const u8, hidden_out: ?[]const u8, greedy: u32) !void {
+fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, positions: []const u32, feed_arg: u32, logits_out: ?[]const u8, hidden_out: ?[]const u8, greedy: u32, heads_out: ?[]const u8, heads_from: u32) !void {
     // A feed beyond a context-clamped batch (engine.batch == context >= prompt)
     // means the whole prompt in one forward; it was rejected as InvalidFeed,
     // which made QD admission reject every batch > context (prefill search).
@@ -293,8 +299,17 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
     var forwards: u64 = 0;
     var next_pos: usize = 0;
     var i: u32 = 0;
+    // --heads-out: from position `heads_from` on, one row a forward with the engine's tap on
+    // (what each attention visit's heads and each router did); before it, the usual feed.
+    var tap: exec.Tap = .{ .gpa = a };
+    defer engine.tap = null;
     while (i < T) {
-        const n = @min(feed, T - i);
+        var n = @min(feed, T - i);
+        // (--heads-from alone gives the same chunking with the tap off, for comparing logits.)
+        if (heads_out != null or heads_from != 0) {
+            if (i < heads_from) n = @min(n, heads_from - i) else n = 1;
+            engine.tap = if (heads_out != null and i >= heads_from) &tap else null;
+        }
         // Head rows: from the first stored position in this chunk (always the prompt's last).
         var first: u32 = n;
         if (next_pos < positions.len and positions[next_pos] < i + n) first = positions[next_pos] - i;
@@ -312,6 +327,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
         }
         i += n;
     }
+    if (heads_out != null) engine.tap = &tap;
     var generated: std.ArrayList(u32) = .empty;
     var row: u32 = engine.out_end - 1;
     for (0..greedy) |g| {
@@ -323,7 +339,15 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
     }
     if (logits_out) |path| try io.writeFile(a, path, std.mem.sliceAsBytes(logits));
     if (hidden_out) |path| try io.writeFile(a, path, std.mem.sliceAsBytes(hidden.?));
+    if (heads_out) |path| {
+        try io.writeFile(a, path, std.mem.sliceAsBytes(tap.norms.items));
+        try io.writeFile(a, try std.fmt.allocPrint(a, "{s}.routes", .{path}), std.mem.sliceAsBytes(tap.routes.items));
+    }
     const summary = .{
+        .tap_forwards = tap.forwards,
+        .tap_heads = tap.heads,
+        .tap_top_k = tap.top_k,
+        .tap_windows = tap.windows.items,
         .tokens = T,
         .feed = feed,
         .positions = positions,
