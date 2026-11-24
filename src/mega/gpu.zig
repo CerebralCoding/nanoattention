@@ -108,17 +108,31 @@ comptime {
     if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 6 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
 }
 
+pub const lfm_source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
+
 pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_plan.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("inkling_fast.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
     // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
     // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
     "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
 
-pub fn open() !metal.Context {
-    const handle = fm_open(source) orelse {
+pub fn openSource(src: [:0]const u8) !metal.Context {
+    const handle = fm_open(src) orelse {
         std.debug.print("Metal: {s}\n", .{std.mem.span(fm_error())});
         return error.MetalFailure;
     };
     return .{ .handle = handle };
+}
+
+pub fn openForModel(model_type: []const u8) !metal.Context {
+    if (std.mem.eql(u8, model_type, "lfm2") or std.mem.eql(u8, model_type, "lfm3")) {
+        return openSource(lfm_source);
+    }
+    return openSource(source);
+}
+
+pub fn open() !metal.Context {
+    return openSource(source);
 }
 
 pub fn dispatch(ctx: metal.Context, kernel: [:0]const u8, buffers: []const metal.Buffer, p: anytype, threads: usize, group: usize) !void {

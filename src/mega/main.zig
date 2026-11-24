@@ -1,6 +1,7 @@
 //! nano: the model-agnostic megakernel executable. The front end is chosen by
 //! the checkpoint's config.json model_type.
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const exec = @import("exec.zig");
 const loader = @import("loader.zig");
@@ -10,6 +11,9 @@ const bench = @import("bench.zig");
 const io = @import("io.zig");
 const Knobs = @import("knobs.zig").Knobs;
 const weights = @import("weights");
+
+pub const std_options_debug_threaded_io: ?*std.Io.Threaded = if (builtin.os.tag == .ios) null else std.Io.Threaded.global_single_threaded;
+pub const std_options_debug_io: std.Io = if (builtin.os.tag == .ios) io.ios_debug_io else std.Io.Threaded.global_single_threaded.io();
 
 const usage =
     \\nano: model-agnostic Zig + Metal megakernel (Apple Silicon)
@@ -56,7 +60,28 @@ fn parseTokens(a: std.mem.Allocator, bytes: []const u8, key: []const u8) ![]u32 
     return out;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init_arg: if (builtin.os.tag == .ios) std.process.Init.Minimal else std.process.Init) !void {
+    if (builtin.os.tag == .ios) {
+        const gpa = std.heap.c_allocator;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var environ_map = try init_arg.environ.createMap(gpa);
+        defer environ_map.deinit();
+        const preopens = try std.process.Preopens.init(arena.allocator());
+        return runMain(.{
+            .minimal = init_arg,
+            .arena = &arena,
+            .gpa = gpa,
+            .io = io.ios_debug_io,
+            .environ_map = &environ_map,
+            .preopens = preopens,
+        });
+    } else {
+        return runMain(init_arg);
+    }
+}
+
+fn runMain(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const gpa = init.gpa;
     var args = std.process.Args.Iterator.init(init.minimal.args);

@@ -45,7 +45,8 @@ pub fn buildProgram(gpa: std.mem.Allocator, a: std.mem.Allocator, directory: []c
 
 pub fn load(gpa: std.mem.Allocator, a: std.mem.Allocator, directory: []const u8, knobs: Knobs, context: u32, options: frontend.Options) !*Loaded {
     const config = try readFile(a, try std.fs.path.join(a, &.{ directory, "config.json" }));
-    const ctx = try gpu.open();
+    const model_type = try exec.modelType(a, config);
+    const ctx = try gpu.openForModel(model_type);
     errdefer ctx.deinit();
     const store = try gpa.create(weights.Store);
     errdefer gpa.destroy(store);
