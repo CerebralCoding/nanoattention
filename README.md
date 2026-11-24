@@ -1,8 +1,8 @@
 <h1 align="center">nanoattention</h1>
 
-<p align="center"><strong>Flint inference, close to the metal.</strong></p>
+<p align="center"><strong>Inkling 2 Mini, Flint, and Liquid AI inference, close to the metal.</strong></p>
 
-<p align="center">A native Zig + Metal engine for Apple Silicon.<br>Explicit memory. Persistent KV caches. Lean-checked execution contracts.</p>
+<p align="center">A multi-model native Zig + Metal engine for Apple Silicon.<br>Explicit memory. Persistent KV caches. Lean-checked execution contracts.</p>
 
 <p align="center">
   <img alt="Apple Silicon macOS" src="https://img.shields.io/badge/platform-Apple%20Silicon-555">
@@ -14,16 +14,20 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#what-it-does">What it does</a> ·
-  <a href="#use-with-codegraff">CodeGraff</a> ·
+  <a href="#inkling-2-mini-nano">Inkling 2 Mini</a> ·
+  <a href="#use-with-nanoharness--codegraff">NanoHarness &amp; CodeGraff</a> ·
   <a href="#performance">Performance</a> ·
   <a href="#correctness-and-proofs">Proofs</a> ·
   <a href="#development">Development</a>
 </p>
 
-Run [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint) locally with a
-small, inspectable inference stack. Zig maps the checkpoint, owns buffers and KV
-state, and schedules the model. Metal kernels execute attention, packed quantized
-projections, expert routing, and the vocabulary head on the GPU.
+Run [Thinking Machines Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
+[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint), and Liquid AI
+(`LFM3-1.7B` / `LFM2.5-1.2B`) locally on Apple Silicon with a small, inspectable
+Zig + Metal stack. `nano` runs Inkling 2 Mini and Liquid AI models through a
+model-agnostic megakernel; `flint` drives Recursive Flint. Zig maps the checkpoint,
+owns buffers and KV/ring state, and schedules execution; Metal kernels run attention,
+quantized projections, expert routing, and the vocabulary head on the GPU.
 
 **The native runtime does not link MLX, PyTorch, or CUDA.** Optional Python tools
 handle tokenization, chat templates, and the local HTTP bridge—not model math.
@@ -43,8 +47,12 @@ cd nanoattention
 zig build -Doptimize=ReleaseSafe
 ```
 
-This repository is private; cloning requires access. The executable is
-`zig-out/bin/flint`. There is no runtime or model auto-install step.
+This repository is private; cloning requires access. Building produces both
+`zig-out/bin/nano` (the model-agnostic megakernel for Inkling 2 Mini and Liquid AI
+models) and `zig-out/bin/flint` (the dedicated engine for Recursive Flint). Both
+binaries (`nano-aarch64-macos.tar.gz` and `flint-aarch64-macos.tar.gz`) also ship
+in [GitHub Releases](https://github.com/justrach/nanoattention/releases) starting at
+`v0.2.0`. There is no runtime or model auto-install step.
 
 ### 2. Get the weights
 
@@ -124,11 +132,13 @@ The loader also supports F32/F16/BF16 tensors and mixed-precision embeddings.
 NVIDIA NVFP4 is not supported. The tested INT4 export has received more full-model
 validation than the published BF16 checkpoint.
 
-## Use with CodeGraff
+## Use with NanoHarness & CodeGraff
+
+`justrach/nanoharness` integrates both `flint` and `nano` directly from **Settings → Agents** on Apple Silicon Macs (exposing `nanoattention/flint` and `nanoattention/inkling-2-mini` over a managed local OpenAI-compatible loopback server with unified-memory sizing).
 
 Keep the model local while CodeGraff reads files, runs tools, and handles the coding
 conversation. The owned launcher starts one loopback adapter and one persistent
-native worker, then selects `nanoattention/flint` for the chosen workspace.
+native worker, then selects `nanoattention/flint` for the chosen workspace (`tools/inkling_adapter.py` and `tools/inkling_agent.py` run Inkling 2 Mini through the same provider slot).
 
 ```sh
 python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 1400 -- \
@@ -235,14 +245,31 @@ LFM3 beat pipelined MLX on decode; LFM2.5 did not reliably beat it. MLX was
 faster on prefill for both. See [measurements and reproduction commands](benchmarks/liquid-attention.md),
 [the engine design](docs/MEGAKERNEL.md), and [LFM3 CLI usage](docs/CLI.md).
 
-**Experimental: Inkling 2 Mini.** `nano` can inspect and run the original
-mixed-precision checkpoint with token IDs. MLX parity has not passed; see the
-[verified workflow and limits](docs/MEGAKERNEL.md#inkling-2-mini-experimental).
-With the opt-in knobs, on twelve real prompts of 4K to 32K tokens on the tested
-M3 Ultra, it decodes 29 to 36% faster than the pinned MLX reference and reaches
-the first token 2.7 to 4.6% sooner than MLX at MLX's best prefill chunk (7.6 to
-9.6% sooner at its default)
-([measurements](benchmarks/inkling-long-context.md)).
+## Inkling 2 Mini (`nano`)
+
+`nano` natively runs [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (`inkling2_loop`: 24 physical layers expanded to 48 logical loop visits, 128 routed NVFP4/MXFP8 experts, relative & depth attention, BF16 dense projections, ~19.5 GB checkpoint) with **zero MLX or PyTorch runtime dependency**:
+
+```sh
+./zig-out/bin/nano inspect "$CKPT"
+./zig-out/bin/nano bench "$CKPT" --knobs src/mega/presets/inkling.json \
+  --context 4200 --prompt-tokens 4096 --decode-tokens 64 --repeats 3
+./zig-out/bin/nano session "$CKPT" --context 32768 --knobs src/mega/presets/inkling.json
+python3 tools/inkling_adapter.py "$CKPT" --engine native --binary zig-out/bin/nano
+```
+
+Matched 3-repeat `nano bench` throughput on an **Apple M3 Ultra (60 GPU cores, 256 GB unified memory)** (`--decode-tokens 64 --repeats 3 --decode-detail 1`, `0` gate redos) with [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json):
+
+| Prompt (context) | Long-Context Base (Pre / Dec) | Pre-Qwegn `megakernel-v1` (Pre / Dec) | `inkling.json` `v0.2.0` (Pre / Dec) | Speedup vs Base |
+| ---: | ---: | ---: | ---: | ---: |
+| 4,096 (`4,200`) | `1,263.44` / `39.82` tok/s | `1,403.25` / `54.60` tok/s | **`1,570.07` / `64.49` tok/s** | **+24.3% / +62.0%** |
+| 16,384 (`16,512`) | `1,197.98` / `38.37` tok/s | `1,330.69` / `51.83` tok/s | **`1,477.74` / `61.24` tok/s** | **+23.4% / +59.6%** |
+| 32,768 (`32,900`) | `1,069.70` / `36.72` tok/s | `1,249.00` / `48.74` tok/s | **`1,376.23` / `58.06` tok/s** | **+28.7% / +58.1%** |
+
+Against published `ml-explore/mlx-lm#2086` numbers (which ran on an **80-core M3 Ultra / 512 GB**, reporting `1,516.3` / `32.07` tok/s at 4K and `1,472.3` / `32.50` tok/s at 16K), `nano v0.2.0` on 60 cores achieves **`2.01×`** higher decode at 4K and **`1.88×`** at 16K, and exceeds MLX's raw 80-core prefill at both 4K (`+3.5%`) and 16K (`+0.4%`).
+
+See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-Elites QD grid across 4K/16K/32K in [`benchmarks/inkling-qd/elites.md`](benchmarks/inkling-qd/elites.md), the Lean 4 contracts in [`proofs/Inkling.lean`](proofs/Inkling.lean) (`49` public / `53` total theorems), and [`docs/MEGAKERNEL.md`](docs/MEGAKERNEL.md).
+
+**Parity & limits:** `inkling.json` is bit-identical (`max_abs = 0.0`) to pre-Qwegn `megakernel-v1` across `cake_toks` (`feed=1, 8`), `real_512` (`feed=512`, `560/560` top-1, `32/32` greedy), and `long_real` (`feed=512`, `568/568` top-1, `32/32` greedy), matches `64/64` greedy tokens on `cake_toks` against baseline, and passes [`tools/nano_inkling_attention_check.py`](tools/nano_inkling_attention_check.py) (`24/24` top-1 agreement across six arm pairs). Note that `nano` runs the text path only: the vision tower and the checkpoint's bundled `mtp.safetensors` block-diffusion drafter are not yet wired.
 
 ## Development
 
@@ -284,7 +311,9 @@ does not remove physical-memory or Metal-buffer limits.
 Original code and contributions are **[MIT licensed](LICENSE)**. Adapted Recursive
 `rec` components retain Apache-2.0 terms; adapted MLX components retain MIT terms
 and notices. The top-level MIT license does not replace those upstream obligations.
-Model weights are not bundled and remain separately licensed.
+Model weights are not bundled and remain separately licensed; Recursive Flint,
+Thinking Machines Inkling 2 Mini, and Liquid AI checkpoints retain their
+respective upstream licenses.
 
 See [third-party notices](THIRD_PARTY_NOTICES.md), [provenance](PROVENANCE.md), and
 [`licenses/`](licenses/).
