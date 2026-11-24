@@ -1,19 +1,34 @@
 const std = @import("std");
 
+fn addMetalSdk(b: *std.Build, module: *std.Build.Module, sdk: ?[]const u8) void {
+    module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
+    if (sdk) |dir| {
+        module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ dir, "System/Library/Frameworks" }) });
+        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ dir, "usr/lib" }) });
+        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ dir, "usr/include" }) });
+    }
+    module.linkFramework("Foundation", .{});
+    module.linkFramework("Metal", .{});
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     if (target.result.os.tag != .macos or target.result.cpu.arch != .aarch64)
         @panic("Flint Metal currently requires Apple Silicon macOS");
+    const sdk: ?[]const u8 = if (b.option([]const u8, "sdk", "macOS SDK path for non-native macOS target builds")) |s|
+        s
+    else if (!target.query.isNative())
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result)
+    else
+        null;
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
-    module.linkFramework("Foundation", .{});
-    module.linkFramework("Metal", .{});
+    addMetalSdk(b, module, sdk);
     const proofs = b.addSystemCommand(&.{"python3"});
     proofs.addFileArg(b.path("tools/check_resident_proofs.py"));
     b.step("proofs", "Build Lean proofs and check exact Zig/Metal plan bindings").dependOn(&proofs.step);
@@ -26,9 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    bench_module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
-    bench_module.linkFramework("Foundation", .{});
-    bench_module.linkFramework("Metal", .{});
+    addMetalSdk(b, bench_module, sdk);
     const bench = b.addExecutable(.{ .name = "flint-bench", .root_module = bench_module });
     bench.step.dependOn(&proofs.step);
     b.installArtifact(bench);
@@ -38,9 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    speculative_module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
-    speculative_module.linkFramework("Foundation", .{});
-    speculative_module.linkFramework("Metal", .{});
+    addMetalSdk(b, speculative_module, sdk);
     const speculative_bench = b.addExecutable(.{ .name = "flint-speculative-bench", .root_module = speculative_module });
     speculative_bench.step.dependOn(&proofs.step);
     b.installArtifact(speculative_bench);
@@ -59,9 +70,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{.{ .name = "weights", .module = shared }},
     });
-    nano_module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
-    nano_module.linkFramework("Foundation", .{});
-    nano_module.linkFramework("Metal", .{});
+    addMetalSdk(b, nano_module, sdk);
     const nano = b.addExecutable(.{ .name = "nano", .root_module = nano_module });
     nano.step.dependOn(&proofs.step);
     b.installArtifact(nano);
