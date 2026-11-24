@@ -1,9 +1,12 @@
 name = "residentProofs"
 version = "0.1.0"
-defaultTargets = ["ResidentProofs", "resident_emit"]
+defaultTargets = ["ResidentProofs", "Inkling", "resident_emit"]
 
 [[lean_lib]]
 name = "ResidentProofs"
+
+[[lean_lib]]
+name = "Inkling"
 
 [[lean_exe]]
 name = "resident_emit"

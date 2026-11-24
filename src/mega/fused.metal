@@ -10,10 +10,10 @@ struct MKMat {
     ulong w, s, b;
     uint m, y, ys, sdtype, bdtype, pad;
 };
-// Host mirror: ParamsX in src/mega/gpu.zig (160 + 4 * 48 + 16 bytes).
+// Host mirror: ParamsX in src/mega/gpu.zig (160 + 6 * 48 + 16 bytes).
 struct MKX {
     MK p;
-    MKMat mat[4];
+    MKMat mat[6];
     uint count, act_a, act_b, kind;
 };
 

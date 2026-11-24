@@ -23,9 +23,15 @@ pub const Fusion = struct {
     /// rmsnorm(q), rmsnorm(k) per head in place, rope(q), rope(k), store(k), store(v): one launch.
     attn_prep: bool = false,
     bf16_cast: bool = false,
+    controller_merge: bool = false,
+    bf16_projections: bool = false,
+    head_softcap: bool = false,
+    depth_norm: bool = false,
+    inkling_conv: bool = false,
+    relative_gate: bool = false,
 
     pub fn any(self: Fusion) bool {
-        return self.projections or self.glu or self.norms or self.add_norm or self.conv or self.gate or self.attn_prep or self.bf16_cast;
+        return self.projections or self.glu or self.norms or self.add_norm or self.conv or self.gate or self.attn_prep or self.bf16_cast or self.controller_merge or self.bf16_projections or self.head_softcap or self.depth_norm or self.inkling_conv or self.relative_gate;
     }
 };
 
@@ -37,23 +43,37 @@ pub const Step = union(enum) {
     conv: u32,
     gate: u32,
     attn_prep: u32,
-    add_norm: u32,
+    add_norm: struct { first: u32, ops_len: u32, round_add: bool, round_out: bool },
     bf16_cast: u32,
+    controller_merge: u32,
+    bf16_projections: struct { first: u32, count: u32, ops_len: u32, round_mask: u32 },
+    head_softcap: u32,
+    controller_depth_norms: u32,
+    depth_norm: struct { first: u32, ops_len: u32, round_out: bool },
+    inkling_conv: u32,
+    relative_gate: u32,
 
     pub fn first(self: Step) u32 {
         return switch (self) {
-            .op, .glu, .norms, .conv, .gate, .attn_prep, .add_norm, .bf16_cast => |i| i,
+            .op, .glu, .norms, .conv, .gate, .attn_prep, .bf16_cast, .controller_merge, .head_softcap, .controller_depth_norms, .inkling_conv, .relative_gate => |i| i,
+            .add_norm => |m| m.first,
             .projections => |m| m.first,
+            .bf16_projections => |m| m.first,
+            .depth_norm => |m| m.first,
         };
     }
     pub fn len(self: Step) u32 {
         return switch (self) {
             .op => 1,
             .projections => |m| m.count,
-            .glu, .norms => 3,
-            .conv => 4,
-            .gate, .add_norm, .bf16_cast => 2,
+            .glu, .norms, .controller_merge, .head_softcap => 3,
+            .conv, .relative_gate => 4,
+            .gate, .bf16_cast, .inkling_conv => 2,
             .attn_prep => 6,
+            .add_norm => |m| m.ops_len,
+            .bf16_projections => |m| m.ops_len,
+            .controller_depth_norms => 5,
+            .depth_norm => |m| m.ops_len,
         };
     }
 };
@@ -182,59 +202,143 @@ pub fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
 }
 
 const LaunchAccess = struct {
-    reads: [3]?ir.View,
-    write: ir.View,
+    reads: [6]?ir.View = @splat(null),
+    writes: [6]?ir.View = @splat(null),
 
     fn overlapsWrites(a: LaunchAccess, b: LaunchAccess) bool {
-        if (overlaps(a.write, b.write)) return true;
-        for (a.reads) |read| if (read) |v| if (overlaps(v, b.write)) return true;
-        for (b.reads) |read| if (read) |v| if (overlaps(v, a.write)) return true;
+        for (a.writes) |wa| if (wa) |av| {
+            for (b.writes) |wb| if (wb) |bv| if (overlaps(av, bv)) return true;
+            for (b.reads) |rb| if (rb) |bv| if (overlaps(av, bv)) return true;
+        };
+        for (b.writes) |wb| if (wb) |bv| {
+            for (a.reads) |ra| if (ra) |av| if (overlaps(av, bv)) return true;
+        };
         return false;
     }
 };
 
+fn cacheView(p: *const ir.Program, id: ir.StateId) ir.View {
+    return .{ .state = id, .width = p.states[id].width };
+}
+
 fn launchAccess(step: Step, p: *const ir.Program, info: []const WeightInfo) ?LaunchAccess {
-    // An absorbed BF16 cast writes back to the producer's output in the
-    // same dispatch. Other fused steps and multi-launch ops are opaque.
-    const op = switch (step) {
-        .op, .bf16_cast => |i| p.ops[i],
-        else => return null,
-    };
-    switch (op) {
-        .linear => |l| if (!info[l.w].dense) return null,
-        .embed, .rmsnorm, .binary, .row_transform, .grouped_project, .concat, .activate,
-        .softcapped_swiglu, .depth_attention, .inkling_message_merge, .l2_clip, .route_topk,
-        .store, .conv, .inkling_short_conv, .inkling_dynamic_conv => {},
+    switch (step) {
+        .op, .bf16_cast => |i| {
+            const op = p.ops[i];
+            switch (op) {
+                .linear => |l| if (!info[l.w].dense) return null,
+                .embed, .rmsnorm, .binary, .row_transform, .grouped_project, .concat, .activate,
+                .softcapped_swiglu, .depth_attention, .inkling_message_merge, .l2_clip, .route_topk,
+                .store, .conv, .inkling_short_conv, .inkling_dynamic_conv => {},
+                else => return null,
+            }
+            var reads: [3]?ir.View = undefined;
+            var write: ?ir.View = null;
+            access(op, &reads, &write);
+            var out: LaunchAccess = .{};
+            out.reads[0] = reads[0];
+            out.reads[1] = reads[1];
+            out.reads[2] = reads[2];
+            // Persistent caches occupy distinct buffers. Conservatively mark a
+            // whole cache as read or written, even when only one position is used.
+            switch (op) {
+                .store => |o| write = cacheView(p, o.dst),
+                .conv => |o| out.reads[2] = cacheView(p, o.src),
+                .inkling_short_conv => |o| out.reads[2] = cacheView(p, o.src),
+                .inkling_dynamic_conv => |o| out.reads[2] = cacheView(p, o.src),
+                else => {},
+            }
+            out.writes[0] = write orelse return null;
+            return out;
+        },
+        .inkling_conv => |i| {
+            const c = p.ops[i + 1].inkling_short_conv;
+            const ring = cacheView(p, c.src);
+            var out: LaunchAccess = .{};
+            out.reads[0] = c.residual;
+            out.reads[1] = ring;
+            out.writes[0] = c.out;
+            out.writes[1] = ring;
+            return out;
+        },
+        .add_norm => |m| {
+            const b = p.ops[m.first].binary;
+            const norm_idx = m.first + 1 + @intFromBool(m.round_add);
+            const n = p.ops[norm_idx].rmsnorm;
+            var out: LaunchAccess = .{};
+            out.reads[0] = b.a;
+            out.reads[1] = b.b;
+            out.writes[0] = b.out;
+            out.writes[1] = n.out;
+            return out;
+        },
+        .depth_norm => |m| {
+            const d = p.ops[m.first].depth_attention;
+            const n = p.ops[m.first + 1].rmsnorm;
+            var out: LaunchAccess = .{};
+            out.reads[0] = d.bank;
+            out.reads[1] = d.partial;
+            out.writes[0] = d.out;
+            out.writes[1] = n.out;
+            return out;
+        },
+        .controller_depth_norms => |i| {
+            const d = p.ops[i].depth_attention;
+            const n1 = p.ops[i + 1].rmsnorm;
+            const n2 = p.ops[i + 3].rmsnorm;
+            var out: LaunchAccess = .{};
+            out.reads[0] = d.bank;
+            out.reads[1] = d.partial;
+            out.reads[2] = n1.x;
+            out.writes[0] = d.out;
+            out.writes[1] = n1.out;
+            out.writes[2] = n2.out;
+            return out;
+        },
+        .controller_merge => |i| {
+            const l0 = p.ops[i].linear;
+            const m = p.ops[i + 2].inkling_message_merge;
+            var out: LaunchAccess = .{};
+            out.reads[0] = l0.x;
+            out.reads[1] = m.hidden;
+            out.reads[2] = m.message;
+            out.writes[0] = m.gates;
+            out.writes[1] = m.out;
+            return out;
+        },
+        .bf16_projections => |m| {
+            const l0 = p.ops[m.first].linear;
+            var out: LaunchAccess = .{};
+            out.reads[0] = l0.x;
+            var cursor = m.first;
+            for (0..m.count) |k| {
+                out.writes[k] = p.ops[cursor].linear.out;
+                const rounded = ((m.round_mask >> @intCast(k)) & 1) != 0;
+                cursor += if (rounded) @as(u32, 2) else 1;
+            }
+            return out;
+        },
         else => return null,
     }
-    var reads: [3]?ir.View = undefined;
-    var write: ?ir.View = null;
-    access(op, &reads, &write);
-    // Persistent caches occupy distinct buffers. Conservatively mark a
-    // whole cache as read or written, even when only one position is used.
-    switch (op) {
-        .store => |o| write = .{ .state = o.dst, .width = p.states[o.dst].width },
-        .conv => |o| reads[2] = .{ .state = o.src, .width = p.states[o.src].width },
-        .inkling_short_conv => |o| reads[2] = .{ .state = o.src, .width = p.states[o.src].width },
-        .inkling_dynamic_conv => |o| reads[2] = .{ .state = o.src, .width = p.states[o.src].width },
-        else => {},
-    }
-    return .{ .reads = reads, .write = write orelse return null };
 }
 
 /// Only omit a barrier when every dispatch since the last one is a known
-/// single-launch operation with no RAW, WAW, or WAR hazard.
+/// single-launch operation with no RAW, WAW, or WAR hazard and within 36 ops
+/// (< packScratch reuse_margin = 40).
 pub fn independentLaunches(gpa: std.mem.Allocator, steps: []const Step, p: *const ir.Program, info: []const WeightInfo) ![]bool {
     const independent = try gpa.alloc(bool, steps.len);
     var active: [16]LaunchAccess = undefined;
     var count: usize = 0;
+    var run_start_op: u32 = 0;
     for (steps, independent) |step, *can_overlap| {
         can_overlap.* = false;
         const now = launchAccess(step, p, info) orelse {
             count = 0;
+            run_start_op = step.first() + step.len();
             continue;
         };
-        if (count != 0 and count < active.len) {
+        const end_op = step.first() + step.len();
+        if (count != 0 and count < active.len and end_op - run_start_op <= 36) {
             can_overlap.* = true;
             for (active[0..count]) |prev| {
                 if (now.overlapsWrites(prev)) {
@@ -243,7 +347,10 @@ pub fn independentLaunches(gpa: std.mem.Allocator, steps: []const Step, p: *cons
                 }
             }
         }
-        if (!can_overlap.*) count = 0;
+        if (!can_overlap.*) {
+            count = 0;
+            run_start_op = step.first();
+        }
         active[count] = now;
         count += 1;
     }
@@ -300,24 +407,49 @@ fn matchNorms(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
     return deadAfter(p, t, i + 1);
 }
 
-fn matchAddNorm(p: *const ir.Program, i: u32) bool {
-    if (!sameSide(p, i, 2)) return false;
+fn matchAddNorm(p: *const ir.Program, i: u32) ?@FieldType(Step, "add_norm") {
+    if (!sameSide(p, i, 2)) return null;
     const add = switch (p.ops[i]) {
         .binary => |b| b,
-        else => return false,
+        else => return null,
     };
-    const norm = switch (p.ops[i + 1]) {
+    if (add.kind != .add or add.a_act != .identity or add.b_act != .identity or add.b_every != 1) return null;
+    var cursor: u32 = i + 1;
+    var round_add = false;
+    if (cursor < p.ops.len and sameSide(p, i, 3) and p.ops[cursor] == .row_transform) {
+        const t = p.ops[cursor].row_transform;
+        if (t.transform == .copy and t.round == .bf16 and sameView(add.out, t.x) and sameView(add.out, t.out)) {
+            round_add = true;
+            cursor += 1;
+        }
+    }
+    if (cursor >= p.ops.len or !sameSide(p, i, cursor - i + 1)) return null;
+    const norm = switch (p.ops[cursor]) {
         .rmsnorm => |n| n,
-        else => return false,
+        else => return null,
     };
-    if (add.kind != .add or add.a_act != .identity or add.b_act != .identity or add.b_every != 1) return false;
-    if (norm.weight == null or norm.group != 2048 or !sameView(norm.x, add.out)) return false;
-    if (add.a.width != 2048 or add.b.width != 2048 or add.out.width != 2048) return false;
-    if (overlaps(add.a, add.out) and !sameView(add.a, add.out)) return false;
-    if (overlaps(add.b, add.out) and !sameView(add.b, add.out)) return false;
-    if (overlaps(norm.out, add.out) or overlaps(norm.out, add.a) or overlaps(norm.out, add.b)) return false;
-    for (p.traces) |t| if (t.after_op == i + 1 and overlaps(t.view, norm.out)) return false;
-    return true;
+    const w = norm.group;
+    if (w == 0 or (w != 2048 and (w % 4 != 0 or w > 4096)) or !sameView(norm.x, add.out)) return null;
+    if (norm.weight == null and w == 2048) return null;
+    if (add.a.width != w or add.b.width != w or add.out.width != w) return null;
+    if (overlaps(add.a, add.out) and !sameView(add.a, add.out)) return null;
+    if (overlaps(add.b, add.out) and !sameView(add.b, add.out)) return null;
+    if (overlaps(norm.out, add.out) or overlaps(norm.out, add.a) or overlaps(norm.out, add.b)) return null;
+    var round_out = false;
+    if (cursor + 1 < p.ops.len and sameSide(p, i, cursor - i + 2) and p.ops[cursor + 1] == .row_transform) {
+        const t = p.ops[cursor + 1].row_transform;
+        if (t.transform == .copy and t.round == .bf16 and sameView(norm.out, t.x) and sameView(norm.out, t.out)) {
+            round_out = true;
+            cursor += 1;
+        }
+    }
+    const last_op = cursor;
+    for (p.traces) |t| {
+        if (round_add and t.after_op == i) return null;
+        if (t.after_op >= i and t.after_op < last_op and overlaps(t.view, norm.out)) return null;
+        if (t.after_op == last_op and overlaps(t.view, norm.out)) return null;
+    }
+    return .{ .first = i, .ops_len = last_op - i + 1, .round_add = round_add, .round_out = round_out };
 }
 
 fn linearOf(op: ir.Op) ?@FieldType(ir.Op, "linear") {
@@ -461,14 +593,206 @@ fn matchBf16Cast(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
     return true;
 }
 
+fn hasTraceBetween(p: *const ir.Program, first: u32, last_exclusive: u32) bool {
+    for (p.traces) |t| if (t.after_op >= first and t.after_op < last_exclusive) return true;
+    return false;
+}
+
+fn matchControllerMergeOps(p: *const ir.Program, info: []const WeightInfo, i: u32) ?struct {
+    l0: @FieldType(ir.Op, "linear"),
+    l1: @FieldType(ir.Op, "linear"),
+    m: @FieldType(ir.Op, "inkling_message_merge"),
+} {
+    const l0 = linearOf(p.ops[i]) orelse return null;
+    const l1 = linearOf(p.ops[i + 1]) orelse return null;
+    const m = switch (p.ops[i + 2]) {
+        .inkling_message_merge => |v| v,
+        else => return null,
+    };
+    if (info[l0.w].q4 or !info[l0.w].dense or info[l1.w].q4 or !info[l1.w].dense) return null;
+    if (!l0.input_bf16 or !l1.input_bf16 or !sameView(l0.x, l1.x)) return null;
+    if (l0.out.state != l1.out.state or l0.out.state != m.gates.state) return null;
+    if (l0.out.width != l1.out.width or l0.out.width != m.out.width or m.gates.width != 2 * l0.out.width) return null;
+    if (l0.out.col != m.gates.col or l1.out.col != l0.out.col + l0.out.width) return null;
+    if (overlaps(l0.out, l0.x) or overlaps(l1.out, l0.x) or overlaps(m.out, m.hidden) or overlaps(m.out, m.message) or overlaps(m.out, l0.x)) return null;
+    if (!deadAfter(p, m.gates, i + 2)) return null;
+    return .{ .l0 = l0, .l1 = l1, .m = m };
+}
+
+fn matchControllerMerge(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
+    if (!sameSide(p, i, 3) or hasTraceBetween(p, i, i + 2)) return false;
+    return matchControllerMergeOps(p, info, i) != null;
+}
+
+fn matchBf16Projections(p: *const ir.Program, info: []const WeightInfo, i: u32) ?@FieldType(Step, "bf16_projections") {
+    const l0 = linearOf(p.ops[i]) orelse return null;
+    if (info[l0.w].q4 or !info[l0.w].dense or info[l0.w].buffer == 0 or !l0.input_bf16) return null;
+    if (l0.out.width % 4 != 0 or l0.x.width % 128 != 0) return null;
+    var outs: [6]ir.View = undefined;
+    var count: u32 = 0;
+    var cursor: u32 = i;
+    var round_mask: u32 = 0;
+    while (count < 6 and cursor < p.ops.len and sameSide(p, i, cursor - i + 1)) {
+        const l = linearOf(p.ops[cursor]) orelse break;
+        if (info[l.w].q4 or !info[l.w].dense or info[l.w].buffer != info[l0.w].buffer or !l.input_bf16) break;
+        if (!sameView(l.x, l0.x) or l.out.width % 4 != 0) break;
+        var clash = overlaps(l.out, l0.x);
+        for (outs[0..count]) |prev| clash = clash or overlaps(prev, l.out);
+        if (clash) break;
+        var step_len: u32 = 1;
+        if (cursor + 1 < p.ops.len and sameSide(p, i, cursor - i + 2) and !hasTraceBetween(p, cursor, cursor + 1)) {
+            if (p.ops[cursor + 1] == .row_transform) {
+                const t = p.ops[cursor + 1].row_transform;
+                if (t.transform == .copy and t.round == .bf16 and sameView(l.out, t.x) and sameView(l.out, t.out)) {
+                    round_mask |= @as(u32, 1) << @intCast(count);
+                    step_len = 2;
+                }
+            }
+        }
+        outs[count] = l.out;
+        count += 1;
+        cursor += step_len;
+    }
+    if (count < 2) return null;
+    return .{ .first = i, .count = count, .ops_len = cursor - i, .round_mask = round_mask };
+}
+
+fn matchHeadSoftcap(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
+    if (!sameSide(p, i, 3) or hasTraceBetween(p, i, i + 2)) return false;
+    const l = linearOf(p.ops[i]) orelse return false;
+    if (info[l.w].q4 or !info[l.w].dense or !l.input_bf16) return false;
+    const cast = switch (p.ops[i + 1]) {
+        .row_transform => |t| t,
+        else => return false,
+    };
+    const cap = switch (p.ops[i + 2]) {
+        .row_transform => |t| t,
+        else => return false,
+    };
+    if (cast.transform != .copy or cast.round != .bf16 or !sameView(l.out, cast.x) or !sameView(l.out, cast.out)) return false;
+    if (cap.transform != .softcap or cap.round != .none) return false;
+    if (!sameView(cap.x, l.out) or cap.out.width > l.out.width) return false;
+    if (overlaps(cap.out, l.out)) return false;
+    return deadAfter(p, l.out, i + 2);
+}
+
+fn matchControllerDepthNorms(p: *const ir.Program, i: u32) bool {
+    if (!sameSide(p, i, 5) or hasTraceBetween(p, i, i + 4)) return false;
+    const d = switch (p.ops[i]) {
+        .depth_attention => |v| v,
+        else => return false,
+    };
+    const n1 = switch (p.ops[i + 1]) {
+        .rmsnorm => |v| v,
+        else => return false,
+    };
+    const c1 = switch (p.ops[i + 2]) {
+        .row_transform => |v| v,
+        else => return false,
+    };
+    const n2 = switch (p.ops[i + 3]) {
+        .rmsnorm => |v| v,
+        else => return false,
+    };
+    const c2 = switch (p.ops[i + 4]) {
+        .row_transform => |v| v,
+        else => return false,
+    };
+    if (n1.weight != null or n2.weight != null or n1.round_normalized != .none or n2.round_normalized != .none) return false;
+    if (n1.eps != n2.eps or n1.group != d.partial.width or n2.group != d.partial.width or n1.x.width != n1.group or n2.x.width != n2.group) return false;
+    if (!sameView(n2.x, d.out) or sameView(n1.x, d.out)) return false;
+    if (c1.transform != .copy or c1.round != .bf16 or !sameView(n1.out, c1.x) or !sameView(n1.out, c1.out)) return false;
+    if (c2.transform != .copy or c2.round != .bf16 or !sameView(n2.out, c2.x) or !sameView(n2.out, c2.out)) return false;
+    if (n1.out.state != n2.out.state or n2.out.col != n1.out.col + n1.out.width) return false;
+    for ([_]ir.View{ d.out, n1.out, n2.out }) |out| {
+        if (overlaps(out, d.bank) or overlaps(out, d.partial) or overlaps(out, n1.x)) return false;
+    }
+    return !overlaps(d.out, n1.out) and !overlaps(d.out, n2.out);
+}
+
+fn matchDepthNorm(p: *const ir.Program, i: u32) ?@FieldType(Step, "depth_norm") {
+    if (!sameSide(p, i, 2)) return null;
+    const d = switch (p.ops[i]) {
+        .depth_attention => |v| v,
+        else => return null,
+    };
+    const n = switch (p.ops[i + 1]) {
+        .rmsnorm => |v| v,
+        else => return null,
+    };
+    if (n.group != d.partial.width or n.x.width != n.group or !sameView(n.x, d.out)) return null;
+    if (overlaps(n.out, d.bank) or overlaps(n.out, d.partial) or overlaps(n.out, d.out)) return null;
+    var ops_len: u32 = 2;
+    var round_out = false;
+    if (i + 2 < p.ops.len and sameSide(p, i, 3) and p.ops[i + 2] == .row_transform) {
+        const t = p.ops[i + 2].row_transform;
+        if (t.transform == .copy and t.round == .bf16 and sameView(n.out, t.x) and sameView(n.out, t.out)) {
+            ops_len = 3;
+            round_out = true;
+        }
+    }
+    if (hasTraceBetween(p, i, i + ops_len - 1)) return null;
+    if (!deadAfter(p, d.out, i + 1)) return null;
+    return .{ .first = i, .ops_len = ops_len, .round_out = round_out };
+}
+
+fn matchInklingConv(p: *const ir.Program, i: u32) bool {
+    if (!sameSide(p, i, 2) or hasTraceBetween(p, i, i + 1)) return false;
+    const st = switch (p.ops[i]) {
+        .store => |v| v,
+        else => return false,
+    };
+    const cv = switch (p.ops[i + 1]) {
+        .inkling_short_conv => |v| v,
+        else => return false,
+    };
+    if (st.dst != cv.src or p.states[cv.src].kind != .ring) return false;
+    if (!sameView(st.src, cv.residual) or overlaps(cv.out, st.src)) return false;
+    return true;
+}
+
+fn matchRelativeGate(p: *const ir.Program, i: u32) bool {
+    if (!sameSide(p, i, 4) or hasTraceBetween(p, i, i + 3)) return false;
+    const a = switch (p.ops[i]) {
+        .relative_attention => |v| v,
+        else => return false,
+    };
+    const c1 = switch (p.ops[i + 1]) {
+        .row_transform => |v| v,
+        else => return false,
+    };
+    const b = switch (p.ops[i + 2]) {
+        .binary => |v| v,
+        else => return false,
+    };
+    const c2 = switch (p.ops[i + 3]) {
+        .row_transform => |v| v,
+        else => return false,
+    };
+    if (c1.transform != .copy or c1.round != .bf16 or !sameView(c1.x, a.out) or !sameView(c1.out, a.out)) return false;
+    if (b.kind != .mul or b.a_act != .identity or b.b_act != .sigmoid or b.b_every != 1) return false;
+    if (!sameView(b.a, a.out) or b.out.width != a.out.width or overlaps(b.out, b.b) or overlaps(b.out, a.out)) return false;
+    if (c2.transform != .copy or c2.round != .bf16 or !sameView(c2.x, b.out) or !sameView(c2.out, b.out)) return false;
+    return deadAfter(p, a.out, i + 2);
+}
+
 pub fn build(a: std.mem.Allocator, p: *const ir.Program, fusion: Fusion, info: []const WeightInfo) ![]Step {
     var steps: std.ArrayList(Step) = .empty;
     var i: u32 = 0;
     while (i < p.ops.len) {
         const step: Step = blk: {
+            if (fusion.depth_norm) {
+                if (matchControllerDepthNorms(p, i)) break :blk .{ .controller_depth_norms = i };
+                if (matchDepthNorm(p, i)) |m| break :blk .{ .depth_norm = m };
+            }
+            if (fusion.controller_merge and matchControllerMerge(p, info, i)) break :blk .{ .controller_merge = i };
+            if (fusion.head_softcap and matchHeadSoftcap(p, info, i)) break :blk .{ .head_softcap = i };
+            if (fusion.bf16_projections) if (matchBf16Projections(p, info, i)) |m| break :blk .{ .bf16_projections = m };
+            if (fusion.add_norm) if (matchAddNorm(p, i)) |m| break :blk .{ .add_norm = m };
+            if (fusion.inkling_conv and matchInklingConv(p, i)) break :blk .{ .inkling_conv = i };
+            if (fusion.relative_gate and matchRelativeGate(p, i)) break :blk .{ .relative_gate = i };
             if (fusion.bf16_cast and matchBf16Cast(p, info, i)) break :blk .{ .bf16_cast = i };
             if (fusion.norms and matchNorms(p, info, i)) break :blk .{ .norms = i };
-            if (fusion.add_norm and matchAddNorm(p, i)) break :blk .{ .add_norm = i };
             if (fusion.glu and matchGlu(p, info, i)) break :blk .{ .glu = i };
             if (fusion.conv and matchConv(p, i)) break :blk .{ .conv = i };
             if (fusion.gate and matchGate(p, i)) break :blk .{ .gate = i };
@@ -508,7 +832,7 @@ test "reference schedule is one step per op; fusions cover every op once" {
     try std.testing.expectEqual(p.ops.len, reference.len);
     const fused = try build(a, &p, .{ .projections = true, .glu = true, .norms = true, .conv = true, .gate = true }, info);
     var next: u32 = 0;
-    var counts: [6]u32 = @splat(0);
+    var counts: [@typeInfo(Step).@"union".field_names.len]u32 = @splat(0);
     for (fused) |s| {
         try std.testing.expectEqual(next, s.first());
         next += s.len();
@@ -570,4 +894,54 @@ test "decode search: attention prep fusion covers each attention layer's six ops
     }
     try std.testing.expectEqual(@as(u32, @intCast(p.ops.len)), next);
     try std.testing.expectEqual(@as(u32, 2), preps);
+}
+
+test "extended independentLaunches handles fused steps and enforces op_span <= 36 cutoff" {
+    var b = ir.Builder.init(std.testing.allocator);
+    defer b.deinit();
+    const tok = try b.state(.{ .name = "tokens", .kind = .tokens, .width = 1 });
+    _ = try b.state(.{ .name = "position", .kind = .position, .width = 1 });
+    const ring1 = try b.state(.{ .name = "r1", .kind = .ring, .width = 4, .horizon = 3 });
+    const ring2 = try b.state(.{ .name = "r2", .kind = .ring, .width = 4, .horizon = 3 });
+    const a1 = try b.state(.{ .name = "a1", .kind = .scratch, .width = 4 });
+    const a2 = try b.state(.{ .name = "a2", .kind = .scratch, .width = 4 });
+    const o1 = try b.state(.{ .name = "o1", .kind = .scratch, .width = 4 });
+    const o2 = try b.state(.{ .name = "o2", .kind = .scratch, .width = 4 });
+    const cw1 = try b.weight("cw1", &.{ 4, 1, 4 });
+    const cw2 = try b.weight("cw2", &.{ 4, 1, 4 });
+    // Two independent inkling_conv steps (4 ops total) should overlap.
+    try b.op(.{ .store = .{ .src = b.view(a1), .dst = ring1 } });
+    try b.op(.{ .inkling_short_conv = .{ .src = ring1, .weight = cw1, .residual = b.view(a1), .out = b.view(o1), .taps = 4, .round = .bf16 } });
+    try b.op(.{ .store = .{ .src = b.view(a2), .dst = ring2 } });
+    try b.op(.{ .inkling_short_conv = .{ .src = ring2, .weight = cw2, .residual = b.view(a2), .out = b.view(o2), .taps = 4, .round = .bf16 } });
+    // Another conv touching ring1 conflicts on the persistent ring cache.
+    const a3 = try b.state(.{ .name = "a3", .kind = .scratch, .width = 4 });
+    const o3 = try b.state(.{ .name = "o3", .kind = .scratch, .width = 4 });
+    try b.op(.{ .store = .{ .src = b.view(a3), .dst = ring1 } });
+    try b.op(.{ .inkling_short_conv = .{ .src = ring1, .weight = cw1, .residual = b.view(a3), .out = b.view(o3), .taps = 4, .round = .bf16 } });
+    // Add 14 independent 3-op add_norm (binary + bf16_cast + rmsnorm) steps so op_span crosses 36 before count == 16.
+    var s_in: [14]ir.StateId = undefined;
+    var s_out: [14]ir.StateId = undefined;
+    for (0..14) |k| {
+        s_in[k] = try b.state(.{ .name = try b.print("in{d}", .{k}), .kind = .scratch, .width = 4 });
+        const s_mid = try b.state(.{ .name = try b.print("mid{d}", .{k}), .kind = .scratch, .width = 4 });
+        s_out[k] = try b.state(.{ .name = try b.print("out{d}", .{k}), .kind = .scratch, .width = 4 });
+        try b.op(.{ .binary = .{ .kind = .add, .a = b.view(s_in[k]), .b = b.view(s_in[k]), .out = b.view(s_mid) } });
+        try b.op(.{ .row_transform = .{ .x = b.view(s_mid), .out = b.view(s_mid), .transform = .copy, .round = .bf16 } });
+        try b.op(.{ .rmsnorm = .{ .x = b.view(s_mid), .weight = null, .out = b.view(s_out[k]), .group = 4, .eps = 1e-5 } });
+    }
+    const p: ir.Program = .{ .arena = b.arena, .meta = .{ .model_type = "t", .vocab = 1, .eos = &.{}, .max_context = 1 }, .weights = b.weights.items, .states = b.states.items, .tables = &.{}, .ops = b.ops.items, .head_start = @intCast(b.ops.items.len), .traces = &.{}, .tokens = b.view(tok), .logits = .{ .state = tok, .width = 1 }, .next = .{ .state = tok, .width = 1 } };
+    const info = try std.testing.allocator.alloc(WeightInfo, p.weights.len);
+    defer std.testing.allocator.free(info);
+    @memset(info, .{ .q4 = false, .buffer = 1 });
+    const steps = try build(std.testing.allocator, &p, .{ .inkling_conv = true, .add_norm = true }, info);
+    defer std.testing.allocator.free(steps);
+    try std.testing.expectEqual(@as(usize, 17), steps.len);
+    const indep = try independentLaunches(std.testing.allocator, steps, &p, info);
+    defer std.testing.allocator.free(indep);
+    try std.testing.expect(!indep[0]);
+    try std.testing.expect(indep[1]); // r1 and r2 are disjoint
+    try std.testing.expect(!indep[2]); // conflicts on r1 (run_start_op = 4)
+    for (3..14) |idx| try std.testing.expect(indep[idx]); // ops 4..39 (span <= 36, count <= 12)
+    try std.testing.expect(!indep[14]); // op span 4..43 = 39 > 36 forces a barrier even with count == 12 < 16!
 }

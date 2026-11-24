@@ -34,7 +34,9 @@ def main() -> int:
                 stdout=subprocess.PIPE).stdout)
             for filename, mode in (("resident_plan.zig", "--zig"),
                                    ("resident_plan.metal", "--metal"),
-                                   ("replay_limits.h", "--replay-c"))
+                                   ("replay_limits.h", "--replay-c"),
+                                   ("mega/inkling_plan.zig", "--inkling-zig"),
+                                   ("mega/inkling_plan.metal", "--inkling-metal"))
         ]
         failed = False
         for path, expected in generated:

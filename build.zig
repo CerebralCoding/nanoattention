@@ -63,8 +63,10 @@ pub fn build(b: *std.Build) void {
     nano_module.linkFramework("Foundation", .{});
     nano_module.linkFramework("Metal", .{});
     const nano = b.addExecutable(.{ .name = "nano", .root_module = nano_module });
+    nano.step.dependOn(&proofs.step);
     b.installArtifact(nano);
     const nano_tests = b.addTest(.{ .root_module = nano_module });
+    nano_tests.step.dependOn(&proofs.step);
     const run_nano_tests = b.addRunArtifact(nano_tests);
     b.step("test-mega", "Run megakernel IR, front-end, state and headless Metal kernel tests").dependOn(&run_nano_tests.step);
     const tests = b.addTest(.{ .root_module = module });

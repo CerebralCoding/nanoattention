@@ -216,11 +216,60 @@ pub const Knobs = struct {
     /// codes), halving the threadgroup traffic of the weight operand.
     x2_half: bool = false,
 
+    // ---- Inkling optimizations ----
+    /// Fuse controller forget/gain projections and message merge in single-row decode.
+    fuse_controller_merge: bool = false,
+    /// Fuse up to 6 consecutive dense BF16 linears sharing one input into a single launch.
+    fuse_bf16_projections: bool = false,
+    /// Split-K BF16 decode matvec (8 SIMDs/row) for small-M dense projections.
+    bf16_decode_splitk: bool = false,
+    /// 128-bit weight loads (`ushort4` x 2) for single-row BF16 decode linears when aligned.
+    bf16_decode_wide: bool = false,
+    /// Fuse final vocabulary projection, BF16 cast and tanh softcap into one launch.
+    fuse_head_softcap: bool = false,
+    /// Vectorized register-resident depth attention (decode and prefill).
+    depth_attention_fast: bool = false,
+    /// Fuse depth attention + following RMSNorm(+BF16 cast) in controllers and visit blocks.
+    fuse_depth_norm: bool = false,
+    /// Single-read, two-barrier vectorized RMSNorm for n <= 4 * threadgroup.
+    rmsnorm_fast: bool = false,
+    /// Combine KV f32 cache store + BF16 mirror pack when relative_stripes is active.
+    store_pack_bf16: bool = false,
+    /// Fuse short-conv ring store + single-row mk_inkling_short_conv_ring.
+    fuse_inkling_conv: bool = false,
+    /// 8-distance-per-thread BF16 grouped projection for single-row relative bias.
+    relative_bias_decode: bool = false,
+    /// Sub-SIMD branchless NVFP4 and vectorized MXFP8 single-row decode experts.
+    expert_nvfp4_fast: bool = false,
+    /// Single-pass online softmax striped decode attention (log2 units, small TG memory).
+    relative_long_fast: bool = false,
+    /// Fuse relative attention + BF16 cast + sigmoid gate + BF16 cast in single-row decode.
+    fuse_relative_gate: bool = false,
+    /// Half-precision staged relative prefill tiles with reversed query schedule and Lean far-band split.
+    relative_prefill_fast: bool = false,
+    /// M=64, N=64, B=32 expert prefill tiles with SLC-resident BF16 input packing.
+    expert_block_m64n64: bool = false,
+
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};
 
     pub fn fusion(self: Knobs) @import("plan.zig").Fusion {
-        return .{ .projections = self.fuse_projections, .glu = self.fuse_glu, .norms = self.fuse_norms, .add_norm = self.fuse_add_norm, .conv = self.fuse_conv, .gate = self.fuse_gate, .attn_prep = self.fuse_attn_prep, .bf16_cast = self.fuse_bf16_cast };
+        return .{
+            .projections = self.fuse_projections,
+            .glu = self.fuse_glu,
+            .norms = self.fuse_norms,
+            .add_norm = self.fuse_add_norm,
+            .conv = self.fuse_conv,
+            .gate = self.fuse_gate,
+            .attn_prep = self.fuse_attn_prep,
+            .bf16_cast = self.fuse_bf16_cast,
+            .controller_merge = self.fuse_controller_merge,
+            .bf16_projections = self.fuse_bf16_projections,
+            .head_softcap = self.fuse_head_softcap,
+            .depth_norm = self.fuse_depth_norm,
+            .inkling_conv = self.fuse_inkling_conv,
+            .relative_gate = self.fuse_relative_gate,
+        };
     }
 
     pub fn validate(self: Knobs) !void {

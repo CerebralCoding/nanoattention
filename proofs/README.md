@@ -276,3 +276,18 @@ simultaneously resident threadgroups, GPU scheduling fairness, eventual
 arrival, or successful completion before the spin limit. There is no
 unconditional GPU-residency/liveness theorem. On-device execution, numerical
 checks, timeout handling and performance measurements remain necessary.
+
+## Inkling 2 Mini megakernel certificates (`proofs/Inkling.lean`)
+
+`proofs/Inkling.lean` (`Std`-only, zero `sorry`/`admit`/`native_decide`, standard axioms only) formalizes integer indexing, bit-decode, and overlap contracts for the Inkling 2 Mini (`inkling2_loop`) decode and prefill kernels in **39 theorems**. `proofs/Main.lean` emits matching compile-time constants and inline Metal helpers into `src/mega/inkling_plan.zig` and `src/mega/inkling_plan.metal`, verified against `tools/check_resident_proofs.py` on every build:
+
+- **Schedule & state-slot injectivity:** `inkling_visit_count` (48 logical visits over 24 physical layers), `inkling_physical_layer_bounds`, and `inkling_state_slot_injective` (each logical visit receives a distinct persistent state slot).
+- **Speculative `d2_gate` ring & token packing:** `d2_gate_ring_disjoint` (stalled/recomputed ahead-decode cannot overwrite live ring horizon entries when `capacity >= horizon + 2`) and `d2_token_pack_roundtrip` (`gen << 20 | token` bijective packing in the 32-bit gate word, `d2GenShift = 20`, `d2MaxVocab = 2^20`).
+- **Short-convolution ring step:** `ring_back_bounds`, `ring_back_eq_mod` (branchless `inkling_ring_back` equals `(slot + capacity - back) % capacity` without 64-bit division), and `ring_back_ne_current`.
+- **Sub-SIMD NVFP4 gate+up & down decode:** `nvfp4_bit_decode_exact` (branchless E2M1 bit-manipulation in `inkling_nvfp4_decode4` equals the 16-entry LUT identically), `nvfp4_subsimd_coverage`, `nvfp4_subsimd_unique`, `nvfp4_subsimd_scale_block`, `nvfp4_k_divisibility` (`16`-lane sub-SIMD gate+up), and `nvfp4_subsimd8_coverage`, `nvfp4_subsimd8_unique`, `nvfp4_subsimd8_scale_block`, `nvfp4_down_k_divisibility` (`8`-lane sub-SIMD down projection).
+- **Fused multi-projection & split-K BF16 decode:** `multi_proj_local_bounds`, `multi_proj_inverse_coverage`, `multi_proj_u32_bounds` (covering `inkling_multi_proj_index` and `inkling_multi_proj_local_tile` up to 6 matrices), plus `splitk_bf16_coverage` and `splitk_bf16_unique` (`8`-SIMD × `32`-lane vec4 stride partitioning).
+- **Register-resident depth attention & RMSNorm:** `depth_reg_2304_exact`, `depth_reg_ownership`, `depth_vec_coverage`, `depth_reg_simds`, and `depth_reg_unique` (`576` threads = `18` SIMDs × `32` lanes × `4` elements covering `hidden = 2304`).
+- **Striped GQA3 & prefill far-band relative attention:** `gqa3_ownership` (`3` query heads per KV head), `stripe_partition_bounds`, `stripe_partition_coverage`, `stripe_partition_disjoint` (for `inkling_stripe_start`/`inkling_stripe_end`), `global_linear_slot`, and `prefill_far_band_exact` (`inkling_far_band_end` proves that keys below the boundary are strictly causal `<= diag`, past `rel_extent`, and fit linearly without ring modulo when `far_end <= capacity`).
+- **Two-stage decode argmax & `N=64` expert prefill tiles:** `argmax_part_coverage`, `argmax_part_unique` (`64` partition groups), `expert_block_n64_divisibility`, `expert_block_n64_coverage`, `expert_block_n64_unique`, and `expert_tail_partition` (unique part assignment for partial `tail` tiles across `parts` striped workgroups).
+
+As with the resident certificates, these prove integer schedule/index/bit-decode invariants only — FP32/FP16/BF16 reassociation, Metal barrier ordering, memory coherence, and runtime speedup are validated empirically by the `nano` unit tests, real-prompt logit parity checks, and `tools/nano_inkling_attention_check.py`.

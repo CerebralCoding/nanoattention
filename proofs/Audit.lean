@@ -1,4 +1,5 @@
 import ResidentProofs
+import Inkling
 
 -- Optional proof-trust audit. Only Lean's standard logical axioms may occur;
 -- in particular there must be no sorryAx or executable/native-decision axiom.
@@ -105,3 +106,43 @@ import ResidentProofs
 #print axioms Resident.replay_param_bounds
 #print axioms Resident.replay_param_disjoint
 #print axioms Resident.aligned_head_ownership
+
+#print axioms Inkling.inkling_visit_count
+#print axioms Inkling.inkling_physical_layer_bounds
+#print axioms Inkling.inkling_state_slot_injective
+#print axioms Inkling.d2_gate_ring_disjoint
+#print axioms Inkling.d2_token_pack_roundtrip
+#print axioms Inkling.ring_back_bounds
+#print axioms Inkling.ring_back_eq_mod
+#print axioms Inkling.ring_back_ne_current
+#print axioms Inkling.nvfp4_bit_decode_exact
+#print axioms Inkling.nvfp4_subsimd_coverage
+#print axioms Inkling.nvfp4_subsimd_unique
+#print axioms Inkling.nvfp4_subsimd_scale_block
+#print axioms Inkling.nvfp4_k_divisibility
+#print axioms Inkling.multi_proj_local_bounds
+#print axioms Inkling.multi_proj_inverse_coverage
+#print axioms Inkling.multi_proj_u32_bounds
+#print axioms Inkling.splitk_bf16_coverage
+#print axioms Inkling.splitk_bf16_unique
+#print axioms Inkling.depth_reg_2304_exact
+#print axioms Inkling.depth_reg_ownership
+#print axioms Inkling.depth_vec_coverage
+#print axioms Inkling.gqa3_ownership
+#print axioms Inkling.stripe_partition_bounds
+#print axioms Inkling.stripe_partition_coverage
+#print axioms Inkling.stripe_partition_disjoint
+#print axioms Inkling.global_linear_slot
+#print axioms Inkling.prefill_far_band_exact
+#print axioms Inkling.nvfp4_subsimd8_coverage
+#print axioms Inkling.nvfp4_subsimd8_unique
+#print axioms Inkling.nvfp4_subsimd8_scale_block
+#print axioms Inkling.nvfp4_down_k_divisibility
+#print axioms Inkling.depth_reg_simds
+#print axioms Inkling.depth_reg_unique
+#print axioms Inkling.expert_block_n64_divisibility
+#print axioms Inkling.expert_block_n64_coverage
+#print axioms Inkling.expert_block_n64_unique
+#print axioms Inkling.expert_tail_partition
+#print axioms Inkling.argmax_part_coverage
+#print axioms Inkling.argmax_part_unique

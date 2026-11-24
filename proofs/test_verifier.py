@@ -26,11 +26,14 @@ class VerifierTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=fixture_dir)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        (self.root / "src").mkdir()
+        (self.root / "src" / "mega").mkdir(parents=True)
         (self.root / "proofs").mkdir()
+        self.modes = ["--zig", "--metal", "--replay-c", "--inkling-zig", "--inkling-metal"]
         self.artifacts = [self.root / "src" / name
-                          for name in ("resident_plan.zig", "resident_plan.metal")]
-        self.expected = [b"generated zig\n", b"generated metal\n"]
+                          for name in ("resident_plan.zig", "resident_plan.metal", "replay_limits.h",
+                                       "mega/inkling_plan.zig", "mega/inkling_plan.metal")]
+        self.expected = [b"generated zig\n", b"generated metal\n", b"generated replay\n",
+                         b"generated inkling zig\n", b"generated inkling metal\n"]
         for path in self.artifacts:
             path.write_bytes(b"stale\n")
         self.calls = []
@@ -38,12 +41,13 @@ class VerifierTests(unittest.TestCase):
 
     def run_process(self, command, **kwargs):
         self.calls.append(command)
-        if command == ["lake", "build"]:
+        if command[:2] == ["lake", "build"] or command[:2] == ["lake", "env"]:
             return subprocess.CompletedProcess(command, 0)
-        if command[-1] == "--metal" and self.fail_metal:
+        mode = command[-1]
+        if mode == "--metal" and self.fail_metal:
             raise subprocess.CalledProcessError(1, command)
         return subprocess.CompletedProcess(command, 0,
-                                           stdout=self.expected[command[-1] == "--metal"])
+                                           stdout=self.expected[self.modes.index(mode)])
 
     def invoke(self, *args):
         with patch.object(CHECKER, "__file__", str(self.root / "tools" / "check_resident_proofs.py")), \
@@ -55,7 +59,7 @@ class VerifierTests(unittest.TestCase):
 
     def test_drift_fails_without_rewriting(self):
         self.assertEqual(self.invoke(), 1)
-        self.assertEqual([p.read_bytes() for p in self.artifacts], [b"stale\n"] * 2)
+        self.assertEqual([p.read_bytes() for p in self.artifacts], [b"stale\n"] * len(self.artifacts))
         self.assertEqual(self.calls[0], ["lake", "build"])
 
     def test_matching_bindings_pass(self):
@@ -70,19 +74,25 @@ class VerifierTests(unittest.TestCase):
 
     def test_tile_parameter_drift_is_rejected_in_either_binding(self):
         self.expected = [b"pub const row_tiles = [_]u32{1, 2, 4, 8};\n",
-                         b"#define RESIDENT_ROW_TILE_8 8\n"]
-        for drifted in range(2):
+                         b"#define RESIDENT_ROW_TILE_8 8\n",
+                         b"replay\n",
+                         b"pub const expert_block_m: u32 = 32;\n",
+                         b"#define INKLING_EXPERT_BLOCK_M 32u\n"]
+        for drifted in (0, 1, 3, 4):
             with self.subTest(binding=drifted):
                 for index, (path, content) in enumerate(zip(self.artifacts, self.expected)):
-                    path.write_bytes(content.replace(b"8", b"16")
-                                     if index == drifted else content)
+                    bad = content.replace(b"8", b"16") if drifted < 2 else content.replace(b"32", b"64")
+                    path.write_bytes(bad if index == drifted else content)
                 before = [p.read_bytes() for p in self.artifacts]
                 self.assertEqual(self.invoke(), 1)
                 self.assertEqual([p.read_bytes() for p in self.artifacts], before)
 
     def test_worker_limit_drift_is_rejected_in_either_binding(self):
         self.expected = [b"pub const max_workers: u32 = 32;\n",
-                         b"#define RESIDENT_MAX_WORKERS 32\n"]
+                         b"#define RESIDENT_MAX_WORKERS 32\n",
+                         b"replay\n",
+                         b"inkling_z\n",
+                         b"inkling_m\n"]
         for drifted in range(2):
             for limit in (b"60", b"33"):
                 with self.subTest(binding=drifted, limit=limit):
@@ -96,7 +106,7 @@ class VerifierTests(unittest.TestCase):
     def test_emitter_failure_does_not_partially_generate(self):
         self.fail_metal = True
         self.assertEqual(self.invoke("--generate"), 1)
-        self.assertEqual([p.read_bytes() for p in self.artifacts], [b"stale\n"] * 2)
+        self.assertEqual([p.read_bytes() for p in self.artifacts], [b"stale\n"] * len(self.artifacts))
 
 
 if __name__ == "__main__":

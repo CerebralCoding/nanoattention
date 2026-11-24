@@ -87,7 +87,7 @@ pub const Mat = extern struct {
 /// Mirror of MKX in src/mega/fused.metal.
 pub const ParamsX = extern struct {
     p: Params = .{},
-    mat: [4]Mat = @splat(.{}),
+    mat: [6]Mat = @splat(.{}),
     count: u32 = 0,
     act_a: u32 = 0,
     act_b: u32 = 0,
@@ -105,10 +105,10 @@ pub const flag_bias16: u32 = 32;
 comptime {
     if (@sizeOf(ExpertParams) != 96) @compileError("ExpertParams must match MKExpert in inkling_ops.metal");
     if (@sizeOf(Params) != 160) @compileError("Params must match MK in kernels.metal");
-    if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 4 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
+    if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 6 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
 }
 
-pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_plan.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("inkling_fast.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
     // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
     // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
     "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
