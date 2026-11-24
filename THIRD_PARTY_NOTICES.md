@@ -10,7 +10,7 @@ separately licensed.
 
 ## Recursive `rec` resident execution design
 
-The resident Metal decode path in `src/resident.metal` adapts the persistent-worker and atomic arrival/phase barrier approach from [`recursive-oss/rec`](https://github.com/recursive-oss/rec), particularly:
+The resident Metal decode path in `src/resident.metal` adapts the persistent-worker and atomic arrival/phase barrier approach from **Recursive**'s [`recursive-oss/rec`](https://github.com/recursive-oss/rec) (with upstream contributions from **Chris Cummins** ([`@ChrisCummins`](https://github.com/ChrisCummins)), **Audrey Tang** ([`@audreyt`](https://github.com/audreyt)), and **Oliver Yu** ([`@tc3oliver`](https://github.com/tc3oliver))), particularly:
 
 - `engine/src/rec_mlx/kernels/megakernel.py`
 - `engine/src/rec_mlx/kernels/device.py`
@@ -57,11 +57,29 @@ are adapted for this engine. The shaders retain Apple's copyright and MIT notice
 ## mlx-lm Inkling 2 relative attention (`nano`)
 
 `src/mega/inkling_tiles.metal` adapts the batched relative attention kernel of
-mlx-lm's Inkling 2 model (`mlx_lm/models/inkling2/kernels.py`, at `0c4c99192230`
-of `jundot/mlx-lm`; MIT, copyright © 2026 Apple Inc.). The tile loop is the
+`mlx-lm`'s Inkling 2 model (`mlx_lm/models/inkling2/kernels.py`, at `0c4c99192230`
+of [`jundot/mlx-lm`](https://github.com/jundot/mlx-lm) / [`ml-explore/mlx-lm#2086`](https://github.com/ml-explore/mlx-lm/pull/2086), primarily authored by **Jun Kim** [`@jundot`](https://github.com/jundot) with contributions from **Pedro Cuenca** [`@pcuenca`](https://github.com/pcuenca) and **Lucas Gelfond** [`@lucasgelfond`](https://github.com/lucasgelfond); MIT, copyright © 2026 Apple Inc.). The tile loop is the
 source's; operand addressing (arena words, position-major 16-bit K and V
 mirrors, ring slots) and run-time head counts, relative extent and window are
 this engine's. `mk_relative_attention_prefill` in `src/mega/inkling_ops.metal`
 follows the same kernel. The shader retains the copyright and MIT notice.
 
 MLX is copyright © 2023 Apple Inc. and licensed under the MIT License; a copy is included in `licenses/mlx-MIT.txt`. This engine does not link to or execute MLX. MLX is used separately only for optional reference comparisons and benchmarks. The integer proofs do not establish IEEE754 equivalence of MLX's or this implementation's reductions; unchanged numerical checks remain required.
+
+## Qwegn Inkling 2 Mini kernel optimizations (`nano`)
+
+Six Inkling 2 Mini megakernel optimization designs in `src/mega/inkling_fast.metal`,
+`src/mega/plan.zig`, `src/mega/exec.zig`, `src/mega/inkling2_loop.zig`, and
+`proofs/Inkling.lean` were studied from and adapted after **[`qwegnai/qwegn`](https://github.com/qwegnai/qwegn)**
+(authored by **[`@Andrei-cloud`](https://github.com/Andrei-cloud)** / QwegnAI; studied at `v0.36.0`, commit `632425e928c8`, licensed under the Apache License, Version 2.0 — see `licenses/qwegn-APACHE-2.0.txt`):
+
+- `Sources/QWMetal/inkling2/qw_ink2_common.metalh` — constant-cache FP8 E4M3FN and FP4 pair LUT decoding (`expert_fp_lut`)
+- `Sources/QWMetal/inkling2/qw_ink2_moe.metal` — single-threadgroup compact MoE tile building / sparse `M=16/32/64` tiling (`expert_compact_tiles`) and BF16 MoE intermediates (`expert_bf16_io`)
+- `Sources/QWMetal/inkling2/qw_ink2_sconv_qkvr.metal` — fused sliding short-conv / global QKV + relative prep (`fuse_qkvr_prep`)
+- `Sources/QWMetal/inkling2/qw_ink2_attn.metal` — inline single-row relative bias projection inside striped relative attention (`relative_inline_bias`)
+- `Sources/QWMetal/inkling2/qw_ink2_ctrl_batch.metal` and `Sources/QWMetal/inkling2/qw_ink2_ctrl_fast.metal` — fused controller message merge + RMSNorm/BF16 cast (`fuse_merge_norm`)
+
+`nano`'s implementations are written natively for `nano`'s Zig/Metal IR, arena word
+layout, and Lean-checked integer helpers rather than being direct ports of Qwegn's
+Swift/Metal 4 implementation, while preserving full upstream author attribution and
+Apache-2.0 notice.

@@ -18,7 +18,8 @@
   <a href="#use-with-nanoharness--codegraff">NanoHarness &amp; CodeGraff</a> ·
   <a href="#performance">Performance</a> ·
   <a href="#correctness-and-proofs">Proofs</a> ·
-  <a href="#development">Development</a>
+  <a href="#development">Development</a> ·
+  <a href="#acknowledgements--credits">Credits</a>
 </p>
 
 Run [Thinking Machines Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
@@ -257,7 +258,7 @@ faster on prefill for both. See [measurements and reproduction commands](benchma
 python3 tools/inkling_adapter.py "$CKPT" --engine native --binary zig-out/bin/nano
 ```
 
-Matched 3-repeat `nano bench` throughput on an **Apple M3 Ultra (60 GPU cores, 256 GB unified memory)** (`--decode-tokens 64 --repeats 3 --decode-detail 1`, `0` gate redos) with [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json):
+Matched 3-repeat `nano bench` throughput on an **Apple M3 Ultra (60 GPU cores, 256 GB unified memory)** (`--decode-tokens 64 --repeats 3 --decode-detail 1`, `0` gate redos) with [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json) — incorporating six megakernel optimization designs inspired by [`qwegnai/qwegn`](https://github.com/qwegnai/qwegn) ([`@Andrei-cloud`](https://github.com/Andrei-cloud) / QwegnAI, Apache-2.0):
 
 | Prompt (context) | Long-Context Base (Pre / Dec) | Pre-Qwegn `megakernel-v1` (Pre / Dec) | `inkling.json` `v0.2.0` (Pre / Dec) | Speedup vs Base |
 | ---: | ---: | ---: | ---: | ---: |
@@ -265,7 +266,7 @@ Matched 3-repeat `nano bench` throughput on an **Apple M3 Ultra (60 GPU cores, 2
 | 16,384 (`16,512`) | `1,197.98` / `38.37` tok/s | `1,330.69` / `51.83` tok/s | **`1,477.74` / `61.24` tok/s** | **+23.4% / +59.6%** |
 | 32,768 (`32,900`) | `1,069.70` / `36.72` tok/s | `1,249.00` / `48.74` tok/s | **`1,376.23` / `58.06` tok/s** | **+28.7% / +58.1%** |
 
-Against published `ml-explore/mlx-lm#2086` numbers (which ran on an **80-core M3 Ultra / 512 GB**, reporting `1,516.3` / `32.07` tok/s at 4K and `1,472.3` / `32.50` tok/s at 16K), `nano v0.2.0` on 60 cores achieves **`2.01×`** higher decode at 4K and **`1.88×`** at 16K, and exceeds MLX's raw 80-core prefill at both 4K (`+3.5%`) and 16K (`+0.4%`).
+Against published [`ml-explore/mlx-lm#2086`](https://github.com/ml-explore/mlx-lm/pull/2086) numbers (authored by **Jun Kim** [`@jundot`](https://github.com/jundot) with contributions from Pedro Cuenca and Lucas Gelfond, run on an **80-core M3 Ultra / 512 GB**, reporting `1,516.3` / `32.07` tok/s at 4K and `1,472.3` / `32.50` tok/s at 16K), `nano v0.2.0` on 60 cores achieves **`2.01×`** higher decode at 4K and **`1.88×`** at 16K, and exceeds MLX's raw 80-core prefill at both 4K (`+3.5%`) and 16K (`+0.4%`).
 
 See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-Elites QD grid across 4K/16K/32K in [`benchmarks/inkling-qd/elites.md`](benchmarks/inkling-qd/elites.md), the Lean 4 contracts in [`proofs/Inkling.lean`](proofs/Inkling.lean) (`49` public / `53` total theorems), and [`docs/MEGAKERNEL.md`](docs/MEGAKERNEL.md).
 
@@ -306,10 +307,21 @@ adapter rejects unsupported sampling and reasoning controls. Full batched prefil
 for Flint and broad model-quality parity remain unverified. mmap avoids an extra full weight copy; it
 does not remove physical-memory or Metal-buffer limits.
 
+## Acknowledgements & credits
+
+`nanoattention` builds directly on ideas, kernel designs, and reference implementations from the open-source Apple Silicon ML community:
+
+- **Qwegn** ([`qwegnai/qwegn`](https://github.com/qwegnai/qwegn)) — authored by **[`@Andrei-cloud`](https://github.com/Andrei-cloud)** / QwegnAI (Apache-2.0): source of the six Inkling 2 Mini optimization designs adapted in `v0.2.0` (`expert_fp_lut`, `expert_compact_tiles`, `expert_bf16_io`, `fuse_qkvr_prep`, `relative_inline_bias`, and `fuse_merge_norm`) across [`src/mega/inkling_fast.metal`](src/mega/inkling_fast.metal), `src/mega/plan.zig`, `src/mega/exec.zig`, and `proofs/Inkling.lean`.
+- **`mlx-lm` Inkling 2 support** ([`ml-explore/mlx-lm#2086`](https://github.com/ml-explore/mlx-lm/pull/2086) / [`jundot/mlx-lm`](https://github.com/jundot/mlx-lm)) — authored by **Jun Kim** ([`@jundot`](https://github.com/jundot)), with contributions from **Pedro Cuenca** ([`@pcuenca`](https://github.com/pcuenca)) and **Lucas Gelfond** ([`@lucasgelfond`](https://github.com/lucasgelfond)) (MIT, Apple Inc.): batched relative attention tile kernel adapted in [`src/mega/inkling_tiles.metal`](src/mega/inkling_tiles.metal) and the `mlx-lm` reference baseline.
+- **MLX** ([`ml-explore/mlx`](https://github.com/ml-explore/mlx)) — Apple Inc. and the MLX contributors (MIT): INT4 `qmv_fast` / `qdot`, vector SDPA, Steel GEMM, and Steel attention kernel designs.
+- **Recursive `rec`** ([`recursive-oss/rec`](https://github.com/recursive-oss/rec)) — Recursive (**Chris Cummins** [`@ChrisCummins`](https://github.com/ChrisCummins), **Audrey Tang** [`@audreyt`](https://github.com/audreyt), **Oliver Yu** [`@tc3oliver`](https://github.com/tc3oliver); Apache-2.0): resident decode and atomic arrival/phase barrier design adapted in [`src/resident.metal`](src/resident.metal).
+- **Model & architecture authors** — **Thinking Machines Lab** ([Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)), **Recursive** ([Flint](https://huggingface.co/RecursiveSI/flint), Apache-2.0), and **Liquid AI** (`LFM3-1.7B` / `LFM2.5-1.2B-Instruct`).
+
 ## License
 
 Original code and contributions are **[MIT licensed](LICENSE)**. Adapted Recursive
-`rec` components retain Apache-2.0 terms; adapted MLX components retain MIT terms
+`rec` and Qwegn ([`qwegnai/qwegn`](https://github.com/qwegnai/qwegn)) components
+retain Apache-2.0 terms; adapted MLX and `mlx-lm` components retain MIT terms
 and notices. The top-level MIT license does not replace those upstream obligations.
 Model weights are not bundled and remain separately licensed; Recursive Flint,
 Thinking Machines Inkling 2 Mini, and Liquid AI checkpoints retain their

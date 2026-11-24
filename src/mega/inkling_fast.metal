@@ -1,4 +1,11 @@
 // Inkling 2 Mini optimized decode and prefill kernels; embedded after inkling_tiles.metal.
+//
+// Upstream attribution: six optimization designs (constant-cache FP8/FP4 LUTs,
+// compact single-TG MoE tiling and BF16 MoE intermediates, fused QKVR prep,
+// inline single-row relative bias, and fused controller merge+norm) are adapted
+// from qwegnai/qwegn by @Andrei-cloud / QwegnAI (Apache-2.0; see
+// THIRD_PARTY_NOTICES.md and licenses/qwegn-APACHE-2.0.txt) and implemented
+// natively for nano's Zig/Metal IR and Lean-checked integer helpers.
 
 // Decode controller up-projections + message merge:
 // 1 SIMD computes 4 output channels of forget_weight (buffer 0, p.w), gain_weight (buffer 1, p.s),
