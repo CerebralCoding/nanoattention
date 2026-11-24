@@ -70,3 +70,20 @@ pub fn farBandEnd(first_diag: u32, rel_ext: u32, bk: u32) u32 {
 pub fn argmaxSpan(n: u32) u32 {
     return (n + argmax_groups - 1) / argmax_groups;
 }
+pub fn moeTileBlock(c: u32) u32 {
+    return if (c <= 16) 16 else if (c <= 32) 32 else 64;
+}
+pub fn moePackTileR(tid_y: u32, bm: u32) u32 {
+    const code: u32 = if (bm == 16) 1 else if (bm == 32) 2 else 3;
+    return (code << 24) | (tid_y & 0xFFFFFF);
+}
+pub fn moeUnpackBm(packed_tile: u32) u32 {
+    const code: u32 = packed_tile >> 24;
+    return if (code == 1) 16 else if (code == 2) 32 else 64;
+}
+pub fn moeUnpackTidY(packed_tile: u32) u32 {
+    return packed_tile & 0xFFFFFF;
+}
+pub fn moeMaxTiles(exp_count: u32, total_pairs: u32) u32 {
+    return @min(total_pairs, @min(exp_count, total_pairs) + (total_pairs + 63) / 64);
+}

@@ -29,9 +29,11 @@ pub const Fusion = struct {
     depth_norm: bool = false,
     inkling_conv: bool = false,
     relative_gate: bool = false,
+    qkvr_prep: bool = false,
+    merge_norm: bool = false,
 
     pub fn any(self: Fusion) bool {
-        return self.projections or self.glu or self.norms or self.add_norm or self.conv or self.gate or self.attn_prep or self.bf16_cast or self.controller_merge or self.bf16_projections or self.head_softcap or self.depth_norm or self.inkling_conv or self.relative_gate;
+        return self.projections or self.glu or self.norms or self.add_norm or self.conv or self.gate or self.attn_prep or self.bf16_cast or self.controller_merge or self.bf16_projections or self.head_softcap or self.depth_norm or self.inkling_conv or self.relative_gate or self.qkvr_prep or self.merge_norm;
     }
 };
 
@@ -52,14 +54,18 @@ pub const Step = union(enum) {
     depth_norm: struct { first: u32, ops_len: u32, round_out: bool },
     inkling_conv: u32,
     relative_gate: u32,
+    qkvr_sconv_prep: u32,
+    qkvr_dyn_prep: u32,
+    controller_merge_norm: struct { first: u32, ops_len: u32, round_out: bool },
 
     pub fn first(self: Step) u32 {
         return switch (self) {
-            .op, .glu, .norms, .conv, .gate, .attn_prep, .bf16_cast, .controller_merge, .head_softcap, .controller_depth_norms, .inkling_conv, .relative_gate => |i| i,
+            .op, .glu, .norms, .conv, .gate, .attn_prep, .bf16_cast, .controller_merge, .head_softcap, .controller_depth_norms, .inkling_conv, .relative_gate, .qkvr_sconv_prep, .qkvr_dyn_prep => |i| i,
             .add_norm => |m| m.first,
             .projections => |m| m.first,
             .bf16_projections => |m| m.first,
             .depth_norm => |m| m.first,
+            .controller_merge_norm => |m| m.first,
         };
     }
     pub fn len(self: Step) u32 {
@@ -74,6 +80,9 @@ pub const Step = union(enum) {
             .bf16_projections => |m| m.ops_len,
             .controller_depth_norms => 5,
             .depth_norm => |m| m.ops_len,
+            .qkvr_sconv_prep => 15,
+            .qkvr_dyn_prep => 13,
+            .controller_merge_norm => |m| m.ops_len,
         };
     }
 };
@@ -304,6 +313,19 @@ fn launchAccess(step: Step, p: *const ir.Program, info: []const WeightInfo) ?Lau
             out.reads[2] = m.message;
             out.writes[0] = m.gates;
             out.writes[1] = m.out;
+            return out;
+        },
+        .controller_merge_norm => |cmn| {
+            const l0 = p.ops[cmn.first].linear;
+            const m = p.ops[cmn.first + 2].inkling_message_merge;
+            const n = p.ops[cmn.first + 3].rmsnorm;
+            var out: LaunchAccess = .{};
+            out.reads[0] = l0.x;
+            out.reads[1] = m.hidden;
+            out.reads[2] = m.message;
+            out.writes[0] = m.gates;
+            out.writes[1] = m.out;
+            out.writes[2] = n.out;
             return out;
         },
         .bf16_projections => |m| {
@@ -624,6 +646,31 @@ fn matchControllerMerge(p: *const ir.Program, info: []const WeightInfo, i: u32) 
     return matchControllerMergeOps(p, info, i) != null;
 }
 
+fn matchControllerMergeNorm(p: *const ir.Program, info: []const WeightInfo, i: u32) ?@FieldType(Step, "controller_merge_norm") {
+    if (!sameSide(p, i, 4)) return null;
+    const cm = matchControllerMergeOps(p, info, i) orelse return null;
+    const norm = switch (p.ops[i + 3]) {
+        .rmsnorm => |v| v,
+        else => return null,
+    };
+    if (!sameView(cm.m.out, norm.x) or norm.x.width != norm.group) return null;
+    if (overlaps(norm.out, cm.m.gates) or overlaps(norm.out, cm.m.hidden) or overlaps(norm.out, cm.m.message) or overlaps(norm.out, cm.l0.x)) return null;
+    var ops_len: u32 = 4;
+    var round_out = false;
+    if (i + 4 < p.ops.len and sameSide(p, i, 5)) {
+        if (p.ops[i + 4] == .row_transform) {
+            const t = p.ops[i + 4].row_transform;
+            if (t.transform == .copy and t.round == .bf16 and sameView(norm.out, t.x) and sameView(norm.out, t.out)) {
+                ops_len = 5;
+                round_out = true;
+            }
+        }
+    }
+    if (hasTraceBetween(p, i, i + ops_len - 1)) return null;
+    if (!deadAfter(p, cm.m.out, i + 3)) return null;
+    return .{ .first = i, .ops_len = ops_len, .round_out = round_out };
+}
+
 fn matchBf16Projections(p: *const ir.Program, info: []const WeightInfo, i: u32) ?@FieldType(Step, "bf16_projections") {
     const l0 = linearOf(p.ops[i]) orelse return null;
     if (info[l0.w].q4 or !info[l0.w].dense or info[l0.w].buffer == 0 or !l0.input_bf16) return null;
@@ -776,6 +823,131 @@ fn matchRelativeGate(p: *const ir.Program, i: u32) bool {
     return deadAfter(p, a.out, i + 2);
 }
 
+fn viewsDisjoint(vs: []const ir.View) bool {
+    for (vs, 0..) |a, idx| for (vs[idx + 1 ..]) |b| if (overlaps(a, b)) return false;
+    return true;
+}
+
+fn isCopyBf16(op: ir.Op, x: ir.View, out: ir.View) bool {
+    const t = switch (op) {
+        .row_transform => |v| v,
+        else => return false,
+    };
+    return t.transform == .copy and t.round == .bf16 and sameView(t.x, x) and sameView(t.out, out);
+}
+
+fn matchQkvrTail(p: *const ir.Program, i: u32, cv: ir.View, ck: ir.View, dim: u32) ?struct {
+    nv: ir.View,
+    q: ir.View,
+    r: ir.View,
+    has_log: bool,
+} {
+    const n_v = switch (p.ops[i]) {
+        .rmsnorm => |v| v,
+        else => return null,
+    };
+    if (n_v.weight != null or n_v.round_normalized != .none or !sameView(n_v.x, cv) or n_v.group != dim or cv.width % dim != 0) return null;
+    if (!isCopyBf16(p.ops[i + 1], n_v.out, n_v.out)) return null;
+    const cl_q = switch (p.ops[i + 2]) {
+        .l2_clip => |v| v,
+        else => return null,
+    };
+    if (cl_q.scale == null or !sameView(cl_q.out, cl_q.x) or cl_q.group != dim or cl_q.x.width % dim != 0) return null;
+    if (!isCopyBf16(p.ops[i + 3], cl_q.x, cl_q.x)) return null;
+    const cl_k = switch (p.ops[i + 4]) {
+        .l2_clip => |v| v,
+        else => return null,
+    };
+    if (cl_k.scale != null or !sameView(cl_k.x, ck) or !sameView(cl_k.out, ck) or cl_k.group != dim or ck.width != cv.width) return null;
+    if (!isCopyBf16(p.ops[i + 5], ck, ck)) return null;
+    const cl_r = switch (p.ops[i + 6]) {
+        .l2_clip => |v| v,
+        else => return null,
+    };
+    if (cl_r.scale == null or !sameView(cl_r.out, cl_r.x) or cl_r.group == 0 or cl_r.x.width % cl_r.group != 0) return null;
+    if (!isCopyBf16(p.ops[i + 7], cl_r.x, cl_r.x)) return null;
+    if (cl_q.x.width / dim != cl_r.x.width / cl_r.group) return null;
+    var off: u32 = i + 8;
+    var has_log = false;
+    if (p.ops[off] == .row_transform and p.ops[off].row_transform.transform == .log_position_scale) {
+        if (off + 4 >= p.ops.len) return null;
+        const tq = p.ops[off].row_transform;
+        const tr = switch (p.ops[off + 1]) {
+            .row_transform => |v| v,
+            else => return null,
+        };
+        if (tq.round != .bf16 or tr.transform != .log_position_scale or tr.round != .bf16) return null;
+        if (!sameView(tq.x, cl_q.x) or !sameView(tq.out, cl_q.x) or !sameView(tr.x, cl_r.x) or !sameView(tr.out, cl_r.x)) return null;
+        if (!std.meta.eql(tq.transform.log_position_scale, tr.transform.log_position_scale)) return null;
+        has_log = true;
+        off += 2;
+    }
+    const gp = switch (p.ops[off]) {
+        .grouped_project => |v| v,
+        else => return null,
+    };
+    const sk = switch (p.ops[off + 1]) {
+        .store => |v| v,
+        else => return null,
+    };
+    const sv = switch (p.ops[off + 2]) {
+        .store => |v| v,
+        else => return null,
+    };
+    if (!sameView(gp.x, cl_r.x) or gp.groups != cl_r.x.width / cl_r.group) return null;
+    if (!sameView(sk.src, ck) or !sameView(sv.src, n_v.out) or sk.dst == sv.dst) return null;
+    if (!p.states[sk.dst].persistent() or !p.states[sv.dst].persistent()) return null;
+    if (!viewsDisjoint(&.{ cl_q.x, cl_r.x, ck, cv, n_v.out, gp.out })) return null;
+    if (!deadAfter(p, ck, off + 2) or !deadAfter(p, n_v.out, off + 2)) return null;
+    return .{ .nv = n_v.out, .q = cl_q.x, .r = cl_r.x, .has_log = has_log };
+}
+
+fn matchQkvrSconvPrep(p: *const ir.Program, i: u32) bool {
+    if (!sameSide(p, i, 15) or hasTraceBetween(p, i, i + 14)) return false;
+    const sk = switch (p.ops[i]) {
+        .store => |v| v,
+        else => return false,
+    };
+    const ck = switch (p.ops[i + 1]) {
+        .inkling_short_conv => |v| v,
+        else => return false,
+    };
+    const sv = switch (p.ops[i + 2]) {
+        .store => |v| v,
+        else => return false,
+    };
+    const cv = switch (p.ops[i + 3]) {
+        .inkling_short_conv => |v| v,
+        else => return false,
+    };
+    if (p.states[sk.dst].kind != .ring or p.states[sv.dst].kind != .ring or sk.dst == sv.dst) return false;
+    if (ck.src != sk.dst or cv.src != sv.dst or !sameView(sk.src, ck.residual) or !sameView(sv.src, cv.residual)) return false;
+    if (ck.round != .bf16 or cv.round != .bf16 or ck.taps != cv.taps or ck.out.width != cv.out.width) return false;
+    const dim = switch (p.ops[i + 4]) {
+        .rmsnorm => |v| v.group,
+        else => return false,
+    };
+    const tail = matchQkvrTail(p, i + 4, cv.out, ck.out, dim) orelse return false;
+    if (tail.has_log) return false;
+    const gp = p.ops[i + 12].grouped_project;
+    if (!viewsDisjoint(&.{ tail.q, tail.r, sk.src, sv.src, ck.out, cv.out, tail.nv, gp.out })) return false;
+    return deadAfter(p, cv.out, i + 14);
+}
+
+fn matchQkvrDynPrep(p: *const ir.Program, i: u32) bool {
+    if (!sameSide(p, i, 13) or hasTraceBetween(p, i, i + 12)) return false;
+    const nv = switch (p.ops[i]) {
+        .rmsnorm => |v| v,
+        else => return false,
+    };
+    const cl_k = switch (p.ops[i + 4]) {
+        .l2_clip => |v| v,
+        else => return false,
+    };
+    const tail = matchQkvrTail(p, i, nv.x, cl_k.x, nv.group) orelse return false;
+    return tail.has_log;
+}
+
 pub fn build(a: std.mem.Allocator, p: *const ir.Program, fusion: Fusion, info: []const WeightInfo) ![]Step {
     var steps: std.ArrayList(Step) = .empty;
     var i: u32 = 0;
@@ -785,10 +957,15 @@ pub fn build(a: std.mem.Allocator, p: *const ir.Program, fusion: Fusion, info: [
                 if (matchControllerDepthNorms(p, i)) break :blk .{ .controller_depth_norms = i };
                 if (matchDepthNorm(p, i)) |m| break :blk .{ .depth_norm = m };
             }
+            if (fusion.merge_norm) if (matchControllerMergeNorm(p, info, i)) |m| break :blk .{ .controller_merge_norm = m };
             if (fusion.controller_merge and matchControllerMerge(p, info, i)) break :blk .{ .controller_merge = i };
             if (fusion.head_softcap and matchHeadSoftcap(p, info, i)) break :blk .{ .head_softcap = i };
             if (fusion.bf16_projections) if (matchBf16Projections(p, info, i)) |m| break :blk .{ .bf16_projections = m };
             if (fusion.add_norm) if (matchAddNorm(p, i)) |m| break :blk .{ .add_norm = m };
+            if (fusion.qkvr_prep) {
+                if (matchQkvrSconvPrep(p, i)) break :blk .{ .qkvr_sconv_prep = i };
+                if (matchQkvrDynPrep(p, i)) break :blk .{ .qkvr_dyn_prep = i };
+            }
             if (fusion.inkling_conv and matchInklingConv(p, i)) break :blk .{ .inkling_conv = i };
             if (fusion.relative_gate and matchRelativeGate(p, i)) break :blk .{ .relative_gate = i };
             if (fusion.bf16_cast and matchBf16Cast(p, info, i)) break :blk .{ .bf16_cast = i };

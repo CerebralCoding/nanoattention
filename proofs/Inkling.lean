@@ -593,4 +593,215 @@ theorem argmax_part_unique (g₁ o₁ g₂ o₂ span : Nat)
   have hg : g₁ = g₂ := by rw [← hd, ← hd2, heq]
   exact ⟨hg, by rw [hg] at heq; omega⟩
 
+/-- FP8 E4M3FN IEEE-754 binary32 bit-pattern reconstruction (`mk_expert_e4m3`). -/
+def e4m3BitDecode (code : Nat) : Nat :=
+  let exp := (code / 8) % 16
+  let mant := code % 8
+  let sign := (code / 128) * 2^31
+  if exp = 15 ∧ mant = 7 then
+    0x7fc00000
+  else if exp = 0 then
+    let magBits :=
+      if mant = 0 then 0
+      else if mant = 1 then 0x3b000000
+      else if mant < 4 then 0x3b800000 + (mant - 2) * 2^22
+      else 0x3c000000 + (mant - 4) * 2^21
+    magBits + sign
+  else
+    sign + (exp + 120) * 2^23 + mant * 2^20
+
+theorem e4m3_bit_decode_nan :
+    e4m3BitDecode 127 = 0x7fc00000 ∧ e4m3BitDecode 255 = 0x7fc00000 := by decide
+
+theorem e4m3_bit_decode_zero :
+    e4m3BitDecode 0 = 0 ∧ e4m3BitDecode 128 = 0x80000000 ∧
+    e4m3BitDecode 56 = 0x3f800000 ∧ e4m3BitDecode 184 = 0xbf800000 ∧
+    e4m3BitDecode 126 = 0x43e00000 ∧ e4m3BitDecode 254 = 0xc3e00000 := by decide
+
+theorem e4m3_bit_decode_u32 (code : Nat) (hc : code < 256) :
+    e4m3BitDecode code < 2^32 := by
+  unfold e4m3BitDecode
+  dsimp only
+  by_cases h1 : (code / 8) % 16 = 15 ∧ code % 8 = 7
+  · simp [h1]
+  · simp only [h1, ↓reduceIte]
+    by_cases h2 : (code / 8) % 16 = 0
+    · simp only [h2, ↓reduceIte]
+      by_cases m0 : code % 8 = 0
+      · simp only [m0, ↓reduceIte]; omega
+      · simp only [m0, ↓reduceIte]
+        by_cases m1 : code % 8 = 1
+        · simp only [m1, ↓reduceIte]; omega
+        · simp only [m1, ↓reduceIte]
+          by_cases m2 : code % 8 < 4 <;> simp only [m2, ↓reduceIte] <;> omega
+    · simp only [h2, ↓reduceIte]; omega
+
+theorem fp4_pair_decompose (b : Nat) (hb : b < 256) :
+    b % 16 < 16 ∧ b / 16 < 16 ∧ b % 16 + (b / 16) * 16 = b := by
+  omega
+
+theorem fp4_bit_decode_u32 (code : Nat) (hc : code < 16) :
+    nvfp4BitDecode code < 2^32 := by
+  unfold nvfp4BitDecode
+  dsimp only
+  split <;> omega
+
+theorem fp4_pair_lut_exact (b : Nat) (hb : b < 256) :
+    nvfp4BitDecode (b % 16) < 2^32 ∧ nvfp4BitDecode (b / 16) < 2^32 ∧
+    nvfp4BitDecode (b % 16) ∈ nvfp4ExpectedBits ∧
+    nvfp4BitDecode (b / 16) ∈ nvfp4ExpectedBits := by
+  have hlo : b % 16 < 16 := by omega
+  have hhi : b / 16 < 16 := by omega
+  refine ⟨fp4_bit_decode_u32 (b % 16) hlo, fp4_bit_decode_u32 (b / 16) hhi, ?_, ?_⟩
+  · have hmem : b % 16 ∈ List.range 16 := List.mem_range.mpr hlo
+    rw [← nvfp4_bit_decode_exact]
+    exact List.mem_map.mpr ⟨b % 16, hmem, rfl⟩
+  · have hmem : b / 16 ∈ List.range 16 := List.mem_range.mpr hhi
+    rw [← nvfp4_bit_decode_exact]
+    exact List.mem_map.mpr ⟨b / 16, hmem, rfl⟩
+
+/-- Compact MoE row-block size (`qw_moe_tile.metalh`): 16 for <=16 rows, 32 for <=32, else 64. -/
+def moeTileBlock (c : Nat) : Nat :=
+  if c ≤ 16 then 16 else if c ≤ 32 then 32 else 64
+
+def moeTileCode (bm : Nat) : Nat :=
+  if bm = 16 then 1 else if bm = 32 then 2 else 3
+
+def moePackTileR (tidY bm : Nat) : Nat :=
+  (moeTileCode bm) * 2^24 + (tidY % 2^24)
+
+def moeUnpackBm (packed : Nat) : Nat :=
+  let code := packed / 2^24
+  if code = 1 then 16 else if code = 2 then 32 else 64
+
+def moeUnpackTidY (packed : Nat) : Nat :=
+  packed % 2^24
+
+def moeMaxTiles (experts totalPairs : Nat) : Nat :=
+  min totalPairs (min experts totalPairs + (totalPairs + 63) / 64)
+
+theorem moe_tile_pack_roundtrip (tidY bm : Nat)
+    (htid : tidY < 2^24) (hbm : bm = 16 ∨ bm = 32 ∨ bm = 64) :
+    let packed := moePackTileR tidY bm
+    packed < 2^32 ∧ moeUnpackBm packed = bm ∧ moeUnpackTidY packed = tidY := by
+  dsimp only
+  unfold moePackTileR moeUnpackBm moeUnpackTidY moeTileCode
+  have hmod : tidY % 2^24 = tidY := Nat.mod_eq_of_lt htid
+  rw [hmod]
+  have hdiv : ∀ c : Nat, (c * 2^24 + tidY) / 2^24 = c := fun c => by
+    rw [Nat.add_comm, Nat.add_mul_div_right _ _ (by decide : 0 < 2^24), Nat.div_eq_of_lt htid, Nat.zero_add]
+  have hrm : ∀ c : Nat, (c * 2^24 + tidY) % 2^24 = tidY := fun c => by
+    rw [Nat.add_comm, Nat.add_mul_mod_self_right, hmod]
+  rcases hbm with rfl | rfl | rfl
+  · rw [show (if (16 : Nat) = 16 then 1 else if (16 : Nat) = 32 then 2 else 3) = 1 from rfl]
+    rw [hdiv 1, hrm 1]
+    exact ⟨by omega, rfl, rfl⟩
+  · rw [show (if (32 : Nat) = 16 then 1 else if (32 : Nat) = 32 then 2 else 3) = 2 from rfl]
+    rw [hdiv 2, hrm 2]
+    exact ⟨by omega, rfl, rfl⟩
+  · rw [show (if (64 : Nat) = 16 then 1 else if (64 : Nat) = 32 then 2 else 3) = 3 from rfl]
+    rw [hdiv 3, hrm 3]
+    exact ⟨by omega, rfl, rfl⟩
+
+private def sumMoeTiles : List Nat → Nat
+  | [] => 0
+  | c :: cs => (if c = 0 then 0 else (c + 63) / 64) + sumMoeTiles cs
+
+private def activeBuckets : List Nat → Nat
+  | [] => 0
+  | c :: cs => (if c = 0 then 0 else 1) + activeBuckets cs
+
+private def sumFullTiles64 : List Nat → Nat
+  | [] => 0
+  | c :: cs => c / 64 + sumFullTiles64 cs
+
+private theorem sum_moe_tiles_le_sum (cs : List Nat) : sumMoeTiles cs ≤ cs.sum := by
+  induction cs with
+  | nil => simp [sumMoeTiles]
+  | cons c cs ih =>
+      simp only [sumMoeTiles, List.sum_cons]
+      by_cases hc : c = 0 <;> simp [hc] <;> omega
+
+private theorem active_buckets_le_len_and_sum (cs : List Nat) :
+    activeBuckets cs ≤ cs.length ∧ activeBuckets cs ≤ cs.sum := by
+  induction cs with
+  | nil => simp [activeBuckets]
+  | cons c cs ih =>
+      simp only [activeBuckets, List.length_cons, List.sum_cons]
+      by_cases hc : c = 0 <;> simp [hc] <;> omega
+
+private theorem sum_full_tiles_mul (cs : List Nat) :
+    64 * sumFullTiles64 cs ≤ cs.sum := by
+  induction cs with
+  | nil => simp [sumFullTiles64]
+  | cons c cs ih =>
+      simp only [sumFullTiles64, List.sum_cons]
+      omega
+
+private theorem sum_moe_tiles_decomp (cs : List Nat) :
+    sumMoeTiles cs ≤ activeBuckets cs + sumFullTiles64 cs := by
+  induction cs with
+  | nil => simp [sumMoeTiles, activeBuckets, sumFullTiles64]
+  | cons c cs ih =>
+      simp only [sumMoeTiles, activeBuckets, sumFullTiles64]
+      by_cases hc : c = 0
+      · simp [hc]; omega
+      · simp [hc]; omega
+
+theorem moe_tile_count_bound (cs : List Nat) :
+    sumMoeTiles cs ≤ moeMaxTiles cs.length cs.sum := by
+  unfold moeMaxTiles
+  have h1 := sum_moe_tiles_le_sum cs
+  have ⟨h2a, h2b⟩ := active_buckets_le_len_and_sum cs
+  have h3 := sum_full_tiles_mul cs
+  have h4 := sum_moe_tiles_decomp cs
+  have h3b : sumFullTiles64 cs ≤ (cs.sum + 63) / 64 := by omega
+  omega
+
+/-- Single-launch batched SConv + QKVR ring safety: writing `(pos + t) % capacity`
+for `t < batch` never collides with reading `(pos + t' - back) % capacity` for `t' < back <= horizon`. -/
+theorem sconv_batch_ring_disjoint (pos t t' back horizon batch capacity : Nat)
+    (hcap : horizon + batch ≤ capacity) (ht : t < batch)
+    (ht' : t' < back) (hback : back ≤ horizon) (hpos : back ≤ pos + t') :
+    (pos + t) % capacity ≠ (pos + t' - back) % capacity := by
+  intro heq
+  have hpc : 0 < capacity := by omega
+  let r := (pos + t' - back) % capacity
+  let q := (pos + t' - back) / capacity
+  have hdm : capacity * q + r = pos + t' - back := Nat.div_add_mod _ capacity
+  have hr_lt : r < capacity := Nat.mod_lt _ hpc
+  let delta := t + back - t'
+  have hdelta_lo : 1 ≤ delta := by omega
+  have hdelta_hi : delta < capacity := by omega
+  have hplus : pos + t = r + delta + q * capacity := by
+    rw [Nat.mul_comm q capacity]
+    omega
+  have hmod1 : (pos + t) % capacity = (r + delta) % capacity := by
+    rw [hplus, Nat.add_mul_mod_self_right]
+  by_cases hwrap : r + delta < capacity
+  · have hm : (r + delta) % capacity = r + delta := Nat.mod_eq_of_lt hwrap
+    rw [hmod1, hm] at heq
+    change r + delta = r at heq
+    omega
+  · have hsub_lt : r + delta - capacity < capacity := by omega
+    have hex : r + delta = (r + delta - capacity) + 1 * capacity := by omega
+    have hm : (r + delta) % capacity = r + delta - capacity := by
+      calc (r + delta) % capacity
+          = ((r + delta - capacity) + 1 * capacity) % capacity := congrArg (· % capacity) hex
+        _ = (r + delta - capacity) % capacity := Nat.add_mul_mod_self_right _ _ _
+        _ = r + delta - capacity := Nat.mod_eq_of_lt hsub_lt
+    rw [hmod1, hm] at heq
+    change r + delta - capacity = r at heq
+    omega
+
+/-- Inline relative bias far-band skip: if the newest key in a stripe is at
+distance >= `relExtent`, every older key in `[start, start + n)` is also outside `[0, relExtent)`. -/
+theorem inline_rel_skip_far (pos start n relExtent i : Nat)
+    (hstart : start + n ≤ pos + 1)
+    (hn : 0 < n)
+    (hfar : relExtent ≤ pos - (start + n - 1))
+    (hi : i < n) :
+    start + i ≤ pos ∧ relExtent ≤ pos - (start + i) := by
+  omega
+
 end Inkling

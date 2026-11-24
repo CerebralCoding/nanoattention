@@ -559,29 +559,181 @@ kernel void mk_grouped_project_bf16d8_row1(device float *arena [[buffer(0)]], de
     }
 }
 
-// ---- Step 3D kernels: fast NVFP4 & MXFP8 decode experts ----
+// ---- Step 3D & Qwegn LUT kernels: fast NVFP4 & MXFP8 decode experts ----
+static constant float mk_e4m3_f32_lut[256] = {
+    0.0f, 0x1.0000000000000p-9f, 0x1.0000000000000p-8f, 0x1.8000000000000p-8f, 0x1.0000000000000p-7f, 0x1.4000000000000p-7f, 0x1.8000000000000p-7f, 0x1.c000000000000p-7f,
+    0x1.0000000000000p-6f, 0x1.2000000000000p-6f, 0x1.4000000000000p-6f, 0x1.6000000000000p-6f, 0x1.8000000000000p-6f, 0x1.a000000000000p-6f, 0x1.c000000000000p-6f, 0x1.e000000000000p-6f,
+    0x1.0000000000000p-5f, 0x1.2000000000000p-5f, 0x1.4000000000000p-5f, 0x1.6000000000000p-5f, 0x1.8000000000000p-5f, 0x1.a000000000000p-5f, 0x1.c000000000000p-5f, 0x1.e000000000000p-5f,
+    0x1.0000000000000p-4f, 0x1.2000000000000p-4f, 0x1.4000000000000p-4f, 0x1.6000000000000p-4f, 0x1.8000000000000p-4f, 0x1.a000000000000p-4f, 0x1.c000000000000p-4f, 0x1.e000000000000p-4f,
+    0x1.0000000000000p-3f, 0x1.2000000000000p-3f, 0x1.4000000000000p-3f, 0x1.6000000000000p-3f, 0x1.8000000000000p-3f, 0x1.a000000000000p-3f, 0x1.c000000000000p-3f, 0x1.e000000000000p-3f,
+    0x1.0000000000000p-2f, 0x1.2000000000000p-2f, 0x1.4000000000000p-2f, 0x1.6000000000000p-2f, 0x1.8000000000000p-2f, 0x1.a000000000000p-2f, 0x1.c000000000000p-2f, 0x1.e000000000000p-2f,
+    0x1.0000000000000p-1f, 0x1.2000000000000p-1f, 0x1.4000000000000p-1f, 0x1.6000000000000p-1f, 0x1.8000000000000p-1f, 0x1.a000000000000p-1f, 0x1.c000000000000p-1f, 0x1.e000000000000p-1f,
+    0x1.0000000000000p+0f, 0x1.2000000000000p+0f, 0x1.4000000000000p+0f, 0x1.6000000000000p+0f, 0x1.8000000000000p+0f, 0x1.a000000000000p+0f, 0x1.c000000000000p+0f, 0x1.e000000000000p+0f,
+    0x1.0000000000000p+1f, 0x1.2000000000000p+1f, 0x1.4000000000000p+1f, 0x1.6000000000000p+1f, 0x1.8000000000000p+1f, 0x1.a000000000000p+1f, 0x1.c000000000000p+1f, 0x1.e000000000000p+1f,
+    0x1.0000000000000p+2f, 0x1.2000000000000p+2f, 0x1.4000000000000p+2f, 0x1.6000000000000p+2f, 0x1.8000000000000p+2f, 0x1.a000000000000p+2f, 0x1.c000000000000p+2f, 0x1.e000000000000p+2f,
+    0x1.0000000000000p+3f, 0x1.2000000000000p+3f, 0x1.4000000000000p+3f, 0x1.6000000000000p+3f, 0x1.8000000000000p+3f, 0x1.a000000000000p+3f, 0x1.c000000000000p+3f, 0x1.e000000000000p+3f,
+    0x1.0000000000000p+4f, 0x1.2000000000000p+4f, 0x1.4000000000000p+4f, 0x1.6000000000000p+4f, 0x1.8000000000000p+4f, 0x1.a000000000000p+4f, 0x1.c000000000000p+4f, 0x1.e000000000000p+4f,
+    0x1.0000000000000p+5f, 0x1.2000000000000p+5f, 0x1.4000000000000p+5f, 0x1.6000000000000p+5f, 0x1.8000000000000p+5f, 0x1.a000000000000p+5f, 0x1.c000000000000p+5f, 0x1.e000000000000p+5f,
+    0x1.0000000000000p+6f, 0x1.2000000000000p+6f, 0x1.4000000000000p+6f, 0x1.6000000000000p+6f, 0x1.8000000000000p+6f, 0x1.a000000000000p+6f, 0x1.c000000000000p+6f, 0x1.e000000000000p+6f,
+    0x1.0000000000000p+7f, 0x1.2000000000000p+7f, 0x1.4000000000000p+7f, 0x1.6000000000000p+7f, 0x1.8000000000000p+7f, 0x1.a000000000000p+7f, 0x1.c000000000000p+7f, 0x1.e000000000000p+7f,
+    0x1.0000000000000p+8f, 0x1.2000000000000p+8f, 0x1.4000000000000p+8f, 0x1.6000000000000p+8f, 0x1.8000000000000p+8f, 0x1.a000000000000p+8f, 0x1.c000000000000p+8f, NAN,
+    -0.0f, -0x1.0000000000000p-9f, -0x1.0000000000000p-8f, -0x1.8000000000000p-8f, -0x1.0000000000000p-7f, -0x1.4000000000000p-7f, -0x1.8000000000000p-7f, -0x1.c000000000000p-7f,
+    -0x1.0000000000000p-6f, -0x1.2000000000000p-6f, -0x1.4000000000000p-6f, -0x1.6000000000000p-6f, -0x1.8000000000000p-6f, -0x1.a000000000000p-6f, -0x1.c000000000000p-6f, -0x1.e000000000000p-6f,
+    -0x1.0000000000000p-5f, -0x1.2000000000000p-5f, -0x1.4000000000000p-5f, -0x1.6000000000000p-5f, -0x1.8000000000000p-5f, -0x1.a000000000000p-5f, -0x1.c000000000000p-5f, -0x1.e000000000000p-5f,
+    -0x1.0000000000000p-4f, -0x1.2000000000000p-4f, -0x1.4000000000000p-4f, -0x1.6000000000000p-4f, -0x1.8000000000000p-4f, -0x1.a000000000000p-4f, -0x1.c000000000000p-4f, -0x1.e000000000000p-4f,
+    -0x1.0000000000000p-3f, -0x1.2000000000000p-3f, -0x1.4000000000000p-3f, -0x1.6000000000000p-3f, -0x1.8000000000000p-3f, -0x1.a000000000000p-3f, -0x1.c000000000000p-3f, -0x1.e000000000000p-3f,
+    -0x1.0000000000000p-2f, -0x1.2000000000000p-2f, -0x1.4000000000000p-2f, -0x1.6000000000000p-2f, -0x1.8000000000000p-2f, -0x1.a000000000000p-2f, -0x1.c000000000000p-2f, -0x1.e000000000000p-2f,
+    -0x1.0000000000000p-1f, -0x1.2000000000000p-1f, -0x1.4000000000000p-1f, -0x1.6000000000000p-1f, -0x1.8000000000000p-1f, -0x1.a000000000000p-1f, -0x1.c000000000000p-1f, -0x1.e000000000000p-1f,
+    -0x1.0000000000000p+0f, -0x1.2000000000000p+0f, -0x1.4000000000000p+0f, -0x1.6000000000000p+0f, -0x1.8000000000000p+0f, -0x1.a000000000000p+0f, -0x1.c000000000000p+0f, -0x1.e000000000000p+0f,
+    -0x1.0000000000000p+1f, -0x1.2000000000000p+1f, -0x1.4000000000000p+1f, -0x1.6000000000000p+1f, -0x1.8000000000000p+1f, -0x1.a000000000000p+1f, -0x1.c000000000000p+1f, -0x1.e000000000000p+1f,
+    -0x1.0000000000000p+2f, -0x1.2000000000000p+2f, -0x1.4000000000000p+2f, -0x1.6000000000000p+2f, -0x1.8000000000000p+2f, -0x1.a000000000000p+2f, -0x1.c000000000000p+2f, -0x1.e000000000000p+2f,
+    -0x1.0000000000000p+3f, -0x1.2000000000000p+3f, -0x1.4000000000000p+3f, -0x1.6000000000000p+3f, -0x1.8000000000000p+3f, -0x1.a000000000000p+3f, -0x1.c000000000000p+3f, -0x1.e000000000000p+3f,
+    -0x1.0000000000000p+4f, -0x1.2000000000000p+4f, -0x1.4000000000000p+4f, -0x1.6000000000000p+4f, -0x1.8000000000000p+4f, -0x1.a000000000000p+4f, -0x1.c000000000000p+4f, -0x1.e000000000000p+4f,
+    -0x1.0000000000000p+5f, -0x1.2000000000000p+5f, -0x1.4000000000000p+5f, -0x1.6000000000000p+5f, -0x1.8000000000000p+5f, -0x1.a000000000000p+5f, -0x1.c000000000000p+5f, -0x1.e000000000000p+5f,
+    -0x1.0000000000000p+6f, -0x1.2000000000000p+6f, -0x1.4000000000000p+6f, -0x1.6000000000000p+6f, -0x1.8000000000000p+6f, -0x1.a000000000000p+6f, -0x1.c000000000000p+6f, -0x1.e000000000000p+6f,
+    -0x1.0000000000000p+7f, -0x1.2000000000000p+7f, -0x1.4000000000000p+7f, -0x1.6000000000000p+7f, -0x1.8000000000000p+7f, -0x1.a000000000000p+7f, -0x1.c000000000000p+7f, -0x1.e000000000000p+7f,
+    -0x1.0000000000000p+8f, -0x1.2000000000000p+8f, -0x1.4000000000000p+8f, -0x1.6000000000000p+8f, -0x1.8000000000000p+8f, -0x1.a000000000000p+8f, -0x1.c000000000000p+8f, NAN,
+};
+
+static constant half mk_e4m3_h_lut[256] = {
+    0.0h, half(0x1.0000000000000p-9f), half(0x1.0000000000000p-8f), half(0x1.8000000000000p-8f), half(0x1.0000000000000p-7f), half(0x1.4000000000000p-7f), half(0x1.8000000000000p-7f), half(0x1.c000000000000p-7f),
+    half(0x1.0000000000000p-6f), half(0x1.2000000000000p-6f), half(0x1.4000000000000p-6f), half(0x1.6000000000000p-6f), half(0x1.8000000000000p-6f), half(0x1.a000000000000p-6f), half(0x1.c000000000000p-6f), half(0x1.e000000000000p-6f),
+    half(0x1.0000000000000p-5f), half(0x1.2000000000000p-5f), half(0x1.4000000000000p-5f), half(0x1.6000000000000p-5f), half(0x1.8000000000000p-5f), half(0x1.a000000000000p-5f), half(0x1.c000000000000p-5f), half(0x1.e000000000000p-5f),
+    half(0x1.0000000000000p-4f), half(0x1.2000000000000p-4f), half(0x1.4000000000000p-4f), half(0x1.6000000000000p-4f), half(0x1.8000000000000p-4f), half(0x1.a000000000000p-4f), half(0x1.c000000000000p-4f), half(0x1.e000000000000p-4f),
+    half(0x1.0000000000000p-3f), half(0x1.2000000000000p-3f), half(0x1.4000000000000p-3f), half(0x1.6000000000000p-3f), half(0x1.8000000000000p-3f), half(0x1.a000000000000p-3f), half(0x1.c000000000000p-3f), half(0x1.e000000000000p-3f),
+    half(0x1.0000000000000p-2f), half(0x1.2000000000000p-2f), half(0x1.4000000000000p-2f), half(0x1.6000000000000p-2f), half(0x1.8000000000000p-2f), half(0x1.a000000000000p-2f), half(0x1.c000000000000p-2f), half(0x1.e000000000000p-2f),
+    half(0x1.0000000000000p-1f), half(0x1.2000000000000p-1f), half(0x1.4000000000000p-1f), half(0x1.6000000000000p-1f), half(0x1.8000000000000p-1f), half(0x1.a000000000000p-1f), half(0x1.c000000000000p-1f), half(0x1.e000000000000p-1f),
+    half(0x1.0000000000000p+0f), half(0x1.2000000000000p+0f), half(0x1.4000000000000p+0f), half(0x1.6000000000000p+0f), half(0x1.8000000000000p+0f), half(0x1.a000000000000p+0f), half(0x1.c000000000000p+0f), half(0x1.e000000000000p+0f),
+    half(0x1.0000000000000p+1f), half(0x1.2000000000000p+1f), half(0x1.4000000000000p+1f), half(0x1.6000000000000p+1f), half(0x1.8000000000000p+1f), half(0x1.a000000000000p+1f), half(0x1.c000000000000p+1f), half(0x1.e000000000000p+1f),
+    half(0x1.0000000000000p+2f), half(0x1.2000000000000p+2f), half(0x1.4000000000000p+2f), half(0x1.6000000000000p+2f), half(0x1.8000000000000p+2f), half(0x1.a000000000000p+2f), half(0x1.c000000000000p+2f), half(0x1.e000000000000p+2f),
+    half(0x1.0000000000000p+3f), half(0x1.2000000000000p+3f), half(0x1.4000000000000p+3f), half(0x1.6000000000000p+3f), half(0x1.8000000000000p+3f), half(0x1.a000000000000p+3f), half(0x1.c000000000000p+3f), half(0x1.e000000000000p+3f),
+    half(0x1.0000000000000p+4f), half(0x1.2000000000000p+4f), half(0x1.4000000000000p+4f), half(0x1.6000000000000p+4f), half(0x1.8000000000000p+4f), half(0x1.a000000000000p+4f), half(0x1.c000000000000p+4f), half(0x1.e000000000000p+4f),
+    half(0x1.0000000000000p+5f), half(0x1.2000000000000p+5f), half(0x1.4000000000000p+5f), half(0x1.6000000000000p+5f), half(0x1.8000000000000p+5f), half(0x1.a000000000000p+5f), half(0x1.c000000000000p+5f), half(0x1.e000000000000p+5f),
+    half(0x1.0000000000000p+6f), half(0x1.2000000000000p+6f), half(0x1.4000000000000p+6f), half(0x1.6000000000000p+6f), half(0x1.8000000000000p+6f), half(0x1.a000000000000p+6f), half(0x1.c000000000000p+6f), half(0x1.e000000000000p+6f),
+    half(0x1.0000000000000p+7f), half(0x1.2000000000000p+7f), half(0x1.4000000000000p+7f), half(0x1.6000000000000p+7f), half(0x1.8000000000000p+7f), half(0x1.a000000000000p+7f), half(0x1.c000000000000p+7f), half(0x1.e000000000000p+7f),
+    half(0x1.0000000000000p+8f), half(0x1.2000000000000p+8f), half(0x1.4000000000000p+8f), half(0x1.6000000000000p+8f), half(0x1.8000000000000p+8f), half(0x1.a000000000000p+8f), half(0x1.c000000000000p+8f), half(NAN),
+    -0.0h, half(-0x1.0000000000000p-9f), half(-0x1.0000000000000p-8f), half(-0x1.8000000000000p-8f), half(-0x1.0000000000000p-7f), half(-0x1.4000000000000p-7f), half(-0x1.8000000000000p-7f), half(-0x1.c000000000000p-7f),
+    half(-0x1.0000000000000p-6f), half(-0x1.2000000000000p-6f), half(-0x1.4000000000000p-6f), half(-0x1.6000000000000p-6f), half(-0x1.8000000000000p-6f), half(-0x1.a000000000000p-6f), half(-0x1.c000000000000p-6f), half(-0x1.e000000000000p-6f),
+    half(-0x1.0000000000000p-5f), half(-0x1.2000000000000p-5f), half(-0x1.4000000000000p-5f), half(-0x1.6000000000000p-5f), half(-0x1.8000000000000p-5f), half(-0x1.a000000000000p-5f), half(-0x1.c000000000000p-5f), half(-0x1.e000000000000p-5f),
+    half(-0x1.0000000000000p-4f), half(-0x1.2000000000000p-4f), half(-0x1.4000000000000p-4f), half(-0x1.6000000000000p-4f), half(-0x1.8000000000000p-4f), half(-0x1.a000000000000p-4f), half(-0x1.c000000000000p-4f), half(-0x1.e000000000000p-4f),
+    half(-0x1.0000000000000p-3f), half(-0x1.2000000000000p-3f), half(-0x1.4000000000000p-3f), half(-0x1.6000000000000p-3f), half(-0x1.8000000000000p-3f), half(-0x1.a000000000000p-3f), half(-0x1.c000000000000p-3f), half(-0x1.e000000000000p-3f),
+    half(-0x1.0000000000000p-2f), half(-0x1.2000000000000p-2f), half(-0x1.4000000000000p-2f), half(-0x1.6000000000000p-2f), half(-0x1.8000000000000p-2f), half(-0x1.a000000000000p-2f), half(-0x1.c000000000000p-2f), half(-0x1.e000000000000p-2f),
+    half(-0x1.0000000000000p-1f), half(-0x1.2000000000000p-1f), half(-0x1.4000000000000p-1f), half(-0x1.6000000000000p-1f), half(-0x1.8000000000000p-1f), half(-0x1.a000000000000p-1f), half(-0x1.c000000000000p-1f), half(-0x1.e000000000000p-1f),
+    half(-0x1.0000000000000p+0f), half(-0x1.2000000000000p+0f), half(-0x1.4000000000000p+0f), half(-0x1.6000000000000p+0f), half(-0x1.8000000000000p+0f), half(-0x1.a000000000000p+0f), half(-0x1.c000000000000p+0f), half(-0x1.e000000000000p+0f),
+    half(-0x1.0000000000000p+1f), half(-0x1.2000000000000p+1f), half(-0x1.4000000000000p+1f), half(-0x1.6000000000000p+1f), half(-0x1.8000000000000p+1f), half(-0x1.a000000000000p+1f), half(-0x1.c000000000000p+1f), half(-0x1.e000000000000p+1f),
+    half(-0x1.0000000000000p+2f), half(-0x1.2000000000000p+2f), half(-0x1.4000000000000p+2f), half(-0x1.6000000000000p+2f), half(-0x1.8000000000000p+2f), half(-0x1.a000000000000p+2f), half(-0x1.c000000000000p+2f), half(-0x1.e000000000000p+2f),
+    half(-0x1.0000000000000p+3f), half(-0x1.2000000000000p+3f), half(-0x1.4000000000000p+3f), half(-0x1.6000000000000p+3f), half(-0x1.8000000000000p+3f), half(-0x1.a000000000000p+3f), half(-0x1.c000000000000p+3f), half(-0x1.e000000000000p+3f),
+    half(-0x1.0000000000000p+4f), half(-0x1.2000000000000p+4f), half(-0x1.4000000000000p+4f), half(-0x1.6000000000000p+4f), half(-0x1.8000000000000p+4f), half(-0x1.a000000000000p+4f), half(-0x1.c000000000000p+4f), half(-0x1.e000000000000p+4f),
+    half(-0x1.0000000000000p+5f), half(-0x1.2000000000000p+5f), half(-0x1.4000000000000p+5f), half(-0x1.6000000000000p+5f), half(-0x1.8000000000000p+5f), half(-0x1.a000000000000p+5f), half(-0x1.c000000000000p+5f), half(-0x1.e000000000000p+5f),
+    half(-0x1.0000000000000p+6f), half(-0x1.2000000000000p+6f), half(-0x1.4000000000000p+6f), half(-0x1.6000000000000p+6f), half(-0x1.8000000000000p+6f), half(-0x1.a000000000000p+6f), half(-0x1.c000000000000p+6f), half(-0x1.e000000000000p+6f),
+    half(-0x1.0000000000000p+7f), half(-0x1.2000000000000p+7f), half(-0x1.4000000000000p+7f), half(-0x1.6000000000000p+7f), half(-0x1.8000000000000p+7f), half(-0x1.a000000000000p+7f), half(-0x1.c000000000000p+7f), half(-0x1.e000000000000p+7f),
+    half(-0x1.0000000000000p+8f), half(-0x1.2000000000000p+8f), half(-0x1.4000000000000p+8f), half(-0x1.6000000000000p+8f), half(-0x1.8000000000000p+8f), half(-0x1.a000000000000p+8f), half(-0x1.c000000000000p+8f), half(NAN),
+};
+
+static constant half2 mk_fp4_pair_h2_lut[256] = {
+    half2(0.0h, 0.0h), half2(0.5h, 0.0h), half2(1.0h, 0.0h), half2(1.5h, 0.0h),
+    half2(2.0h, 0.0h), half2(3.0h, 0.0h), half2(4.0h, 0.0h), half2(6.0h, 0.0h),
+    half2(-0.0h, 0.0h), half2(-0.5h, 0.0h), half2(-1.0h, 0.0h), half2(-1.5h, 0.0h),
+    half2(-2.0h, 0.0h), half2(-3.0h, 0.0h), half2(-4.0h, 0.0h), half2(-6.0h, 0.0h),
+    half2(0.0h, 0.5h), half2(0.5h, 0.5h), half2(1.0h, 0.5h), half2(1.5h, 0.5h),
+    half2(2.0h, 0.5h), half2(3.0h, 0.5h), half2(4.0h, 0.5h), half2(6.0h, 0.5h),
+    half2(-0.0h, 0.5h), half2(-0.5h, 0.5h), half2(-1.0h, 0.5h), half2(-1.5h, 0.5h),
+    half2(-2.0h, 0.5h), half2(-3.0h, 0.5h), half2(-4.0h, 0.5h), half2(-6.0h, 0.5h),
+    half2(0.0h, 1.0h), half2(0.5h, 1.0h), half2(1.0h, 1.0h), half2(1.5h, 1.0h),
+    half2(2.0h, 1.0h), half2(3.0h, 1.0h), half2(4.0h, 1.0h), half2(6.0h, 1.0h),
+    half2(-0.0h, 1.0h), half2(-0.5h, 1.0h), half2(-1.0h, 1.0h), half2(-1.5h, 1.0h),
+    half2(-2.0h, 1.0h), half2(-3.0h, 1.0h), half2(-4.0h, 1.0h), half2(-6.0h, 1.0h),
+    half2(0.0h, 1.5h), half2(0.5h, 1.5h), half2(1.0h, 1.5h), half2(1.5h, 1.5h),
+    half2(2.0h, 1.5h), half2(3.0h, 1.5h), half2(4.0h, 1.5h), half2(6.0h, 1.5h),
+    half2(-0.0h, 1.5h), half2(-0.5h, 1.5h), half2(-1.0h, 1.5h), half2(-1.5h, 1.5h),
+    half2(-2.0h, 1.5h), half2(-3.0h, 1.5h), half2(-4.0h, 1.5h), half2(-6.0h, 1.5h),
+    half2(0.0h, 2.0h), half2(0.5h, 2.0h), half2(1.0h, 2.0h), half2(1.5h, 2.0h),
+    half2(2.0h, 2.0h), half2(3.0h, 2.0h), half2(4.0h, 2.0h), half2(6.0h, 2.0h),
+    half2(-0.0h, 2.0h), half2(-0.5h, 2.0h), half2(-1.0h, 2.0h), half2(-1.5h, 2.0h),
+    half2(-2.0h, 2.0h), half2(-3.0h, 2.0h), half2(-4.0h, 2.0h), half2(-6.0h, 2.0h),
+    half2(0.0h, 3.0h), half2(0.5h, 3.0h), half2(1.0h, 3.0h), half2(1.5h, 3.0h),
+    half2(2.0h, 3.0h), half2(3.0h, 3.0h), half2(4.0h, 3.0h), half2(6.0h, 3.0h),
+    half2(-0.0h, 3.0h), half2(-0.5h, 3.0h), half2(-1.0h, 3.0h), half2(-1.5h, 3.0h),
+    half2(-2.0h, 3.0h), half2(-3.0h, 3.0h), half2(-4.0h, 3.0h), half2(-6.0h, 3.0h),
+    half2(0.0h, 4.0h), half2(0.5h, 4.0h), half2(1.0h, 4.0h), half2(1.5h, 4.0h),
+    half2(2.0h, 4.0h), half2(3.0h, 4.0h), half2(4.0h, 4.0h), half2(6.0h, 4.0h),
+    half2(-0.0h, 4.0h), half2(-0.5h, 4.0h), half2(-1.0h, 4.0h), half2(-1.5h, 4.0h),
+    half2(-2.0h, 4.0h), half2(-3.0h, 4.0h), half2(-4.0h, 4.0h), half2(-6.0h, 4.0h),
+    half2(0.0h, 6.0h), half2(0.5h, 6.0h), half2(1.0h, 6.0h), half2(1.5h, 6.0h),
+    half2(2.0h, 6.0h), half2(3.0h, 6.0h), half2(4.0h, 6.0h), half2(6.0h, 6.0h),
+    half2(-0.0h, 6.0h), half2(-0.5h, 6.0h), half2(-1.0h, 6.0h), half2(-1.5h, 6.0h),
+    half2(-2.0h, 6.0h), half2(-3.0h, 6.0h), half2(-4.0h, 6.0h), half2(-6.0h, 6.0h),
+    half2(0.0h, -0.0h), half2(0.5h, -0.0h), half2(1.0h, -0.0h), half2(1.5h, -0.0h),
+    half2(2.0h, -0.0h), half2(3.0h, -0.0h), half2(4.0h, -0.0h), half2(6.0h, -0.0h),
+    half2(-0.0h, -0.0h), half2(-0.5h, -0.0h), half2(-1.0h, -0.0h), half2(-1.5h, -0.0h),
+    half2(-2.0h, -0.0h), half2(-3.0h, -0.0h), half2(-4.0h, -0.0h), half2(-6.0h, -0.0h),
+    half2(0.0h, -0.5h), half2(0.5h, -0.5h), half2(1.0h, -0.5h), half2(1.5h, -0.5h),
+    half2(2.0h, -0.5h), half2(3.0h, -0.5h), half2(4.0h, -0.5h), half2(6.0h, -0.5h),
+    half2(-0.0h, -0.5h), half2(-0.5h, -0.5h), half2(-1.0h, -0.5h), half2(-1.5h, -0.5h),
+    half2(-2.0h, -0.5h), half2(-3.0h, -0.5h), half2(-4.0h, -0.5h), half2(-6.0h, -0.5h),
+    half2(0.0h, -1.0h), half2(0.5h, -1.0h), half2(1.0h, -1.0h), half2(1.5h, -1.0h),
+    half2(2.0h, -1.0h), half2(3.0h, -1.0h), half2(4.0h, -1.0h), half2(6.0h, -1.0h),
+    half2(-0.0h, -1.0h), half2(-0.5h, -1.0h), half2(-1.0h, -1.0h), half2(-1.5h, -1.0h),
+    half2(-2.0h, -1.0h), half2(-3.0h, -1.0h), half2(-4.0h, -1.0h), half2(-6.0h, -1.0h),
+    half2(0.0h, -1.5h), half2(0.5h, -1.5h), half2(1.0h, -1.5h), half2(1.5h, -1.5h),
+    half2(2.0h, -1.5h), half2(3.0h, -1.5h), half2(4.0h, -1.5h), half2(6.0h, -1.5h),
+    half2(-0.0h, -1.5h), half2(-0.5h, -1.5h), half2(-1.0h, -1.5h), half2(-1.5h, -1.5h),
+    half2(-2.0h, -1.5h), half2(-3.0h, -1.5h), half2(-4.0h, -1.5h), half2(-6.0h, -1.5h),
+    half2(0.0h, -2.0h), half2(0.5h, -2.0h), half2(1.0h, -2.0h), half2(1.5h, -2.0h),
+    half2(2.0h, -2.0h), half2(3.0h, -2.0h), half2(4.0h, -2.0h), half2(6.0h, -2.0h),
+    half2(-0.0h, -2.0h), half2(-0.5h, -2.0h), half2(-1.0h, -2.0h), half2(-1.5h, -2.0h),
+    half2(-2.0h, -2.0h), half2(-3.0h, -2.0h), half2(-4.0h, -2.0h), half2(-6.0h, -2.0h),
+    half2(0.0h, -3.0h), half2(0.5h, -3.0h), half2(1.0h, -3.0h), half2(1.5h, -3.0h),
+    half2(2.0h, -3.0h), half2(3.0h, -3.0h), half2(4.0h, -3.0h), half2(6.0h, -3.0h),
+    half2(-0.0h, -3.0h), half2(-0.5h, -3.0h), half2(-1.0h, -3.0h), half2(-1.5h, -3.0h),
+    half2(-2.0h, -3.0h), half2(-3.0h, -3.0h), half2(-4.0h, -3.0h), half2(-6.0h, -3.0h),
+    half2(0.0h, -4.0h), half2(0.5h, -4.0h), half2(1.0h, -4.0h), half2(1.5h, -4.0h),
+    half2(2.0h, -4.0h), half2(3.0h, -4.0h), half2(4.0h, -4.0h), half2(6.0h, -4.0h),
+    half2(-0.0h, -4.0h), half2(-0.5h, -4.0h), half2(-1.0h, -4.0h), half2(-1.5h, -4.0h),
+    half2(-2.0h, -4.0h), half2(-3.0h, -4.0h), half2(-4.0h, -4.0h), half2(-6.0h, -4.0h),
+    half2(0.0h, -6.0h), half2(0.5h, -6.0h), half2(1.0h, -6.0h), half2(1.5h, -6.0h),
+    half2(2.0h, -6.0h), half2(3.0h, -6.0h), half2(4.0h, -6.0h), half2(6.0h, -6.0h),
+    half2(-0.0h, -6.0h), half2(-0.5h, -6.0h), half2(-1.0h, -6.0h), half2(-1.5h, -6.0h),
+    half2(-2.0h, -6.0h), half2(-3.0h, -6.0h), half2(-4.0h, -6.0h), half2(-6.0h, -6.0h),
+};
+
+template <bool Lut>
 inline float mk_nvfp4_dot16(uint2 raw, float4 x0, float4 x1, float4 x2, float4 x3) {
-    const float4 d0 = inkling_nvfp4_decode4(raw.x);
-    const float4 d1 = inkling_nvfp4_decode4(raw.x >> 16);
-    const float4 d2 = inkling_nvfp4_decode4(raw.y);
-    const float4 d3 = inkling_nvfp4_decode4(raw.y >> 16);
-    float acc = dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3);
-    return acc;
+    if constexpr (Lut) {
+        const uchar4 a0 = as_type<uchar4>(raw.x), a1 = as_type<uchar4>(raw.y);
+        const float4 d0 = float4(half4(mk_fp4_pair_h2_lut[a0[0]], mk_fp4_pair_h2_lut[a0[1]]));
+        const float4 d1 = float4(half4(mk_fp4_pair_h2_lut[a0[2]], mk_fp4_pair_h2_lut[a0[3]]));
+        const float4 d2 = float4(half4(mk_fp4_pair_h2_lut[a1[0]], mk_fp4_pair_h2_lut[a1[1]]));
+        const float4 d3 = float4(half4(mk_fp4_pair_h2_lut[a1[2]], mk_fp4_pair_h2_lut[a1[3]]));
+        return dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3);
+    } else {
+        const float4 d0 = inkling_nvfp4_decode4(raw.x);
+        const float4 d1 = inkling_nvfp4_decode4(raw.x >> 16);
+        const float4 d2 = inkling_nvfp4_decode4(raw.y);
+        const float4 d3 = inkling_nvfp4_decode4(raw.y >> 16);
+        return dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3);
+    }
 }
 
+template <bool Lut>
 inline float mk_e4m3x4_dot(uint packed, float4 xv) {
-    const float4 wv(mk_expert_e4m3(uchar(packed)),
-                    mk_expert_e4m3(uchar(packed >> 8)),
-                    mk_expert_e4m3(uchar(packed >> 16)),
-                    mk_expert_e4m3(uchar(packed >> 24)));
-    return dot(wv, xv);
+    if constexpr (Lut) {
+        const uchar4 b = as_type<uchar4>(packed);
+        return dot(float4(mk_e4m3_f32_lut[b[0]], mk_e4m3_f32_lut[b[1]], mk_e4m3_f32_lut[b[2]], mk_e4m3_f32_lut[b[3]]), xv);
+    } else {
+        const float4 wv(mk_expert_e4m3(uchar(packed)),
+                        mk_expert_e4m3(uchar(packed >> 8)),
+                        mk_expert_e4m3(uchar(packed >> 16)),
+                        mk_expert_e4m3(uchar(packed >> 24)));
+        return dot(wv, xv);
+    }
 }
 
 // 16-lane sub-SIMD NVFP4 gate+up decode: 2 pairs (4 rows) per sub-SIMD, 8 rows per SIMD.
-kernel void mk_expert_gate_up_nv16(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
-                                   device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]],
-                                   device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]],
-                                   uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+template <bool Lut, bool Bf16Out>
+inline void mk_expert_gate_up_nv16_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                        device const uchar *amax, device const uchar *denom, constant MKExpert &p,
+                                        uint gid, uint lane) {
     const uint simd_id = gid / 32u;
     const uint cols4 = p.n / 4u;
     const uint slot = simd_id / cols4;
@@ -607,8 +759,9 @@ kernel void mk_expert_gate_up_nv16(device float *arena [[buffer(0)]], device con
             const uint b = k4 / 4u;
             #pragma unroll
             for (uint c = 0u; c < 4u; ++c) {
-                const float sc = mk_expert_e4m3(sp[b + c * sstep]);
-                const float d = mk_nvfp4_dot16(wp[b + c * wstep], x0, x1, x2, x3);
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                const float d = mk_nvfp4_dot16<Lut>(wp[b + c * wstep], x0, x1, x2, x3);
                 acc[c] = fma(d, sc, acc[c]);
             }
         }
@@ -632,47 +785,63 @@ kernel void mk_expert_gate_up_nv16(device float *arena [[buffer(0)]], device con
     if (l16 == 0u) {
         if (expert < p.experts) acc *= mk_load(amax, p.amax, 0u, expert) / mk_load(denom, p.denominator, 0u, 0u);
         device float *out = arena + p.y + row * p.ys + slot * p.n + j;
+        device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + row * p.ys) + slot * p.n + j;
         for (uint c = 0u; c < 2u; ++c) {
             float gate = acc[c * 2u], up = acc[c * 2u + 1u];
             if (p.round_bf16) { gate = mk_bf16(gate); up = mk_bf16(up); }
             const float value = ((tanh(gate / p.gate_cap) * p.gate_cap) * mk_sigmoid(gate)) * (tanh(up / p.up_cap) * p.up_cap);
-            out[c] = p.round_bf16 ? mk_bf16(value) : value;
+            if constexpr (Bf16Out) out16[c] = bfloat(p.round_bf16 ? mk_bf16(value) : value);
+            else out[c] = p.round_bf16 ? mk_bf16(value) : value;
         }
     }
 }
 
+#define MK_EXPERT_NV16(NAME, LUT, BF16) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]], \
+                     uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+        mk_expert_gate_up_nv16_impl<LUT, BF16>(arena, w, s, amax, denom, p, gid, lane); \
+    }
+MK_EXPERT_NV16(mk_expert_gate_up_nv16, false, false)
+MK_EXPERT_NV16(mk_expert_gate_up_nv16_lut, true, false)
+MK_EXPERT_NV16(mk_expert_gate_up_nv16_bf16, false, true)
+MK_EXPERT_NV16(mk_expert_gate_up_nv16_lut_bf16, true, true)
+#undef MK_EXPERT_NV16
+
 // 8-lane sub-SIMD NVFP4 expert down decode: 2 SIMDs (64 threads) per TG cover all 8 expert slots x 4 columns.
-kernel void mk_expert_down_nv8(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
-                               device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]],
-                               device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]],
-                               uint i [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+template <bool Lut, bool Bf16In>
+inline void mk_expert_down_nv8_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                    device const uchar *amax, device const uchar *denom, constant MKExpert &p,
+                                    uint i, uint tid, threadgroup float4 *dots) {
     const uint columns = p.n / 4u;
     if (i >= columns) return;
     const uint j = i * 4u;
     const uint row = p.row0;
     const uint slot = tid >> 3;
     const uint l8 = tid & 7u;
-    threadgroup float4 dots[8];
     device const float *routes = arena + p.routes + row * p.rs;
     const uint expert = uint(routes[slot]);
     float4 acc = 0.0f;
     if (expert < p.experts) {
         const ulong base = (ulong(expert) * p.n + j) * p.k;
-        device const float4 *xp = (device const float4 *)(arena + p.x + row * p.xs + slot * p.k);
+        device const float4 *xp = Bf16In ? nullptr : (device const float4 *)(arena + p.x + row * p.xs + slot * p.k);
+        device const bfloat4 *xp16 = Bf16In ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + row * p.xs) + (slot * p.k) / 4u) : nullptr;
         device const uint2 *wp = (device const uint2 *)(w + p.w + base / 2u);
         device const uchar *sp = s + p.s + base / 16u;
         const uint wstep = p.k / 16u;
         const uint sstep = p.k / 16u;
         for (uint k4 = l8 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD8_LANES * 4u) {
-            const float4 x0 = xp[k4];
-            const float4 x1 = xp[k4 + 1u];
-            const float4 x2 = xp[k4 + 2u];
-            const float4 x3 = xp[k4 + 3u];
+            const float4 x0 = Bf16In ? float4(xp16[k4]) : xp[k4];
+            const float4 x1 = Bf16In ? float4(xp16[k4 + 1u]) : xp[k4 + 1u];
+            const float4 x2 = Bf16In ? float4(xp16[k4 + 2u]) : xp[k4 + 2u];
+            const float4 x3 = Bf16In ? float4(xp16[k4 + 3u]) : xp[k4 + 3u];
             const uint b = k4 / 4u;
             #pragma unroll
             for (uint c = 0u; c < 4u; ++c) {
-                const float sc = mk_expert_e4m3(sp[b + c * sstep]);
-                const float d = mk_nvfp4_dot16(wp[b + c * wstep], x0, x1, x2, x3);
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                const float d = mk_nvfp4_dot16<Lut>(wp[b + c * wstep], x0, x1, x2, x3);
                 acc[c] = fma(d, sc, acc[c]);
             }
         }
@@ -708,11 +877,24 @@ kernel void mk_expert_down_nv8(device float *arena [[buffer(0)]], device const u
     }
 }
 
+#define MK_EXPERT_NV8(NAME, LUT, BF16) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]], \
+                     uint i [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+        threadgroup float4 dots[8]; \
+        mk_expert_down_nv8_impl<LUT, BF16>(arena, w, s, amax, denom, p, i, tid, dots); \
+    }
+MK_EXPERT_NV8(mk_expert_down_nv8, false, false)
+MK_EXPERT_NV8(mk_expert_down_nv8_lut, true, false)
+MK_EXPERT_NV8(mk_expert_down_nv8_bf16, false, true)
+MK_EXPERT_NV8(mk_expert_down_nv8_lut_bf16, true, true)
+#undef MK_EXPERT_NV8
+
 // Vectorized 8-byte MXFP8 gate+up (k % 256 == 0, w % 8 == 0).
-kernel void mk_expert_gate_up_mx_vec(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
-                                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]],
-                                     device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]],
-                                     uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+template <bool Lut, bool Bf16Out>
+inline void mk_expert_gate_up_mx_vec_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                          constant MKExpert &p, uint gid, uint lane) {
     const uint simd_id = gid / 32u;
     const uint columns = p.n / 2u;
     const uint slot = simd_id / columns, j = (simd_id % columns) * 2u;
@@ -736,7 +918,7 @@ kernel void mk_expert_gate_up_mx_vec(device float *arena [[buffer(0)]], device c
                 const uint e = sp[sb + c * sstep];
                 const float scale = as_type<float>(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23);
                 const uint2 packed = wp[k8 + c * wstep];
-                const float part = mk_e4m3x4_dot(packed.x, x0) + mk_e4m3x4_dot(packed.y, x1);
+                const float part = mk_e4m3x4_dot<Lut>(packed.x, x0) + mk_e4m3x4_dot<Lut>(packed.y, x1);
                 acc[c] = fma(part, scale, acc[c]);
             }
         }
@@ -744,45 +926,59 @@ kernel void mk_expert_gate_up_mx_vec(device float *arena [[buffer(0)]], device c
     }
     if (lane == 0u) {
         device float *out = arena + p.y + row * p.ys + slot * p.n + j;
+        device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + row * p.ys) + slot * p.n + j;
         for (uint c = 0u; c < 2u; ++c) {
             float gate = acc[c * 2u], up = acc[c * 2u + 1u];
             if (p.round_bf16) { gate = mk_bf16(gate); up = mk_bf16(up); }
             const float value = ((tanh(gate / p.gate_cap) * p.gate_cap) * mk_sigmoid(gate)) * (tanh(up / p.up_cap) * p.up_cap);
-            out[c] = p.round_bf16 ? mk_bf16(value) : value;
+            if constexpr (Bf16Out) out16[c] = bfloat(p.round_bf16 ? mk_bf16(value) : value);
+            else out[c] = p.round_bf16 ? mk_bf16(value) : value;
         }
     }
 }
 
+#define MK_EXPERT_MX_UP(NAME, LUT, BF16) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]], \
+                     uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+        (void)amax; (void)denom; \
+        mk_expert_gate_up_mx_vec_impl<LUT, BF16>(arena, w, s, p, gid, lane); \
+    }
+MK_EXPERT_MX_UP(mk_expert_gate_up_mx_vec, false, false)
+MK_EXPERT_MX_UP(mk_expert_gate_up_mx_lut, true, false)
+MK_EXPERT_MX_UP(mk_expert_gate_up_mx_bf16, false, true)
+MK_EXPERT_MX_UP(mk_expert_gate_up_mx_lut_bf16, true, true)
+#undef MK_EXPERT_MX_UP
+
 // Vectorized 4-byte MXFP8 down (k % 128 == 0, w % 4 == 0).
-kernel void mk_expert_down_mx_vec(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
-                                  device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]],
-                                  device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]],
-                                  uint i [[threadgroup_position_in_grid]], uint slot [[simdgroup_index_in_threadgroup]],
-                                  uint lane [[thread_index_in_simdgroup]]) {
+template <bool Lut, bool Bf16In>
+inline void mk_expert_down_mx_vec_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                       constant MKExpert &p, uint i, uint slot, uint lane, threadgroup float4 *dots) {
     const uint columns = p.n / 4u;
     if (i >= columns) return;
     const uint j = i * 4u;
     const uint row = p.row0;
-    threadgroup float4 dots[8];
     if (slot < p.top_k) {
         device const float *routes = arena + p.routes + row * p.rs;
         const uint expert = uint(routes[slot]);
         float4 acc = 0.0f;
         if (expert < p.experts) {
             const ulong base = (ulong(expert) * p.n + j) * p.k;
-            device const float4 *xp = (device const float4 *)(arena + p.x + row * p.xs + slot * p.k);
+            device const float4 *xp = Bf16In ? nullptr : (device const float4 *)(arena + p.x + row * p.xs + slot * p.k);
+            device const bfloat4 *xp16 = Bf16In ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + row * p.xs) + (slot * p.k) / 4u) : nullptr;
             device const uint *wp = (device const uint *)(w + p.w + base);
             device const uchar *sp = s + p.s + base / 32u;
             const uint wstep = p.k / 4u;
             const uint sstep = p.k / 32u;
             for (uint k4 = lane; k4 < p.k / 4u; k4 += 32u) {
-                const float4 xv = xp[k4];
+                const float4 xv = Bf16In ? float4(xp16[k4]) : xp[k4];
                 const uint sb = k4 / 8u;
                 #pragma unroll
                 for (uint c = 0u; c < 4u; ++c) {
                     const uint e = sp[sb + c * sstep];
                     const float scale = as_type<float>(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23);
-                    const float part = mk_e4m3x4_dot(wp[k4 + c * wstep], xv);
+                    const float part = mk_e4m3x4_dot<Lut>(wp[k4 + c * wstep], xv);
                     acc[c] = fma(part, scale, acc[c]);
                 }
             }
@@ -801,14 +997,215 @@ kernel void mk_expert_down_mx_vec(device float *arena [[buffer(0)]], device cons
     }
 }
 
+#define MK_EXPERT_MX_DOWN(NAME, LUT, BF16) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], constant MKExpert &p [[buffer(8)]], \
+                     uint i [[threadgroup_position_in_grid]], uint slot [[simdgroup_index_in_threadgroup]], \
+                     uint lane [[thread_index_in_simdgroup]]) { \
+        (void)amax; (void)denom; \
+        threadgroup float4 dots[8]; \
+        mk_expert_down_mx_vec_impl<LUT, BF16>(arena, w, s, p, i, slot, lane, dots); \
+    }
+MK_EXPERT_MX_DOWN(mk_expert_down_mx_vec, false, false)
+MK_EXPERT_MX_DOWN(mk_expert_down_mx_lut, true, false)
+MK_EXPERT_MX_DOWN(mk_expert_down_mx_bf16, false, true)
+MK_EXPERT_MX_DOWN(mk_expert_down_mx_lut_bf16, true, true)
+#undef MK_EXPERT_MX_DOWN
+
+// ---- Qwegn Wave 2 kernels: fused sliding/dynamic QKVR prep + KV f32/u16 store ----
+inline float4 mk_bf16_vec4(float4 v) {
+    return float4(mk_bf16(v.x), mk_bf16(v.y), mk_bf16(v.z), mk_bf16(v.w));
+}
+
+template <bool Sconv>
+inline void mk_inkling_qkvr_prep_impl(device float *arena, device float *k_ring, device float *v_ring,
+                                      device float *keys_f32, device ushort *keys_u16,
+                                      device float *vals_f32, device ushort *vals_u16,
+                                      device const uchar *wq_scale, device const uchar *wr_scale,
+                                      device const uchar *wk_w, device const uchar *wv_w,
+                                      constant MKX &x, uint gid, uint lane) {
+    constant MK &p = x.p;
+    const uint units = 2u * p.heads + 2u * p.kv_heads;
+    const uint simd_id = gid / 32u;
+    const uint r = simd_id / units;
+    if (r >= p.rows) return;
+    const uint u = simd_id % units;
+    const uint row = p.row0 + r;
+    const uint position = p.pos + row;
+
+    if (u < p.heads) {
+        const uint h = u;
+        const device float *qp_in = arena + p.x + row * p.xs + h * 128u + lane;
+        device float *qp_out = arena + p.x + row * p.xs + h * 128u + lane;
+        const ulong s_base = ulong(h) * 128u + lane;
+        float val[4];
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            val[j] = qp_in[j * 32u] * mk_load(wq_scale, x.mat[0].w, x.mat[0].sdtype, s_base + j * 32u);
+        }
+        const float total = (simd_sum(val[0] * val[0]) + simd_sum(val[1] * val[1])) +
+                            (simd_sum(val[2] * val[2]) + simd_sum(val[3] * val[3]));
+        const float factor = min(as_type<float>(x.mat[0].m) / (sqrt(total) + 1e-6f), 1.0f);
+        const float lscale = Sconv ? 1.0f : (1.0f + p.scale * metal::precise::log(max(float(position + 1u) / float(p.m), 1.0f)));
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            float res = mk_bf16(val[j] * factor);
+            if constexpr (!Sconv) res = mk_bf16(res * lscale);
+            qp_out[j * 32u] = res;
+        }
+        return;
+    }
+
+    if (u < p.heads + p.kv_heads) {
+        const uint kvh = u - p.heads;
+        const uint kv_width = p.kv_heads * 128u;
+        const uint kv_base = kvh * 128u + lane;
+        float val[4];
+        if constexpr (Sconv) {
+            const uint ring_cap = x.mat[2].m;
+            const device float *in_base = arena + x.mat[2].y;
+            const uint slot = position % ring_cap;
+            const uint dtype = x.mat[2].sdtype;
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint c = kv_base + j * 32u;
+                const float xcur = in_base[row * x.mat[2].ys + c];
+                k_ring[ulong(slot) * kv_width + c] = xcur;
+                float acc = 0.0f;
+                for (uint k = 0u; k < p.taps; ++k) {
+                    const uint back = p.taps - 1u - k;
+                    float tap = 0.0f;
+                    if (back == 0u) {
+                        tap = xcur;
+                    } else if (back <= r) {
+                        tap = in_base[(row - back) * x.mat[2].ys + c];
+                    } else if (back <= position) {
+                        tap = k_ring[ulong(inkling_ring_back(slot, back, ring_cap)) * kv_width + c];
+                    }
+                    if (dtype == 1u) tap = float(half(tap));
+                    else if (dtype == 2u) tap = mk_bf16(tap);
+                    acc += mk_load(wk_w, x.mat[2].w, dtype, ulong(c) * p.taps + k) * tap;
+                }
+                if (dtype == 1u) acc = float(half(acc));
+                else if (dtype == 2u) acc = mk_bf16(acc);
+                val[j] = mk_bf16((acc + xcur) * p.scale);
+            }
+        } else {
+            const device float *ck_in = arena + x.mat[2].y + row * x.mat[2].ys + kv_base;
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) val[j] = ck_in[j * 32u];
+        }
+        const float total = (simd_sum(val[0] * val[0]) + simd_sum(val[1] * val[1])) +
+                            (simd_sum(val[2] * val[2]) + simd_sum(val[3] * val[3]));
+        const float factor = min(as_type<float>(x.mat[1].pad) / (sqrt(total) + 1e-6f), 1.0f);
+        const uint kv_slot = position % p.every;
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const float res = mk_bf16(val[j] * factor);
+            const ulong dst_idx = ulong(kv_slot) * kv_width + kv_base + j * 32u;
+            keys_f32[dst_idx] = res;
+            const ushort h = ushort(as_type<uint>(res) >> 16u);
+            keys_u16[dst_idx] = h;
+            if (kv_slot < 16u) keys_u16[ulong(p.every + kv_slot) * kv_width + kv_base + j * 32u] = h;
+        }
+        return;
+    }
+
+    if (u < p.heads + 2u * p.kv_heads) {
+        const uint kvh = u - (p.heads + p.kv_heads);
+        const uint kv_width = p.kv_heads * 128u;
+        const uint kv_elem_off = kvh * 128u + lane * 4u;
+        float4 val;
+        if constexpr (Sconv) {
+            const uint ring_cap = x.mat[3].m;
+            const device float *in_base = arena + x.mat[3].y;
+            const float4 xcur = *reinterpret_cast<const device float4 *>(in_base + row * x.mat[3].ys + kv_elem_off);
+            *reinterpret_cast<device float4 *>(v_ring + ulong(position % ring_cap) * kv_width + kv_elem_off) = xcur;
+            const uint slot = position % ring_cap;
+            const uint dtype = x.mat[3].sdtype;
+            float4 acc = float4(0.0f);
+            for (uint k = 0u; k < p.taps; ++k) {
+                const uint back = p.taps - 1u - k;
+                float4 tap = float4(0.0f);
+                if (back == 0u) {
+                    tap = xcur;
+                } else if (back <= r) {
+                    tap = *reinterpret_cast<const device float4 *>(in_base + (row - back) * x.mat[3].ys + kv_elem_off);
+                } else if (back <= position) {
+                    tap = *reinterpret_cast<const device float4 *>(v_ring + ulong(inkling_ring_back(slot, back, ring_cap)) * kv_width + kv_elem_off);
+                }
+                if (dtype == 1u) tap = float4(half4(tap));
+                else if (dtype == 2u) tap = mk_bf16_vec4(tap);
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    acc[j] += mk_load(wv_w, x.mat[3].w, dtype, ulong(kv_elem_off + j) * p.taps + k) * tap[j];
+                }
+            }
+            if (dtype == 1u) acc = float4(half4(acc));
+            else if (dtype == 2u) acc = mk_bf16_vec4(acc);
+            val = mk_bf16_vec4((acc + xcur) * p.scale);
+        } else {
+            val = *reinterpret_cast<const device float4 *>(arena + x.mat[3].y + row * x.mat[3].ys + kv_elem_off);
+        }
+        const float tot = simd_sum(dot(val, val));
+        const float inv = metal::precise::rsqrt(tot / 128.0f + p.eps);
+        val = mk_bf16_vec4(val * inv);
+        const uint kv_slot = position % p.pad_k;
+        const ulong dst_idx = ulong(kv_slot) * kv_width + kv_elem_off;
+        *reinterpret_cast<device float4 *>(vals_f32 + dst_idx) = val;
+        const ushort4 h4 = ushort4(as_type<uint4>(val) >> 16u);
+        *reinterpret_cast<device ushort4 *>(vals_u16 + dst_idx) = h4;
+        if (kv_slot < 16u) *reinterpret_cast<device ushort4 *>(vals_u16 + ulong(p.pad_k + kv_slot) * kv_width + kv_elem_off) = h4;
+        return;
+    }
+
+    const uint h = u - (p.heads + 2u * p.kv_heads);
+    const uint r_base = p.y + row * p.ys + h * 16u;
+    const bool active = lane < 16u;
+    float val = active ? arena[r_base + lane] * mk_load(wr_scale, x.mat[1].w, x.mat[1].sdtype, ulong(h) * 16u + lane) : 0.0f;
+    const float total = simd_sum(active ? val * val : 0.0f);
+    if (active) {
+        const float factor = min(as_type<float>(x.mat[1].m) / (sqrt(total) + 1e-6f), 1.0f);
+        val = mk_bf16(val * factor);
+        if constexpr (!Sconv) {
+            const float lscale = 1.0f + p.scale * metal::precise::log(max(float(position + 1u) / float(p.m), 1.0f));
+            val = mk_bf16(val * lscale);
+        }
+        arena[r_base + lane] = val;
+    }
+}
+
+kernel void mk_inkling_qkvr_sconv_fused(device float *arena [[buffer(0)]], device float *k_ring [[buffer(1)]],
+                                        device float *v_ring [[buffer(2)]], device float *keys_f32 [[buffer(3)]],
+                                        device ushort *keys_u16 [[buffer(4)]], device float *vals_f32 [[buffer(5)]],
+                                        device ushort *vals_u16 [[buffer(6)]], device const uchar *weights [[buffer(7)]],
+                                        constant MKX &x [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                        uint lane [[thread_index_in_simdgroup]]) {
+    mk_inkling_qkvr_prep_impl<true>(arena, k_ring, v_ring, keys_f32, keys_u16, vals_f32, vals_u16,
+                                    weights, weights, weights, weights, x, gid, lane);
+}
+
+kernel void mk_inkling_qkvr_dyn_prep_fused(device float *arena [[buffer(0)]], device float *keys_f32 [[buffer(1)]],
+                                           device ushort *keys_u16 [[buffer(2)]], device float *vals_f32 [[buffer(3)]],
+                                           device ushort *vals_u16 [[buffer(4)]], device const uchar *wq_scale [[buffer(5)]],
+                                           device const uchar *wr_scale [[buffer(6)]], constant MKX &x [[buffer(8)]],
+                                           uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    mk_inkling_qkvr_prep_impl<false>(arena, nullptr, nullptr, keys_f32, keys_u16, vals_f32, vals_u16,
+                                     wq_scale, wr_scale, nullptr, nullptr, x, gid, lane);
+}
+
 // ---- Step 3E kernels: fast single-pass log2 striped decode attention + gated merge ----
 // Single-pass online softmax per SIMD in registers (~8.3 KB TG reduction instead of 30.9 KB);
 // maxima stored in parts[*][128] are in log2 units and pair with mk_relative_long_merge_fast / _gated.
-kernel void mk_relative_long_keys_fast(device const float *arena [[buffer(0)]], device const ushort *key [[buffer(1)]],
-                                       device const ushort *val [[buffer(2)]], device float *parts [[buffer(3)]],
-                                       constant MK &p [[buffer(8)]], uint lane [[thread_index_in_simdgroup]],
-                                       uint simd [[simdgroup_index_in_threadgroup]], uint simds [[simdgroups_per_threadgroup]],
-                                       uint g [[threadgroup_position_in_grid]]) {
+#define MK_LONG_FAST_SIMDS 8u
+template <bool InlineBias>
+inline void mk_relative_long_keys_fast_impl(device const float *arena, device const ushort *key,
+                                            device const ushort *val, device float *parts,
+                                            device const uchar *rel_w_bytes, constant MK &p,
+                                            uint lane, uint simd, uint simds, uint g,
+                                            threadgroup float4 *red_acc, threadgroup float *red_m,
+                                            threadgroup float *red_d) {
     const uint kvh = g / p.taps, part = g % p.taps;
     const uint row = p.row0, pos = p.pos + row;
     const uint visible = p.window ? min(p.window, pos + 1u) : pos + 1u;
@@ -826,10 +1223,22 @@ kernel void mk_relative_long_keys_fast(device const float *arena [[buffer(0)]], 
         q[h] = float4(*(device const packed_float4 *)(arena + p.x + row * p.xs + (h0 + h) * 128u + lane * 4u)) * qscale;
     }
 
+    const bool stripe_has_rel = (n > 0u) && ((pos - (start + n - 1u)) < p.m);
+    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f;
+    const device ushort *rel_w = InlineBias ? reinterpret_cast<const device ushort *>(rel_w_bytes + p.w) : nullptr;
+    if constexpr (InlineBias) {
+        if (stripe_has_rel && lane < 16u) {
+            const device float *rp = arena + p.z + row * p.zs;
+            r0 = rp[(h0 + 0u) * 16u + lane];
+            r1 = rp[(h0 + 1u) * 16u + lane];
+            r2 = rp[(h0 + 2u) * 16u + lane];
+        }
+    }
+
     float m[3] = { -INFINITY, -INFINITY, -INFINITY };
     float d[3] = { 0.0f, 0.0f, 0.0f };
     float4 acc[3] = { float4(0.0f), float4(0.0f), float4(0.0f) };
-    device const float *bias_base = arena + p.z + row * p.zs + h0 * p.m;
+    device const float *bias_base = InlineBias ? nullptr : (arena + p.z + row * p.zs + h0 * p.m);
     const uint k_off = kvh * 128u + lane * 4u;
     if (simd < n) {
         const bool linear_slot = (p.window == 0u);
@@ -847,10 +1256,20 @@ kernel void mk_relative_long_keys_fast(device const float *arena [[buffer(0)]], 
             const float s2 = simd_sum(dot(q[2], k));
             const uint distance = pos - t;
             float sc[3];
-            if (distance < p.m) {
-                sc[0] = s0 + bias_base[distance] * M_LOG2E_F;
-                sc[1] = s1 + bias_base[p.m + distance] * M_LOG2E_F;
-                sc[2] = s2 + bias_base[2u * p.m + distance] * M_LOG2E_F;
+            if (stripe_has_rel && distance < p.m) {
+                if constexpr (InlineBias) {
+                    const float wk = (lane < 16u) ? as_type<float>(uint(rel_w[ulong(lane) * p.m + distance]) << 16u) : 0.0f;
+                    const float b0 = mk_bf16(simd_sum(r0 * wk));
+                    const float b1 = mk_bf16(simd_sum(r1 * wk));
+                    const float b2 = mk_bf16(simd_sum(r2 * wk));
+                    sc[0] = s0 + b0 * M_LOG2E_F;
+                    sc[1] = s1 + b1 * M_LOG2E_F;
+                    sc[2] = s2 + b2 * M_LOG2E_F;
+                } else {
+                    sc[0] = s0 + bias_base[distance] * M_LOG2E_F;
+                    sc[1] = s1 + bias_base[p.m + distance] * M_LOG2E_F;
+                    sc[2] = s2 + bias_base[2u * p.m + distance] * M_LOG2E_F;
+                }
             } else {
                 sc[0] = s0;
                 sc[1] = s1;
@@ -874,11 +1293,6 @@ kernel void mk_relative_long_keys_fast(device const float *arena [[buffer(0)]], 
         }
     }
 
-    // 8-SIMD max reduces TG memory from 24.6 KB to 12.3 KB for higher core occupancy.
-    #define MK_LONG_FAST_SIMDS 8u
-    threadgroup float4 red_acc[MK_LONG_FAST_SIMDS * 3u * 32u];
-    threadgroup float red_m[MK_LONG_FAST_SIMDS * 3u];
-    threadgroup float red_d[MK_LONG_FAST_SIMDS * 3u];
     #pragma unroll
     for (uint h = 0u; h < 3u; ++h) {
         red_acc[(h * MK_LONG_FAST_SIMDS + simd) * 32u + lane] = acc[h];
@@ -908,8 +1322,30 @@ kernel void mk_relative_long_keys_fast(device const float *arena [[buffer(0)]], 
             dst[129] = gd;
         }
     }
-    #undef MK_LONG_FAST_SIMDS
 }
+
+kernel void mk_relative_long_keys_fast(device const float *arena [[buffer(0)]], device const ushort *key [[buffer(1)]],
+                                       device const ushort *val [[buffer(2)]], device float *parts [[buffer(3)]],
+                                       constant MK &p [[buffer(8)]], uint lane [[thread_index_in_simdgroup]],
+                                       uint simd [[simdgroup_index_in_threadgroup]], uint simds [[simdgroups_per_threadgroup]],
+                                       uint g [[threadgroup_position_in_grid]]) {
+    threadgroup float4 red_acc[MK_LONG_FAST_SIMDS * 3u * 32u];
+    threadgroup float red_m[MK_LONG_FAST_SIMDS * 3u];
+    threadgroup float red_d[MK_LONG_FAST_SIMDS * 3u];
+    mk_relative_long_keys_fast_impl<false>(arena, key, val, parts, nullptr, p, lane, simd, simds, g, red_acc, red_m, red_d);
+}
+
+kernel void mk_relative_long_keys_inline_fast(device const float *arena [[buffer(0)]], device const ushort *key [[buffer(1)]],
+                                              device const ushort *val [[buffer(2)]], device float *parts [[buffer(3)]],
+                                              device const uchar *rel_w [[buffer(4)]], constant MK &p [[buffer(8)]],
+                                              uint lane [[thread_index_in_simdgroup]], uint simd [[simdgroup_index_in_threadgroup]],
+                                              uint simds [[simdgroups_per_threadgroup]], uint g [[threadgroup_position_in_grid]]) {
+    threadgroup float4 red_acc[MK_LONG_FAST_SIMDS * 3u * 32u];
+    threadgroup float red_m[MK_LONG_FAST_SIMDS * 3u];
+    threadgroup float red_d[MK_LONG_FAST_SIMDS * 3u];
+    mk_relative_long_keys_fast_impl<true>(arena, key, val, parts, rel_w, p, lane, simd, simds, g, red_acc, red_m, red_d);
+}
+#undef MK_LONG_FAST_SIMDS
 
 template <bool Gated>
 inline void mk_relative_long_merge_impl(device float *arena, device const float *parts, constant MK &p,
@@ -967,7 +1403,7 @@ kernel void mk_relative_long_merge_gated(device float *arena [[buffer(0)]], devi
 }
 
 // Shared N=64 expert block output/activation writer.
-template <bool Down>
+template <bool Down, bool Bf16Io>
 inline void mk_expert_block_store(device float *arena, device float *partial, constant MKExpert &p,
                                   uint r, uint c, float lo, float hi) {
     if (p.round_bf16) {
@@ -975,12 +1411,129 @@ inline void mk_expert_block_store(device float *arena, device float *partial, co
         hi = mk_bf16(hi);
     }
     if constexpr (Down) {
-        partial[ulong(r) * p.n + c] = lo;
-        partial[ulong(r) * p.n + c + 1u] = hi;
+        if constexpr (Bf16Io) {
+            device bfloat *out16 = reinterpret_cast<device bfloat *>(partial) + ulong(r) * p.n + c;
+            out16[0] = bfloat(lo);
+            out16[1] = bfloat(hi);
+        } else {
+            partial[ulong(r) * p.n + c] = lo;
+            partial[ulong(r) * p.n + c + 1u] = hi;
+        }
     } else {
         const float out = (tanh(lo / p.gate_cap) * p.gate_cap * mk_sigmoid(lo)) * (tanh(hi / p.up_cap) * p.up_cap);
-        arena[p.y + (p.row0 + r / p.top_k) * p.ys + (r % p.top_k) * p.n + c / 2u] = p.round_bf16 ? mk_bf16(out) : out;
+        const float val = p.round_bf16 ? mk_bf16(out) : out;
+        if constexpr (Bf16Io) {
+            device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + (p.row0 + r / p.top_k) * p.ys) + (r % p.top_k) * p.n + c / 2u;
+            out16[0] = bfloat(val);
+        } else {
+            arena[p.y + (p.row0 + r / p.top_k) * p.ys + (r % p.top_k) * p.n + c / 2u] = val;
+        }
     }
+}
+
+// Single-TG compact MoE tile builder (expert_off[E+1], tile_count[1], sorted_routes[total], tile_e[max_tiles], tile_r[max_tiles]).
+kernel void mk_expert_group_tiles(device const float *arena [[buffer(0)]], device uint *lists [[buffer(1)]],
+                                  constant MKExpert &p [[buffer(8)]], uint tid [[thread_index_in_threadgroup]],
+                                  uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    const uint E = p.experts;
+    const uint total = p.rows * p.top_k;
+    const uint max_tiles = inkling_moe_max_tiles(E, total);
+    device uint *expert_off = lists;
+    device uint *tile_count_ptr = lists + E + 1u;
+    device uint *sorted_routes = lists + E + 2u;
+    device uint *tile_e = sorted_routes + total;
+    device uint *tile_r = tile_e + max_tiles;
+
+    threadgroup atomic_uint tg_count[512];
+    threadgroup uint tg_off[513];
+    threadgroup uint tg_tile_base[513];
+    for (uint e = tid; e < E; e += 256u) atomic_store_explicit(&tg_count[e], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < total; i += 256u) {
+        const uint row = p.row0 + i / p.top_k;
+        const uint slot = i % p.top_k;
+        const uint e = uint(arena[p.routes + row * p.rs + slot]);
+        if (e < E) atomic_fetch_add_explicit(&tg_count[e], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd == 0u) {
+        const uint chunk = (E + 31u) / 32u;
+        const uint s_e = lane * chunk;
+        const uint e_e = min(E, s_e + chunk);
+        uint my_cnt = 0u, my_tiles = 0u;
+        for (uint e = s_e; e < e_e; ++e) {
+            const uint c = atomic_load_explicit(&tg_count[e], memory_order_relaxed);
+            my_cnt += c;
+            if (c > 0u) my_tiles += (c >> 6u) + ((c & 63u) != 0u ? 1u : 0u);
+        }
+        const uint base_cnt = simd_prefix_exclusive_sum(my_cnt);
+        const uint base_tile = simd_prefix_exclusive_sum(my_tiles);
+        uint cur_c = base_cnt, cur_t = base_tile;
+        for (uint e = s_e; e < e_e; ++e) {
+            tg_off[e] = cur_c;
+            tg_tile_base[e] = cur_t;
+            const uint c = atomic_load_explicit(&tg_count[e], memory_order_relaxed);
+            cur_c += c;
+            if (c > 0u) cur_t += (c >> 6u) + ((c & 63u) != 0u ? 1u : 0u);
+        }
+        if (lane == 31u) {
+            tg_off[E] = cur_c;
+            tg_tile_base[E] = cur_t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tid; e <= E; e += 256u) expert_off[e] = tg_off[e];
+    for (uint e = tid; e < E; e += 256u) {
+        atomic_store_explicit(&tg_count[e], tg_off[e], memory_order_relaxed);
+        const uint c = tg_off[e + 1u] - tg_off[e];
+        if (c > 0u) {
+            const uint t0 = tg_tile_base[e];
+            const uint q = c >> 6u, rem = c & 63u;
+            for (uint t = 0u; t < q; ++t) {
+                tile_e[t0 + t] = e;
+                tile_r[t0 + t] = inkling_moe_pack_tile_r(t, 64u);
+            }
+            if (rem > 0u) {
+                const uint tbm = uint(inkling_moe_tile_block(int(rem)));
+                tile_e[t0 + q] = e;
+                tile_r[t0 + q] = inkling_moe_pack_tile_r((q * 64u) / tbm, tbm);
+            }
+        }
+    }
+    if (tid == 0u) *tile_count_ptr = tg_tile_base[E];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < total; i += 256u) {
+        const uint row = p.row0 + i / p.top_k;
+        const uint slot = i % p.top_k;
+        const uint e = uint(arena[p.routes + row * p.rs + slot]);
+        if (e < E) {
+            const uint at = atomic_fetch_add_explicit(&tg_count[e], 1u, memory_order_relaxed);
+            sorted_routes[at] = i;
+        }
+    }
+}
+
+kernel void mk_expert_combine_mm_bf16(device float *arena [[buffer(0)]], device const bfloat *partial [[buffer(1)]],
+                                      constant MKExpert &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    const uint cols4 = p.n / 4u;
+    const uint r = i / cols4, j4 = i % cols4;
+    if (r >= p.rows) return;
+    device const float *routes = arena + p.routes + (p.row0 + r) * p.rs;
+    device const bfloat4 *bp = reinterpret_cast<const device bfloat4 *>(partial);
+    float4 sum = 0.0f;
+    for (uint s = 0u; s < p.top_k; ++s) {
+        if (uint(routes[s]) < p.experts) {
+            const float rw = routes[p.top_k + s];
+            const ulong idx4 = (ulong(r) * p.top_k + s) * cols4 + j4;
+            sum += float4(bp[idx4]) * rw;
+        }
+    }
+    device float4 *dst = reinterpret_cast<device float4 *>(arena + p.y + (p.row0 + r) * p.ys);
+    dst[j4] = p.round_bf16 ? float4(mk_bf16(sum.x), mk_bf16(sum.y), mk_bf16(sum.z), mk_bf16(sum.w)) : sum;
 }
 
 // ---- Step 2 prefill kernel: half fragments, non-transposed staging + Lean far-band split ----
@@ -1235,19 +1788,17 @@ kernel void mk_pack_rows_bf16(device const float *arena [[buffer(0)]], device bf
     reinterpret_cast<device bfloat4 *>(dst)[gid] = bfloat4(v);
 }
 
-template <bool Down, bool Nv, uint M, bool X16>
-inline void mk_expert_block_m64n64(device float *arena, device const uchar *w, device const uchar *s,
-                                    device const uchar *amax, device const uchar *denom, device const uint *lists,
-                                    device float *partial, constant MKExpert &p, uint g, uint tid, uint simd, uint lane,
-                                    uint start, uint stop, uint step, threadgroup bfloat *a, threadgroup bfloat *b) {
-    constexpr uint N = INKLING_EXPERT_BLOCK_N64, B = 32u, L = B + 8u, TG = 128u;
+template <bool Down, bool Nv, uint M, bool X16, bool Lut, bool Bf16Io>
+inline void mk_expert_block_m64n64_core(device float *arena, device const uchar *w, device const uchar *s,
+                                          device const uchar *amax, device const uchar *denom, device const uint *entries,
+                                          uint count, device float *partial, constant MKExpert &p, uint expert, uint c0,
+                                          uint tid, uint simd, uint lane, uint start, uint stop, uint step,
+                                          threadgroup bfloat *a, threadgroup bfloat *b,
+                                          threadgroup const half *tg8, threadgroup const half2 *tg4) {
+    constexpr uint B = 32u, L = B + 8u, TG = 128u;
     constexpr uint ALoads = (M * (B / 4u) + TG - 1u) / TG;
     constexpr uint RM = M >= 16u ? M / 16u : 1u;
     const uint n = Down ? p.n : 2u * p.n;
-    const uint expert = g / (n / N), c0 = (g % (n / N)) * N;
-    device const uint *list = lists + expert * (p.rows * p.top_k + 1u);
-    const uint count = list[0];
-    if (count == 0u) return;
     const float outer = Nv ? mk_load(amax, p.amax, 0, expert) / mk_load(denom, p.denominator, 0, 0) : 1.0f;
     const uint sr = simd / 2u, sc = simd % 2u;
     const uint row_base = M >= 16u ? sr * (M / 2u) : 0u;
@@ -1262,9 +1813,13 @@ inline void mk_expert_block_m64n64(device float *arena, device const uchar *w, d
         for (uint i = 0u; i < ALoads; ++i) {
             const uint id = tid + i * TG, xr = t0 + id / (B / 4u), xk = (id % (B / 4u)) * 4u;
             active[i] = (id < M * (B / 4u)) && (xr < count);
-            const uint route = active[i] ? list[xr + 1u] : 0u;
+            const uint route = active[i] ? entries[xr] : 0u;
             if constexpr (X16) {
-                xs16[i] = x16_base + ulong(route / p.top_k) * p.k + xk;
+                if constexpr (Down) {
+                    xs16[i] = reinterpret_cast<device const bfloat *>(arena + p.x + (p.row0 + route / p.top_k) * p.xs) + (route % p.top_k) * p.k + xk;
+                } else {
+                    xs16[i] = x16_base + ulong(route / p.top_k) * p.k + xk;
+                }
                 xs[i] = nullptr;
             } else {
                 xs[i] = arena + p.x + (p.row0 + route / p.top_k) * p.xs + (Down ? (route % p.top_k) * p.k : 0u) + xk;
@@ -1298,20 +1853,35 @@ inline void mk_expert_block_m64n64(device float *arena, device const uchar *w, d
             threadgroup bfloat4 *dst = reinterpret_cast<threadgroup bfloat4 *>(b + wc * L + wk);
             if constexpr (Nv) {
                 const uint2 raw = uint2(*reinterpret_cast<const device packed_uint2 *>(w + p.w + windex / 2u));
-                const float sc_val = mk_expert_e4m3(s[p.s + windex / 16u]) * outer;
-                dst[0] = bfloat4(inkling_nvfp4_decode4(raw.x) * sc_val);
-                dst[1] = bfloat4(inkling_nvfp4_decode4(raw.x >> 16) * sc_val);
-                dst[2] = bfloat4(inkling_nvfp4_decode4(raw.y) * sc_val);
-                dst[3] = bfloat4(inkling_nvfp4_decode4(raw.y >> 16) * sc_val);
+                const uchar sc_code = s[p.s + windex / 16u];
+                if constexpr (Lut) {
+                    const float sc_val = float(tg8[sc_code]) * outer;
+                    const uchar4 rx0 = as_type<uchar4>(raw.x), rx1 = as_type<uchar4>(raw.y);
+                    dst[0] = bfloat4(float4(half4(tg4[rx0[0]], tg4[rx0[1]])) * sc_val);
+                    dst[1] = bfloat4(float4(half4(tg4[rx0[2]], tg4[rx0[3]])) * sc_val);
+                    dst[2] = bfloat4(float4(half4(tg4[rx1[0]], tg4[rx1[1]])) * sc_val);
+                    dst[3] = bfloat4(float4(half4(tg4[rx1[2]], tg4[rx1[3]])) * sc_val);
+                } else {
+                    const float sc_val = mk_expert_e4m3(sc_code) * outer;
+                    dst[0] = bfloat4(inkling_nvfp4_decode4(raw.x) * sc_val);
+                    dst[1] = bfloat4(inkling_nvfp4_decode4(raw.x >> 16) * sc_val);
+                    dst[2] = bfloat4(inkling_nvfp4_decode4(raw.y) * sc_val);
+                    dst[3] = bfloat4(inkling_nvfp4_decode4(raw.y >> 16) * sc_val);
+                }
             } else {
                 const uint e = s[p.s + windex / 32u];
                 const float factor = as_type<float>(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23);
                 const uint4 q = *reinterpret_cast<const device uint4 *>(w + p.w + windex);
                 #pragma unroll
                 for (uint u = 0u; u < 4u; ++u) {
-                    const uint qu = q[u];
-                    dst[u] = bfloat4(float4(mk_expert_e4m3(uchar(qu)), mk_expert_e4m3(uchar(qu >> 8)),
-                                            mk_expert_e4m3(uchar(qu >> 16)), mk_expert_e4m3(uchar(qu >> 24))) * factor);
+                    if constexpr (Lut) {
+                        const uchar4 qv = as_type<uchar4>(q[u]);
+                        dst[u] = bfloat4(float4(half4(tg8[qv[0]], tg8[qv[1]], tg8[qv[2]], tg8[qv[3]])) * factor);
+                    } else {
+                        const uint qu = q[u];
+                        dst[u] = bfloat4(float4(mk_expert_e4m3(uchar(qu)), mk_expert_e4m3(uchar(qu >> 8)),
+                                                mk_expert_e4m3(uchar(qu >> 16)), mk_expert_e4m3(uchar(qu >> 24))) * factor);
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1338,47 +1908,182 @@ inline void mk_expert_block_m64n64(device float *arena, device const uchar *w, d
             for (uint i = 0u; i < RM; ++i) {
                 const uint t = t0 + row_base + i * 8u + fr;
                 if (t >= count) continue;
-                const uint r = list[t + 1u];
+                const uint r = entries[t];
                 #pragma unroll
                 for (uint j = 0u; j < 4u; ++j) {
-                    mk_expert_block_store<Down>(arena, partial, p, r, col0 + j * 8u, acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                    mk_expert_block_store<Down, Bf16Io>(arena, partial, p, r, col0 + j * 8u, acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
                 }
             }
         }
     }
 }
 
-#define MK_EXPERT_BLOCK_M64N64(NAME, DOWN, NV, X16) \
+#define MK_EXPERT_BLOCK_M64N64_STRIPE(NAME, DOWN, NV, LUT, BF16IO) \
     kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], device const uchar *s [[buffer(2)]], \
                      device const uchar *amax [[buffer(3)]], device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
                      device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], uint g [[threadgroup_position_in_grid]], \
                      uint tid [[thread_index_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
         alignas(8) threadgroup bfloat a[64u * 40u], b[64u * 40u]; \
+        threadgroup half tg8[LUT ? 256u : 1u]; \
+        threadgroup half2 tg4[LUT ? 256u : 1u]; \
         const uint n = DOWN ? p.n : 2u * p.n; \
         const uint cols = n / INKLING_EXPERT_BLOCK_N64, parts = p.rows >= 2048u ? 8u : p.rows >= 256u ? 4u : p.rows >= 64u ? 2u : 1u; \
         const uint expert = g / (cols * parts), part = (g / cols) % parts; \
-        const uint count = lists[expert * (p.rows * p.top_k + 1u)]; \
+        device const uint *list = lists + expert * (p.rows * p.top_k + 1u); \
+        const uint count = list[0]; \
+        if (count == 0u) return; \
+        if constexpr (LUT) { \
+            for (uint i = tid; i < 256u; i += 128u) { \
+                tg8[i] = mk_e4m3_h_lut[i]; \
+                if constexpr (NV) tg4[i] = mk_fp4_pair_h2_lut[i]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        device const uint *entries = list + 1u; \
+        const uint c0 = (g % cols) * INKLING_EXPERT_BLOCK_N64; \
         const uint full = (count / 64u) * 64u, tail = count - full; \
-        g = expert * cols + g % cols; \
+        constexpr bool X16 = (!DOWN) || BF16IO; \
         if (part * 64u < full) { \
-            mk_expert_block_m64n64<DOWN, NV, 64u, X16>(arena, w, s, amax, denom, lists, partial, p, g, tid, simd, lane, part * 64u, full, 64u * parts, a, b); \
+            mk_expert_block_m64n64_core<DOWN, NV, 64u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, part * 64u, full, 64u * parts, a, b, tg8, tg4); \
         } \
         if ((full / 64u) % parts != part) return; \
         if (tail > 32u) { \
-            mk_expert_block_m64n64<DOWN, NV, 64u, X16>(arena, w, s, amax, denom, lists, partial, p, g, tid, simd, lane, full, count, 64u, a, b); \
+            mk_expert_block_m64n64_core<DOWN, NV, 64u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, full, count, 64u, a, b, tg8, tg4); \
         } else if (tail > 16u) { \
-            mk_expert_block_m64n64<DOWN, NV, 32u, X16>(arena, w, s, amax, denom, lists, partial, p, g, tid, simd, lane, full, count, 32u, a, b); \
+            mk_expert_block_m64n64_core<DOWN, NV, 32u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, full, count, 32u, a, b, tg8, tg4); \
         } else if (tail > 8u) { \
-            mk_expert_block_m64n64<DOWN, NV, 16u, X16>(arena, w, s, amax, denom, lists, partial, p, g, tid, simd, lane, full, count, 16u, a, b); \
+            mk_expert_block_m64n64_core<DOWN, NV, 16u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, full, count, 16u, a, b, tg8, tg4); \
         } else if (tail != 0u) { \
-            mk_expert_block_m64n64<DOWN, NV, 8u, X16>(arena, w, s, amax, denom, lists, partial, p, g, tid, simd, lane, full, count, 8u, a, b); \
+            mk_expert_block_m64n64_core<DOWN, NV, 8u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, full, count, 8u, a, b, tg8, tg4); \
         } \
     }
-MK_EXPERT_BLOCK_M64N64(mk_expert_block_up_nv64_m64, false, true, true)
-MK_EXPERT_BLOCK_M64N64(mk_expert_block_down_nv64_m64, true, true, false)
-MK_EXPERT_BLOCK_M64N64(mk_expert_block_up_mx64_m64, false, false, true)
-MK_EXPERT_BLOCK_M64N64(mk_expert_block_down_mx64_m64, true, false, false)
-#undef MK_EXPERT_BLOCK_M64N64
+
+#define MK_EXPERT_BLOCK_M64N64_CT(NAME, DOWN, NV, LUT, BF16IO) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], device const uchar *s [[buffer(2)]], \
+                     device const uchar *amax [[buffer(3)]], device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
+                     device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], uint g [[threadgroup_position_in_grid]], \
+                     uint tid [[thread_index_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+        const uint n = DOWN ? p.n : 2u * p.n; \
+        const uint cols = n / INKLING_EXPERT_BLOCK_N64; \
+        const uint tile_idx = g / cols; \
+        const uint tile_count = lists[p.experts + 1u]; \
+        if (tile_idx >= tile_count) return; \
+        alignas(8) threadgroup bfloat a[64u * 40u], b[64u * 40u]; \
+        threadgroup half tg8[LUT ? 256u : 1u]; \
+        threadgroup half2 tg4[LUT ? 256u : 1u]; \
+        if constexpr (LUT) { \
+            for (uint i = tid; i < 256u; i += 128u) { \
+                tg8[i] = mk_e4m3_h_lut[i]; \
+                if constexpr (NV) tg4[i] = mk_fp4_pair_h2_lut[i]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        const uint total = p.rows * p.top_k; \
+        const uint max_tiles = inkling_moe_max_tiles(p.experts, total); \
+        device const uint *expert_off = lists; \
+        device const uint *sorted_routes = lists + p.experts + 2u; \
+        device const uint *tile_e = sorted_routes + total; \
+        device const uint *tile_r = tile_e + max_tiles; \
+        const uint expert = tile_e[tile_idx]; \
+        const uint packed_r = tile_r[tile_idx]; \
+        const uint off = expert_off[expert]; \
+        const uint count = expert_off[expert + 1u] - off; \
+        const uint bm = uint(inkling_moe_unpack_bm(packed_r)); \
+        const uint t0 = inkling_moe_unpack_tid_y(packed_r) * bm; \
+        const uint c0 = (g % cols) * INKLING_EXPERT_BLOCK_N64; \
+        device const uint *entries = sorted_routes + off; \
+        constexpr bool X16 = (!DOWN) || BF16IO; \
+        if (bm == 64u) { \
+            mk_expert_block_m64n64_core<DOWN, NV, 64u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, t0, min(count, t0 + 64u), 64u, a, b, tg8, tg4); \
+        } else if (bm == 32u) { \
+            mk_expert_block_m64n64_core<DOWN, NV, 32u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, t0, min(count, t0 + 32u), 32u, a, b, tg8, tg4); \
+        } else { \
+            mk_expert_block_m64n64_core<DOWN, NV, 16u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, t0, min(count, t0 + 16u), 16u, a, b, tg8, tg4); \
+        } \
+    }
+
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_nv64_m64, false, true, false, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_nv64_m64, true, true, false, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_mx64_m64, false, false, false, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_mx64_m64, true, false, false, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_nv64_m64_lut, false, true, true, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_nv64_m64_lut, true, true, true, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_mx64_m64_lut, false, false, true, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_mx64_m64_lut, true, false, true, false)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_nv64_m64_bf16, false, true, false, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_nv64_m64_bf16, true, true, false, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_mx64_m64_bf16, false, false, false, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_mx64_m64_bf16, true, false, false, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_nv64_m64_lut_bf16, false, true, true, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_nv64_m64_lut_bf16, true, true, true, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_up_mx64_m64_lut_bf16, false, false, true, true)
+MK_EXPERT_BLOCK_M64N64_STRIPE(mk_expert_block_down_mx64_m64_lut_bf16, true, false, true, true)
+
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_nv64_m64_ct, false, true, false, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_nv64_m64_ct, true, true, false, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_mx64_m64_ct, false, false, false, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_mx64_m64_ct, true, false, false, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_nv64_m64_ct_lut, false, true, true, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_nv64_m64_ct_lut, true, true, true, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_mx64_m64_ct_lut, false, false, true, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_mx64_m64_ct_lut, true, false, true, false)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_nv64_m64_ct_bf16, false, true, false, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_nv64_m64_ct_bf16, true, true, false, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_mx64_m64_ct_bf16, false, false, false, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_mx64_m64_ct_bf16, true, false, false, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_nv64_m64_ct_lut_bf16, false, true, true, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_nv64_m64_ct_lut_bf16, true, true, true, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_mx64_m64_ct_lut_bf16, false, false, true, true)
+MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_mx64_m64_ct_lut_bf16, true, false, true, true)
+#undef MK_EXPERT_BLOCK_M64N64_STRIPE
+#undef MK_EXPERT_BLOCK_M64N64_CT
+
+// Wave 4: Fused controller message merge + RMSNorm(+BF16 cast) for batched forwards.
+kernel void mk_inkling_merge_norm_vec(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                      constant MK &p [[buffer(8)]], uint tgid [[threadgroup_position_in_grid]],
+                                      uint lid [[thread_position_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                                      uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[33];
+    if (tgid >= p.rows) return;
+    const uint row = p.row0 + tgid;
+    const bool active = lid * 4u < p.n;
+    const device float4 *hp = (const device float4 *)(arena + p.x + row * p.xs);
+    const device float4 *mp = (const device float4 *)(arena + p.y + row * p.ys);
+    const device float4 *gp0 = (const device float4 *)(arena + p.z + row * p.zs);
+    const device float4 *gp1 = (const device float4 *)(arena + p.z + row * p.zs + p.n);
+    device float4 *op = (device float4 *)(arena + p.every + row * p.pad_k);
+    float4 mv = float4(0.0f);
+    if (active) {
+        const float4 hid = hp[lid];
+        const float4 msg = mp[lid];
+        const float4 fg = tanh(gp0[lid]);
+        const float4 gn = tanh(gp1[lid]);
+        mv = (float4(1.0f) - fg) * hid + gn * msg;
+        if (p.flags & MK_INKLING_ROUND_RES) {
+            for (uint j = 0u; j < 4u; ++j) mv[j] = mk_bf16(mv[j]);
+        }
+    }
+    const uint nsimds = tg / 32u;
+    const float acc = simd_sum(active ? dot(mv, mv) : 0.0f);
+    if (lane == 0u) partial[simd] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0u) {
+        const float tot = simd_sum(lane < nsimds ? partial[lane] : 0.0f);
+        if (lane == 0u) partial[32] = metal::precise::rsqrt(tot / float(p.n) + p.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    float4 v = mv * partial[32];
+    if (p.flags & MK_ROUND_BF16) {
+        for (uint j = 0u; j < 4u; ++j) v[j] = mk_bf16(v[j]);
+    }
+    float4 res = (p.flags & MK_HAS_WEIGHT) ? mk_fast_load4(w, p.w, p.dtype, lid) * v : v;
+    if (p.flags & MK_ROUND_OUT) {
+        for (uint j = 0u; j < 4u; ++j) res[j] = mk_bf16(res[j]);
+    }
+    op[lid] = res;
+}
+
 
 
 

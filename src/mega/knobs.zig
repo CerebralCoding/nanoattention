@@ -249,6 +249,18 @@ pub const Knobs = struct {
     relative_prefill_fast: bool = false,
     /// M=64, N=64, B=32 expert prefill tiles with SLC-resident BF16 input packing.
     expert_block_m64n64: bool = false,
+    /// Constant-cache FP8 E4M3FN and FP4 pair LUTs for expert dequantization.
+    expert_fp_lut: bool = false,
+    /// Single-TG compact MoE tile builder and M=16/32/64 sparse expert tiles.
+    expert_compact_tiles: bool = false,
+    /// Packed BF16 intermediates for expert_gate_up -> expert_down -> combine.
+    expert_bf16_io: bool = false,
+    /// Fuse sliding sconv / global QKV + relative prep chains (sconv, rmsnorm, l2_clip, log_scale, kv store+pack).
+    fuse_qkvr_prep: bool = false,
+    /// Fuse single-row relative bias projection directly into striped attention key/value pass.
+    relative_inline_bias: bool = false,
+    /// Fuse controller message merge + following RMSNorm(+BF16 cast) on batched forwards.
+    fuse_merge_norm: bool = false,
 
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};
@@ -269,6 +281,8 @@ pub const Knobs = struct {
             .depth_norm = self.fuse_depth_norm,
             .inkling_conv = self.fuse_inkling_conv,
             .relative_gate = self.fuse_relative_gate,
+            .qkvr_prep = self.fuse_qkvr_prep,
+            .merge_norm = self.fuse_merge_norm,
         };
     }
 

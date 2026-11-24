@@ -146,3 +146,12 @@ import Inkling
 #print axioms Inkling.expert_tail_partition
 #print axioms Inkling.argmax_part_coverage
 #print axioms Inkling.argmax_part_unique
+#print axioms Inkling.e4m3_bit_decode_nan
+#print axioms Inkling.e4m3_bit_decode_zero
+#print axioms Inkling.e4m3_bit_decode_u32
+#print axioms Inkling.fp4_pair_decompose
+#print axioms Inkling.fp4_pair_lut_exact
+#print axioms Inkling.moe_tile_pack_roundtrip
+#print axioms Inkling.moe_tile_count_bound
+#print axioms Inkling.sconv_batch_ring_disjoint
+#print axioms Inkling.inline_rel_skip_far

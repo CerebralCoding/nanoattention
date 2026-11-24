@@ -48,4 +48,17 @@ inline float4 inkling_nvfp4_decode4(uint packed) {
     const uint4 bits = select(ordinary, mag * 0x3f000000u, mag < 2u);
     return as_type<float4>(bits | ((code & 8u) << 28));
 }
+inline int inkling_moe_tile_block(int c) { return c <= 16 ? 16 : (c <= 32 ? 32 : 64); }
+inline uint inkling_moe_pack_tile_r(uint tid_y, uint bm) {
+    const uint code = (bm == 16u) ? 1u : ((bm == 32u) ? 2u : 3u);
+    return (code << 24u) | (tid_y & 0xFFFFFFu);
+}
+inline int inkling_moe_unpack_bm(uint packed) {
+    const uint code = packed >> 24u;
+    return (code == 1u) ? 16 : ((code == 2u) ? 32 : 64);
+}
+inline uint inkling_moe_unpack_tid_y(uint packed) { return packed & 0xFFFFFFu; }
+inline uint inkling_moe_max_tiles(uint experts, uint total_pairs) {
+    return min(total_pairs, min(experts, total_pairs) + (total_pairs + 63u) / 64u);
+}
 #endif

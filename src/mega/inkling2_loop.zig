@@ -1792,3 +1792,438 @@ test "Inkling Step 1 expert_block_m64n64 + mk_pack_rows_bf16 match mk_expert_blo
         }
     }
 }
+
+test "Inkling Qwegn Wave 1 expert_fp_lut, expert_compact_tiles and expert_bf16_io match reference" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 256;
+    c.intermediate = 128;
+    c.heads = 4;
+    c.kv_heads = 1;
+    c.head_dim = 8;
+    c.rel_dim = 16;
+    c.rel_extent = 8;
+    c.window = 8;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 32;
+    var p = try lower(gpa, c);
+    defer p.deinit();
+    var tmp = "/tmp/nano-inkling-wave1-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const Engine = @import("exec.zig").Engine;
+
+    const seq = [_]u32{ 1, 4, 11, 2, 3, 6, 8, 9, 5, 7, 10, 12, 1, 2, 3, 4, 5, 6 };
+    const V = c.unpadded_vocab;
+    var ref_logits: [2 * 14]f32 = undefined;
+    var base = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 16,
+        .expert_prefill = true,
+        .expert_mlx_scale = true,
+        .expert_lists_split = true,
+        .expert_block_m64n64 = true,
+        .expert_nvfp4_fast = true,
+        .expert_simd = true,
+        .expert_wide_dot = true,
+        .expert_gate_pair = true,
+        .bf16_linear_tile = true,
+        .bf16_decode_vec = true,
+        .fuse_bf16_cast = true,
+        .scratch_reuse = true,
+    }, 32);
+    defer base.deinit();
+    try base.forward(seq[0..16], 15);
+    try base.forward(seq[16..17], 0);
+    @memcpy(ref_logits[0..V], try base.logits(0));
+    try base.forward(seq[17..18], 0);
+    @memcpy(ref_logits[V .. 2 * V], try base.logits(0));
+
+    for ([_]struct { lut: bool, ct: bool, bf16: bool }{
+        .{ .lut = true, .ct = false, .bf16 = false },
+        .{ .lut = false, .ct = true, .bf16 = false },
+        .{ .lut = false, .ct = false, .bf16 = true },
+        .{ .lut = true, .ct = true, .bf16 = true },
+    }) |cfg| {
+        var k = base.knobs;
+        k.expert_fp_lut = cfg.lut;
+        k.expert_compact_tiles = cfg.ct;
+        k.expert_bf16_io = cfg.bf16;
+        var eng = try Engine.init(gpa, &p, ctx, &store, k, 32);
+        defer eng.deinit();
+        try eng.forward(seq[0..16], 15);
+        try eng.forward(seq[16..17], 0);
+        for (ref_logits[0..V], try eng.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-4);
+        try eng.forward(seq[17..18], 0);
+        for (ref_logits[V .. 2 * V], try eng.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-4);
+    }
+}
+
+test "Inkling Qwegn Wave 1 standalone compact tiles + LUT + BF16 combine match ref bit-for-bit across full/tail tiles" {
+    const gpu = @import("gpu.zig");
+    const inkling_plan = @import("inkling_plan.zig");
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+
+    const rows: u32 = 130;
+    const experts: u32 = 16;
+    const top_k: u32 = 8;
+    const k_dim: u32 = 128;
+    const n_dim: u32 = 128;
+    const pairs = rows * top_k;
+    var prng = std.Random.DefaultPrng.init(99);
+    const rnd = prng.random();
+    const bf16f = struct {
+        fn cast(v: f32) f32 {
+            const bits: u32 = @bitCast(v);
+            return @bitCast((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000);
+        }
+    }.cast;
+
+    const x_words: u32 = rows * top_k * k_dim;
+    const routes_words: u32 = rows * top_k * 2;
+    const y_ref_off: u32 = x_words + routes_words;
+    const y_new_off: u32 = y_ref_off + rows * top_k * n_dim;
+    const y_new_up_off: u32 = y_new_off + rows * n_dim;
+    const y_new_dn_off: u32 = y_new_up_off + rows * top_k * n_dim;
+    const arena_buf = try ctx.alloc(y_new_dn_off + rows * n_dim);
+    defer arena_buf.deinit();
+    const af = arena_buf.floats();
+    const routes_off: u32 = x_words;
+    for (af[0..x_words]) |*v| v.* = bf16f(0.25 * rnd.floatNorm(f32));
+    for (0..rows) |r| {
+        for (0..top_k) |s_i| {
+            // Mix empty/tiny/medium/multi-64-tile experts across routes.
+            const exp_id: u32 = if (s_i == 0) 0 else @intCast((r * 3 + s_i) % (experts - 1));
+            af[routes_off + r * top_k * 2 + s_i] = @floatFromInt(exp_id);
+            af[routes_off + r * top_k * 2 + top_k + s_i] = bf16f(0.125 * @as(f32, @floatFromInt(s_i + 1)));
+        }
+    }
+
+    const list_words = @max(@as(usize, experts) * (pairs + 33), @as(usize, experts) + 2 + pairs + 2 * inkling_plan.moeMaxTiles(experts, pairs));
+    const lists_buf = try ctx.alloc(list_words);
+    defer lists_buf.deinit();
+    const compact_buf = try ctx.alloc(list_words);
+    defer compact_buf.deinit();
+    const partial_ref = try ctx.alloc(@as(usize, pairs) * n_dim);
+    defer partial_ref.deinit();
+    const partial_new = try ctx.alloc(@as(usize, pairs) * n_dim);
+    defer partial_new.deinit();
+
+    const nv_w = try ctx.alloc(experts * 2 * n_dim * k_dim / 8);
+    defer nv_w.deinit();
+    for (nv_w.structs(u32)) |*v| v.* = rnd.int(u32);
+    const nv_s = try ctx.alloc(experts * 2 * n_dim * k_dim / 64);
+    defer nv_s.deinit();
+    for (std.mem.sliceAsBytes(nv_s.floats())) |*b| b.* = @intCast(rnd.intRangeAtMost(u8, 0x28, 0x48));
+    const amax_buf = try ctx.alloc(experts);
+    defer amax_buf.deinit();
+    for (amax_buf.floats()) |*v| v.* = 0.5 + rnd.float(f32);
+    const denom_buf = try ctx.alloc(1);
+    defer denom_buf.deinit();
+    denom_buf.floats()[0] = 6.0;
+
+    const mx_w = try ctx.alloc(experts * 2 * n_dim * k_dim / 4);
+    defer mx_w.deinit();
+    for (std.mem.sliceAsBytes(mx_w.floats())) |*b| {
+        const exp: u8 = @intCast(rnd.intRangeAtMost(u8, 4, 9));
+        const mant: u8 = @intCast(rnd.intRangeAtMost(u8, 0, 7));
+        const sign: u8 = @as(u8, @intCast(rnd.intRangeAtMost(u8, 0, 1))) << 7;
+        b.* = sign | (exp << 3) | mant;
+    }
+    const mx_s = try ctx.alloc(experts * 2 * n_dim * k_dim / 128);
+    defer mx_s.deinit();
+    for (std.mem.sliceAsBytes(mx_s.floats())) |*b| b.* = @intCast(rnd.intRangeAtMost(u8, 124, 129));
+
+    for ([_]bool{ true, false }) |is_nv| {
+        const wbuf = if (is_nv) nv_w else mx_w;
+        const sbuf = if (is_nv) nv_s else mx_s;
+        @memset(af[y_ref_off .. y_new_off + rows * top_k * n_dim], 0);
+        @memset(partial_ref.floats(), 0);
+        @memset(partial_new.floats(), 0);
+
+        // Reference: non-compact up -> down -> combine_mm
+        var p_up: gpu.ExpertParams = .{
+            .rows = rows, .row0 = 0, .x = 0, .xs = top_k * k_dim,
+            .routes = routes_off, .rs = top_k * 2, .y = y_ref_off, .ys = top_k * n_dim,
+            .n = n_dim, .k = k_dim, .experts = experts, .top_k = top_k,
+            .nvfp4 = @intFromBool(is_nv), .round_bf16 = 1, .gate_cap = 16.0, .up_cap = 16.0,
+        };
+        try gpu.dispatch(ctx, "mk_expert_row_lists_simd", &.{ arena_buf, lists_buf }, &p_up, @as(usize, experts) * 32, 128);
+        try gpu.dispatch(ctx, "mk_pack_rows_bf16", &.{ arena_buf, partial_ref }, &p_up, @as(usize, rows) * (k_dim / 4), 256);
+        try gpu.dispatch(ctx, if (is_nv) "mk_expert_block_up_nv64_m64" else "mk_expert_block_up_mx64_m64", &.{ arena_buf, wbuf, sbuf, amax_buf, denom_buf, lists_buf, partial_ref }, &p_up, @as(usize, experts) * (2 * n_dim / 64) * 128 * 2, 128);
+
+        var p_dn = p_up;
+        p_dn.x = y_ref_off;
+        p_dn.xs = top_k * n_dim;
+        p_dn.y = y_new_off; // temporary ref combined output slot; down output is n_dim wide per row
+        p_dn.ys = n_dim;
+        try gpu.dispatch(ctx, if (is_nv) "mk_expert_block_down_nv64_m64" else "mk_expert_block_down_mx64_m64", &.{ arena_buf, wbuf, sbuf, amax_buf, denom_buf, lists_buf, partial_ref }, &p_dn, @as(usize, experts) * (n_dim / 64) * 128 * 2, 128);
+        try gpu.dispatch(ctx, "mk_expert_combine_mm", &.{ arena_buf, partial_ref }, &p_dn, @as(usize, rows) * n_dim, 256);
+
+        // New: compact tiles + LUT + BF16 I/O up -> down -> combine_mm_bf16
+        const max_tiles = inkling_plan.moeMaxTiles(experts, pairs);
+        p_up.y = y_new_up_off;
+        try gpu.dispatch(ctx, "mk_expert_group_tiles", &.{ arena_buf, compact_buf }, &p_up, 256, 256);
+        try gpu.dispatch(ctx, "mk_pack_rows_bf16", &.{ arena_buf, partial_new }, &p_up, @as(usize, rows) * (k_dim / 4), 256);
+        try gpu.dispatch(ctx, if (is_nv) "mk_expert_block_up_nv64_m64_ct_lut_bf16" else "mk_expert_block_up_mx64_m64_ct_lut_bf16", &.{ arena_buf, wbuf, sbuf, amax_buf, denom_buf, compact_buf, partial_new }, &p_up, @as(usize, max_tiles) * (2 * n_dim / 64) * 128, 128);
+
+        p_dn.x = y_new_up_off;
+        p_dn.y = y_new_dn_off;
+        try gpu.dispatch(ctx, if (is_nv) "mk_expert_block_down_nv64_m64_ct_lut_bf16" else "mk_expert_block_down_mx64_m64_ct_lut_bf16", &.{ arena_buf, wbuf, sbuf, amax_buf, denom_buf, compact_buf, partial_new }, &p_dn, @as(usize, max_tiles) * (n_dim / 64) * 128, 128);
+        try gpu.dispatch(ctx, "mk_expert_combine_mm_bf16", &.{ arena_buf, partial_new }, &p_dn, @as(usize, rows) * (n_dim / 4), 256);
+        try ctx.finish();
+
+        const out_len = rows * n_dim;
+        try std.testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(af[y_new_off..][0..out_len])), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(af[y_new_dn_off..][0..out_len])));
+    }
+}
+
+test "Inkling Qwegn Wave 2 fuse_qkvr_prep matches reference on sliding and global layers for prefill and decode" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 3;
+    c.kv_heads = 1;
+    c.head_dim = 128;
+    c.rel_dim = 16;
+    c.rel_extent = 16;
+    c.window = 16;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 32;
+    var p = try lower(gpa, c);
+    defer p.deinit();
+    var tmp = "/tmp/nano-inkling-wave2-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const Engine = @import("exec.zig").Engine;
+
+    const seq = [_]u32{ 1, 4, 11, 2, 3, 6, 8, 9, 5, 7, 10, 12, 1, 2, 3, 4, 5, 6 };
+    const V = c.unpadded_vocab;
+    var ref_logits: [2 * 14]f32 = undefined;
+    var base = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 16,
+        .relative_stripes = true,
+        .relative_tile_prefill = true,
+        .relative_bias16 = true,
+        .relative_bias_d8 = true,
+        .relative_bias_decode = true,
+        .relative_long_fast = true,
+        .relative_prefill_fast = true,
+        .store_pack_bf16 = true,
+        .conv_ring = true,
+        .fuse_inkling_conv = true,
+        .fuse_bf16_cast = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .concurrent_scratch = true,
+    }, 32);
+    defer base.deinit();
+    try base.forward(seq[0..16], 15);
+    try base.forward(seq[16..17], 0);
+    @memcpy(ref_logits[0..V], try base.logits(0));
+    try base.forward(seq[17..18], 0);
+    @memcpy(ref_logits[V .. 2 * V], try base.logits(0));
+
+    var qkvr_k = base.knobs;
+    qkvr_k.fuse_qkvr_prep = true;
+    var qkvr = try Engine.init(gpa, &p, ctx, &store, qkvr_k, 32);
+    defer qkvr.deinit();
+    var sconv_steps: usize = 0;
+    var dyn_steps: usize = 0;
+    for (qkvr.steps) |st| switch (st) {
+        .qkvr_sconv_prep => sconv_steps += 1,
+        .qkvr_dyn_prep => dyn_steps += 1,
+        else => {},
+    };
+    try std.testing.expect(sconv_steps > 0 and dyn_steps > 0);
+    try qkvr.forward(seq[0..16], 15);
+    try qkvr.forward(seq[16..17], 0);
+    for (ref_logits[0..V], try qkvr.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-5);
+    try qkvr.forward(seq[17..18], 0);
+    for (ref_logits[V .. 2 * V], try qkvr.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-5);
+}
+
+test "Inkling Qwegn Wave 3 relative_inline_bias matches reference across d2_gate" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 3;
+    c.kv_heads = 1;
+    c.head_dim = 128;
+    c.rel_dim = 16;
+    c.rel_extent = 16;
+    c.window = 16;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 512;
+    var p = try lower(gpa, c);
+    defer p.deinit();
+    var tmp = "/tmp/nano-inkling-wave3-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const Engine = @import("exec.zig").Engine;
+
+    var seq: [264]u32 = undefined;
+    for (&seq, 0..) |*tok, idx| tok.* = @intCast((idx * 7 + 1) % 14);
+    const V = c.unpadded_vocab;
+    var ref_logits: [2 * 14]f32 = undefined;
+    var base = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 260,
+        .relative_stripes = true,
+        .relative_tile_prefill = true,
+        .relative_bias16 = true,
+        .relative_bias_d8 = true,
+        .relative_bias_decode = true,
+        .relative_long_fast = true,
+        .relative_prefill_fast = true,
+        .fuse_relative_gate = true,
+        .store_pack_bf16 = true,
+        .conv_ring = true,
+        .fuse_inkling_conv = true,
+        .fuse_bf16_cast = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .concurrent_scratch = true,
+        .d2_gate = true,
+    }, 512);
+    defer base.deinit();
+    try base.forward(seq[0..260], 259);
+    try base.forward(seq[260..261], 0);
+    @memcpy(ref_logits[0..V], try base.logits(0));
+    try base.forward(seq[261..262], 0);
+    @memcpy(ref_logits[V .. 2 * V], try base.logits(0));
+
+    for ([_]bool{ false, true }) |fuse_qkvr| {
+        var k = base.knobs;
+        k.relative_inline_bias = true;
+        k.fuse_qkvr_prep = fuse_qkvr;
+        var eng = try Engine.init(gpa, &p, ctx, &store, k, 512);
+        defer eng.deinit();
+        var ib_cnt: usize = 0;
+        for (eng.inline_bias_ok.?) |ok| ib_cnt += @intFromBool(ok);
+        try std.testing.expect(ib_cnt > 0);
+        try eng.forward(seq[0..260], 259);
+        try eng.forward(seq[260..261], 0);
+        for (ref_logits[0..V], try eng.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-4);
+        try eng.forward(seq[261..262], 0);
+        for (ref_logits[V .. 2 * V], try eng.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-4);
+    }
+}
+
+test "Inkling Qwegn Wave 4 fuse_merge_norm matches reference" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 4;
+    c.kv_heads = 1;
+    c.head_dim = 8;
+    c.rel_dim = 16;
+    c.rel_extent = 8;
+    c.window = 8;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 32;
+    var p = try lower(gpa, c);
+    defer p.deinit();
+    var tmp = "/tmp/nano-inkling-wave4-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const Engine = @import("exec.zig").Engine;
+
+    const seq = [_]u32{ 1, 4, 11, 2, 3, 6, 8, 9, 5, 7, 10, 12, 1, 2, 3, 4, 5, 6 };
+    const V = c.unpadded_vocab;
+    var ref_logits: [2 * 14]f32 = undefined;
+    var base = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 16,
+        .bf16_linear_tile = true,
+        .bf16_prefill_tile = 8,
+        .bf16_prefill_matrix = true,
+        .bf16_matrix_small = true,
+        .bf16_decode_vec = true,
+        .fuse_bf16_cast = true,
+        .fuse_controller_merge = true,
+        .fuse_depth_norm = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .concurrent_scratch = true,
+    }, 32);
+    defer base.deinit();
+    try base.forward(seq[0..16], 15);
+    try base.forward(seq[16..17], 0);
+    @memcpy(ref_logits[0..V], try base.logits(0));
+    try base.forward(seq[17..18], 0);
+    @memcpy(ref_logits[V .. 2 * V], try base.logits(0));
+
+    var w4_knobs = base.knobs;
+    w4_knobs.fuse_merge_norm = true;
+    var w4 = try Engine.init(gpa, &p, ctx, &store, w4_knobs, 32);
+    defer w4.deinit();
+    var mn_steps: usize = 0;
+    for (w4.steps) |st| switch (st) {
+        .controller_merge_norm => mn_steps += 1,
+        else => {},
+    };
+    try std.testing.expect(mn_steps > 0);
+    try w4.forward(seq[0..16], 15);
+    try w4.forward(seq[16..17], 0);
+    for (ref_logits[0..V], try w4.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-5);
+    try w4.forward(seq[17..18], 0);
+    for (ref_logits[V .. 2 * V], try w4.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-5);
+}

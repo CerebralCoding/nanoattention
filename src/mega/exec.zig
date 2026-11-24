@@ -100,12 +100,20 @@ pub const Engine = struct {
     steps: []plan.Step,
     independent_launches: ?[]bool = null,
     /// Kept only across adjacent expert operations, with no intervening writes.
-    expert_routes: ?struct { off: u32, stride: u32, row0: u32, rows: u32, experts: u32, top_k: u32 } = null,
+    expert_routes: ?struct { off: u32, stride: u32, row0: u32, rows: u32, experts: u32, top_k: u32, compact: bool } = null,
+    /// Packed BF16 intermediate written by expert_gate_up for immediately following expert_down.
+    expert_up_bf16: ?struct { x_off: u32, x_stride: u32, r_off: u32, r_stride: u32, row0: u32, rows: u32, experts: u32, top_k: u32 } = null,
+    expert_bf16_out: bool = false,
+    expert_bf16_in: bool = false,
     /// Ops at index >= head_start run only on rows with logits: the program's
     /// head_start, or earlier with knobs.head_trim (traced forwards use the program's).
     head_start: u32,
     /// knobs.tail_trim: per step, the rows of a forward something still reads.
     row_needs: ?[]RowNeed = null,
+    op_needs: ?[]RowNeed = null,
+    cur_T: u32 = 0,
+    cur_out_first: u32 = 0,
+    cur_traced: bool = false,
     /// Diagnostics (`nano eval --heads-out`): while set, every forward also records what
     /// each attention visit and each router did. Null in normal runs; no arithmetic changes.
     tap: ?*Tap = null,
@@ -114,6 +122,10 @@ pub const Engine = struct {
     /// in this forward until its attention has read them.
     bias16_ok: ?[]bool = null,
     bias16: ?struct { state: u32, row0: u32, rows: u32 } = null,
+    /// knobs.relative_inline_bias: defer single-row grouped_project directly into mk_relative_long_keys_inline_fast.
+    inline_bias_ok: ?[]bool = null,
+    inline_bias: ?struct { state: u32, r_off: u32, r_stride: u32, w_buf: metal.Buffer, w_off: u64, row0: u32 } = null,
+    force_barrier: bool = false,
     position: u32 = 0,
     failed: bool = false,
     last: Stats = .{},
@@ -249,16 +261,19 @@ pub const Engine = struct {
         errdefer gpa.free(steps);
         if (head_start != program.head_start) steps = try splitAcross(gpa, steps, program.head_start);
         var row_needs: ?[]RowNeed = null;
+        var op_needs: ?[]RowNeed = null;
         errdefer if (row_needs) |v| gpa.free(v);
+        errdefer if (op_needs) |v| gpa.free(v);
         if (knobs.tail_trim != 0) {
             const per_op = try rowNeeds(gpa, program);
-            defer gpa.free(per_op);
+            errdefer gpa.free(per_op);
             const per_step = try gpa.alloc(RowNeed, steps.len);
             for (steps, per_step) |st, *need| {
                 need.* = .{};
                 for (per_op[st.first()..][0..st.len()]) |op_need| need.* = need.merge(op_need);
             }
             row_needs = per_step;
+            op_needs = per_op;
         }
         const independent_launches = if (knobs.concurrent_scratch) try plan.independentLaunches(gpa, steps, program, info) else null;
         errdefer if (independent_launches) |v| gpa.free(v);
@@ -348,10 +363,17 @@ pub const Engine = struct {
             var lists: usize = 0;
             var values: usize = 0;
             for (program.ops) |op| switch (op) {
-                // After the lists: 32 segment counts an expert (knobs.expert_lists_split, MK_LIST_SEGS).
-                .expert_gate_up => |e| lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1 + list_segments)),
+                // After the lists: 32 segment counts an expert (knobs.expert_lists_split, MK_LIST_SEGS),
+                // or compact tile table (expert_off + tile_count + sorted_routes + tileE + tileR).
+                .expert_gate_up => |e| {
+                    const pairs = @as(usize, tile_rows) * e.top_k;
+                    const compact = @as(usize, e.experts) + 2 + pairs + 2 * inkling_plan.moeMaxTiles(e.experts, @intCast(pairs));
+                    lists = @max(lists, @max(@as(usize, e.experts) * (pairs + 1 + list_segments), compact));
+                },
                 .expert_down => |e| {
-                    lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1 + list_segments));
+                    const pairs = @as(usize, tile_rows) * e.top_k;
+                    const compact = @as(usize, e.experts) + 2 + pairs + 2 * inkling_plan.moeMaxTiles(e.experts, @intCast(pairs));
+                    lists = @max(lists, @max(@as(usize, e.experts) * (pairs + 1 + list_segments), compact));
                     values = @max(values, @as(usize, e.top_k) * e.out.width * tile_rows);
                 },
                 else => {},
@@ -411,29 +433,76 @@ pub const Engine = struct {
                 if (knobs.relative_tile_prefill and batch >= 8) prefill_parts = try ctx.alloc(@as(usize, @min(batch, min_tile_rows)) * striped_heads * max_prefill_stripes * 130);
             }
         }
-        // knobs.relative_bias16: a bias state qualifies when exactly two ops touch it,
-        // the projection that writes it and an attention the staged tiles can run.
+        // knobs.relative_bias16 / knobs.relative_inline_bias: qualify bias states with 2 users (producer + relative_attention).
         var bias16_ok: ?[]bool = null;
         errdefer if (bias16_ok) |v| gpa.free(v);
-        if (knobs.relative_bias16 and knobs.relative_tile_prefill) if (relative_half) |hs| {
-            const ok = try gpa.alloc(bool, n);
-            @memset(ok, false);
-            bias16_ok = ok;
+        var inline_bias_ok: ?[]bool = null;
+        errdefer if (inline_bias_ok) |v| gpa.free(v);
+        if ((knobs.relative_bias16 and knobs.relative_tile_prefill) or (knobs.relative_inline_bias and knobs.relative_stripes and knobs.relative_long_fast)) if (relative_half) |hs| {
+            const want_bias16 = knobs.relative_bias16 and knobs.relative_tile_prefill;
+            const want_inline = knobs.relative_inline_bias and knobs.relative_stripes and knobs.relative_long_fast;
+            if (want_bias16) {
+                bias16_ok = try gpa.alloc(bool, n);
+                @memset(bias16_ok.?, false);
+            }
+            if (want_inline) {
+                inline_bias_ok = try gpa.alloc(bool, n);
+                @memset(inline_bias_ok.?, false);
+            }
             const users = try gpa.alloc(u32, n);
             defer gpa.free(users);
             @memset(users, 0);
-            for (program.ops) |op| {
+            const gp_idx = try gpa.alloc(?u32, n);
+            defer gpa.free(gp_idx);
+            @memset(gp_idx, null);
+            const ra_idx = try gpa.alloc(?u32, n);
+            defer gpa.free(ra_idx);
+            @memset(ra_idx, null);
+            for (program.ops, 0..) |op, op_i| {
                 var reads: [3]?ir.View = undefined;
                 var write: ?ir.View = null;
                 plan.access(op, &reads, &write);
                 for ([_]?ir.View{ reads[0], reads[1], reads[2], write }) |view| if (view) |v| {
                     users[v.state] += 1;
                 };
+                switch (op) {
+                    .grouped_project => |g| if (gp_idx[g.out.state] == null) {
+                        gp_idx[g.out.state] = @intCast(op_i);
+                    },
+                    .relative_attention => |a| if (ra_idx[a.bias.state] == null) {
+                        ra_idx[a.bias.state] = @intCast(op_i);
+                    },
+                    else => {},
+                }
             }
             for (program.traces) |t| users[t.view.state] += 1;
             for (program.ops) |op| switch (op) {
                 .relative_attention => |a| if (a.dim == 128 and hs[a.keys] != null and hs[a.values] != null and users[a.bias.state] == 2) {
-                    ok[a.bias.state] = true;
+                    if (bias16_ok) |ok| ok[a.bias.state] = true;
+                    if (inline_bias_ok) |ok| {
+                        const visible = if (a.window == 0) context else @min(context, a.window);
+                        if (a.heads == 3 * a.kv_heads and maxStripeParts(visible, true) <= max_stripe_parts) {
+                            if (gp_idx[a.bias.state]) |gi| if (ra_idx[a.bias.state]) |ri| if (gi < ri and (gi >= head_start) == (ri >= head_start)) {
+                                const g = program.ops[gi].grouped_project;
+                                const gw = bound[g.weight];
+                                if (std.meta.eql(g.out, a.bias) and g.round == .bf16 and g.groups == a.heads and g.x.width / g.groups == 16 and
+                                    gw.quant == null and gw.tensor.dtype == .bf16 and gw.tensor.offset % 2 == 0)
+                                {
+                                    var safe = true;
+                                    for (program.ops[gi + 1 .. ri]) |mid| {
+                                        var mr: [3]?ir.View = undefined;
+                                        var mw: ?ir.View = null;
+                                        plan.access(mid, &mr, &mw);
+                                        if (mw) |mv| if (mv.state == g.x.state and mv.col < g.x.col + g.x.width and g.x.col < mv.col + mv.width) {
+                                            safe = false;
+                                            break;
+                                        };
+                                    }
+                                    if (safe) ok[a.bias.state] = true;
+                                }
+                            };
+                        }
+                    }
                 },
                 else => {},
             };
@@ -456,7 +525,9 @@ pub const Engine = struct {
             .independent_launches = independent_launches,
             .head_start = head_start,
             .row_needs = row_needs,
+            .op_needs = op_needs,
             .bias16_ok = bias16_ok,
+            .inline_bias_ok = inline_bias_ok,
             .prep = prep,
             .prep_xsum = prep_xsum,
             .scores = scores,
@@ -503,7 +574,9 @@ pub const Engine = struct {
         self.gpa.free(self.steps);
         if (self.independent_launches) |v| self.gpa.free(v);
         if (self.row_needs) |v| self.gpa.free(v);
+        if (self.op_needs) |v| self.gpa.free(v);
         if (self.bias16_ok) |v| self.gpa.free(v);
+        if (self.inline_bias_ok) |v| self.gpa.free(v);
         if (self.prep) |b| b.deinit();
         if (self.scores) |b| b.deinit();
         if (self.partials) |b| b.deinit();
@@ -590,10 +663,16 @@ pub const Engine = struct {
         const before = self.ctx.stats();
         const t_begin = io.now() catch 0; // decode climb 2
         var next_trace: usize = 0;
+        self.cur_T = T;
+        self.cur_out_first = out_first;
+        self.cur_traced = trace != null;
         self.prep_key = null;
         self.x2_key = null; // climb 2, exact prefill
         self.expert_routes = null;
+        self.expert_up_bf16 = null;
         self.bias16 = null;
+        self.inline_bias = null;
+        self.force_barrier = false;
         var skipped_barrier = false;
         for (self.steps, 0..) |step, step_i| {
             const first = step.first();
@@ -632,14 +711,33 @@ pub const Engine = struct {
                     else => false,
                 };
                 if (trace == null and self.tap == null) if (self.independent_launches) |v| {
-                    if ((step_i == 0 or (allow_concurrent and v[step_i])) and !skipped_barrier) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
+                    if ((step_i == 0 or (allow_concurrent and v[step_i])) and !skipped_barrier and !self.force_barrier) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
                 };
                 skipped_barrier = false;
+                self.force_barrier = false;
                 defer self.ctx.nano_dispatch_flags = null;
                 switch (step) {
-                    .op => |i| try self.encode(self.program.ops[i], row0, T - row0),
+                    .op => |i| {
+                        self.expert_bf16_out = false;
+                        if (trace == null and self.tap == null and self.knobs.expert_bf16_io and self.program.ops[i] == .expert_gate_up and step_i + 1 < self.steps.len) {
+                            if (self.steps[step_i + 1] == .op) {
+                                const j = self.steps[step_i + 1].op;
+                                if (self.program.ops[j] == .expert_down) {
+                                    const cut = if (trace != null) self.program.head_start else self.head_start;
+                                    const next_first = self.steps[step_i + 1].first();
+                                    const next_row0: u32 = if (next_first >= cut) out_first else if (self.row_needs) |needs| needs[step_i + 1].firstRow(T, out_first, self.knobs.tail_trim) else 0;
+                                    if (next_row0 == row0 and self.canPairExpertBf16(self.program.ops[i].expert_gate_up, self.program.ops[j].expert_down, T - row0)) {
+                                        self.expert_bf16_out = true;
+                                    }
+                                }
+                            }
+                        }
+                        defer self.expert_bf16_out = false;
+                        try self.encode(self.program.ops[i], row0, T - row0);
+                    },
                     else => {
                         self.expert_routes = null;
+                        self.expert_up_bf16 = null;
                         try encodeFused(self, step, row0, T - row0);
                     },
                 }
@@ -828,6 +926,89 @@ pub const Engine = struct {
         };
     }
 
+    fn canPairExpertBf16(self: *const Engine, eu: @FieldType(ir.Op, "expert_gate_up"), ed: @FieldType(ir.Op, "expert_down"), rows: u32) bool {
+        if (!self.knobs.expert_bf16_io or !std.meta.eql(eu.out, ed.x) or !std.meta.eql(eu.routes, ed.routes)) return false;
+        if (eu.experts != ed.experts or eu.top_k != ed.top_k or eu.round != .bf16 or !ed.input_bf16) return false;
+        const u_v = self.words(eu.x);
+        const u_o = self.words(eu.out);
+        const d_o = self.words(ed.out);
+        const u_n = eu.out.width / eu.top_k;
+        const u_k = eu.x.width;
+        const d_k = ed.x.width / ed.top_k;
+        const d_n = ed.out.width;
+        if (d_k != u_n or u_n % 4 != 0 or u_o.off % 4 != 0 or u_o.stride % 4 != 0) return false;
+        const u_w = self.bound[eu.bank.payload];
+        const d_w = self.bound[ed.bank.payload];
+        const u_nvfp4 = eu.bank.amax != null;
+        const d_nvfp4 = ed.bank.amax != null;
+        if (rows == 1) {
+            return self.knobs.expert_nvfp4_fast and u_v.off % 4 == 0 and u_v.stride % 4 == 0 and
+                eu.top_k <= 8 and u_k % 256 == 0 and u_w.tensor.offset % 8 == 0 and
+                d_n % 4 == 0 and d_k % 128 == 0 and
+                (if (d_nvfp4) eu.top_k == 8 and d_w.tensor.offset % 8 == 0 else eu.top_k <= 8 and d_w.tensor.offset % 4 == 0);
+        }
+        if (rows < 8 or self.expert_tiles == null) return false;
+        const tile_rows = expertTileRows(self.knobs);
+        const rem = rows % tile_rows;
+        if (rem != 0 and rem < 8) return false;
+        const chunk_rows = @min(rows, tile_rows);
+        const tile = self.expert_tiles.?;
+        return self.knobs.expert_mlx_scale and self.knobs.expert_block_m64n64 and eu.input_bf16 and
+            ed.round == .bf16 and d_n % 64 == 0 and d_k % 64 == 0 and d_o.off % 4 == 0 and d_o.stride % 4 == 0 and
+            (d_nvfp4 or d_w.tensor.offset % 16 == 0) and
+            u_k % 64 == 0 and (2 * u_n) % 64 == 0 and u_v.off % 4 == 0 and u_v.stride % 4 == 0 and
+            (u_nvfp4 or u_w.tensor.offset % 16 == 0) and
+            (@as(usize, chunk_rows) * u_k + 1) / 2 <= tile[1].floats().len;
+    }
+
+    fn expertBlockM64N64Kernel(down: bool, nvfp4: bool, bf16_io: bool, lut: bool, compact: bool) [:0]const u8 {
+        const names = [_][:0]const u8{
+            "mk_expert_block_up_mx64_m64",
+            "mk_expert_block_down_mx64_m64",
+            "mk_expert_block_up_nv64_m64",
+            "mk_expert_block_down_nv64_m64",
+            "mk_expert_block_up_mx64_m64_bf16",
+            "mk_expert_block_down_mx64_m64_bf16",
+            "mk_expert_block_up_nv64_m64_bf16",
+            "mk_expert_block_down_nv64_m64_bf16",
+            "mk_expert_block_up_mx64_m64_lut",
+            "mk_expert_block_down_mx64_m64_lut",
+            "mk_expert_block_up_nv64_m64_lut",
+            "mk_expert_block_down_nv64_m64_lut",
+            "mk_expert_block_up_mx64_m64_lut_bf16",
+            "mk_expert_block_down_mx64_m64_lut_bf16",
+            "mk_expert_block_up_nv64_m64_lut_bf16",
+            "mk_expert_block_down_nv64_m64_lut_bf16",
+            "mk_expert_block_up_mx64_m64_ct",
+            "mk_expert_block_down_mx64_m64_ct",
+            "mk_expert_block_up_nv64_m64_ct",
+            "mk_expert_block_down_nv64_m64_ct",
+            "mk_expert_block_up_mx64_m64_ct_bf16",
+            "mk_expert_block_down_mx64_m64_ct_bf16",
+            "mk_expert_block_up_nv64_m64_ct_bf16",
+            "mk_expert_block_down_nv64_m64_ct_bf16",
+            "mk_expert_block_up_mx64_m64_ct_lut",
+            "mk_expert_block_down_mx64_m64_ct_lut",
+            "mk_expert_block_up_nv64_m64_ct_lut",
+            "mk_expert_block_down_nv64_m64_ct_lut",
+            "mk_expert_block_up_mx64_m64_ct_lut_bf16",
+            "mk_expert_block_down_mx64_m64_ct_lut_bf16",
+            "mk_expert_block_up_nv64_m64_ct_lut_bf16",
+            "mk_expert_block_down_nv64_m64_ct_lut_bf16",
+        };
+        const idx: usize = (@as(usize, @intFromBool(down)) << 0) |
+            (@as(usize, @intFromBool(nvfp4)) << 1) |
+            (@as(usize, @intFromBool(bf16_io)) << 2) |
+            (@as(usize, @intFromBool(lut)) << 3) |
+            (@as(usize, @intFromBool(compact)) << 4);
+        return names[idx];
+    }
+
+    fn expertVecKernel(comptime base_names: [4][:0]const u8, bf16_io: bool, lut: bool) [:0]const u8 {
+        const idx: usize = (@as(usize, @intFromBool(bf16_io)) << 0) | (@as(usize, @intFromBool(lut)) << 1);
+        return base_names[idx];
+    }
+
     fn expertTileRows(knobs: knobs_mod.Knobs) u32 {
         if (knobs.expert_tile_rows != 0) return knobs.expert_tile_rows;
         return if (knobs.expert_mlx_scale) 512 else 128;
@@ -882,10 +1063,14 @@ pub const Engine = struct {
         if (self.expert_tiles != null and p.rows >= 8 and p.rows <= expertTileRows(self.knobs) and p.k % 32 == 0 and projection_rows % 32 == 0) {
             const tile = self.expert_tiles.?;
             const block = self.knobs.expert_mlx_scale and input_bf16 and p.k % 64 == 0 and p.x % 4 == 0 and p.xs % 4 == 0 and (p.nvfp4 == 0 or p.w % 4 == 0);
-            const key: @TypeOf(self.expert_routes.?) = .{ .off = r.off, .stride = r.stride, .row0 = p.row0, .rows = p.rows, .experts = p.experts, .top_k = p.top_k };
+            const block_m64n64 = block and self.knobs.expert_block_m64n64 and projection_rows % 64 == 0 and (p.nvfp4 != 0 or p.w % 16 == 0) and (down or (@as(usize, p.rows) * p.k + 1) / 2 <= tile[1].floats().len);
+            const compact = block_m64n64 and self.knobs.expert_compact_tiles and p.experts <= 512;
+            const key: @TypeOf(self.expert_routes.?) = .{ .off = r.off, .stride = r.stride, .row0 = p.row0, .rows = p.rows, .experts = p.experts, .top_k = p.top_k, .compact = compact };
             const reusable = if (prev_routes) |prev| std.meta.eql(prev, key) else false;
             if (!reusable) {
-                if (block and self.knobs.expert_lists_split and p.rows >= 256) {
+                if (compact) {
+                    try gpu.dispatch(self.ctx, "mk_expert_group_tiles", &.{ self.arena, tile[0] }, p, 256, 256);
+                } else if (block and self.knobs.expert_lists_split and p.rows >= 256) {
                     try gpu.dispatch(self.ctx, "mk_expert_row_counts", &.{ self.arena, tile[0] }, p, @as(usize, p.experts) * list_segments * 32, 128);
                     try gpu.dispatch(self.ctx, "mk_expert_row_fill", &.{ self.arena, tile[0] }, p, @as(usize, p.experts) * list_segments * 32, 128);
                 } else if (block)
@@ -897,14 +1082,12 @@ pub const Engine = struct {
             // Both list builders produce the same row-major route order. IR
             // validation forbids an expert operation's output aliasing routes.
             self.expert_routes = key;
-            const block_m64n64 = block and self.knobs.expert_block_m64n64 and projection_rows % 64 == 0 and (p.nvfp4 != 0 or p.w % 16 == 0) and (down or (@as(usize, p.rows) * p.k + 1) / 2 <= tile[1].floats().len);
+            const bf16_io = block_m64n64 and (if (down) self.expert_bf16_in else self.expert_bf16_out) and
+                p.round_bf16 != 0 and (if (down) p.n % 4 == 0 and p.y % 4 == 0 and p.ys % 4 == 0 else true);
             const wide = self.knobs.expert_wide_k and p.k % 128 == 0;
             const bf16_storage = self.knobs.expert_bf16_tiles and input_bf16 and p.nvfp4 != 0 and p.k % 128 == 0;
             const name: [:0]const u8 = if (block_m64n64)
-                (if (p.nvfp4 != 0)
-                    (if (down) "mk_expert_block_down_nv64_m64" else "mk_expert_block_up_nv64_m64")
-                else
-                    (if (down) "mk_expert_block_down_mx64_m64" else "mk_expert_block_up_mx64_m64"))
+                expertBlockM64N64Kernel(down, p.nvfp4 != 0, bf16_io, self.knobs.expert_fp_lut, compact)
             else if (block)
                 (if (p.nvfp4 != 0)
                     (if (down) "mk_expert_block_down_nv" else "mk_expert_block_up_nv")
@@ -921,34 +1104,53 @@ pub const Engine = struct {
                 self.ctx.nano_dispatch_flags = null;
             }
             const threads: usize = 128;
-            const parts: usize = if (block_m64n64)
-                (if (p.rows >= 2048) 8 else if (p.rows >= 256) 4 else if (p.rows >= 64) 2 else 1)
-            else if (block and p.rows >= 128)
-                4
-            else if (block and p.rows >= 64)
-                2
-            else
-                1;
             const col_tiles: usize = if (block_m64n64) projection_rows / 64 else projection_rows / 32;
-            try gpu.dispatch(self.ctx, name, &.{ self.arena, w.buffer, scales.buffer, amax, denominator, tile[0], tile[1] }, p, @as(usize, p.experts) * col_tiles * threads * parts, threads);
-            if (down) try gpu.dispatch(self.ctx, "mk_expert_combine_mm", &.{ self.arena, tile[1] }, p, @as(usize, p.rows) * p.n, 256);
+            if (compact) {
+                const max_tiles: usize = inkling_plan.moeMaxTiles(p.experts, p.rows * p.top_k);
+                try gpu.dispatch(self.ctx, name, &.{ self.arena, w.buffer, scales.buffer, amax, denominator, tile[0], tile[1] }, p, max_tiles * col_tiles * threads, threads);
+            } else {
+                const parts: usize = if (block_m64n64)
+                    (if (p.rows >= 2048) 8 else if (p.rows >= 256) 4 else if (p.rows >= 64) 2 else 1)
+                else if (block and p.rows >= 128)
+                    4
+                else if (block and p.rows >= 64)
+                    2
+                else
+                    1;
+                try gpu.dispatch(self.ctx, name, &.{ self.arena, w.buffer, scales.buffer, amax, denominator, tile[0], tile[1] }, p, @as(usize, p.experts) * col_tiles * threads * parts, threads);
+            }
+            if (down) {
+                if (bf16_io) {
+                    try gpu.dispatch(self.ctx, "mk_expert_combine_mm_bf16", &.{ self.arena, tile[1] }, p, @as(usize, p.rows) * (p.n / 4), 256);
+                } else {
+                    try gpu.dispatch(self.ctx, "mk_expert_combine_mm", &.{ self.arena, tile[1] }, p, @as(usize, p.rows) * p.n, 256);
+                }
+            }
         } else if (self.knobs.expert_nvfp4_fast and p.rows == 1 and p.n % 4 == 0 and p.x % 4 == 0 and p.xs % 4 == 0 and
             !down and p.top_k <= 8 and p.k % 256 == 0 and p.w % 8 == 0)
         {
+            const lut = self.knobs.expert_fp_lut;
+            const bf16_io = self.expert_bf16_out;
             if (p.nvfp4 != 0) {
                 const simds = @as(usize, p.top_k) * (p.n / 4);
-                try gpu.dispatch(self.ctx, "mk_expert_gate_up_nv16", buffers, p, simds * 32, 128);
+                const kname = expertVecKernel(.{ "mk_expert_gate_up_nv16", "mk_expert_gate_up_nv16_bf16", "mk_expert_gate_up_nv16_lut", "mk_expert_gate_up_nv16_lut_bf16" }, bf16_io, lut);
+                try gpu.dispatch(self.ctx, kname, buffers, p, simds * 32, 128);
             } else {
                 const simds = @as(usize, p.top_k) * (p.n / 2);
-                try gpu.dispatch(self.ctx, "mk_expert_gate_up_mx_vec", buffers, p, simds * 32, 256);
+                const kname = expertVecKernel(.{ "mk_expert_gate_up_mx_vec", "mk_expert_gate_up_mx_bf16", "mk_expert_gate_up_mx_lut", "mk_expert_gate_up_mx_lut_bf16" }, bf16_io, lut);
+                try gpu.dispatch(self.ctx, kname, buffers, p, simds * 32, 256);
             }
         } else if (self.knobs.expert_nvfp4_fast and p.rows == 1 and p.n % 4 == 0 and p.x % 4 == 0 and p.xs % 4 == 0 and
             down and p.k % 128 == 0 and (if (p.nvfp4 != 0) p.top_k == 8 and p.w % 8 == 0 else p.top_k <= 8 and p.w % 4 == 0))
         {
+            const lut = self.knobs.expert_fp_lut;
+            const bf16_io = self.expert_bf16_in;
             if (p.nvfp4 != 0) {
-                try gpu.dispatch(self.ctx, "mk_expert_down_nv8", buffers, p, @as(usize, p.n / 4) * 64, 64);
+                const kname = expertVecKernel(.{ "mk_expert_down_nv8", "mk_expert_down_nv8_bf16", "mk_expert_down_nv8_lut", "mk_expert_down_nv8_lut_bf16" }, bf16_io, lut);
+                try gpu.dispatch(self.ctx, kname, buffers, p, @as(usize, p.n / 4) * 64, 64);
             } else {
-                try gpu.dispatch(self.ctx, "mk_expert_down_mx_vec", buffers, p, @as(usize, p.n / 4) * 256, 256);
+                const kname = expertVecKernel(.{ "mk_expert_down_mx_vec", "mk_expert_down_mx_bf16", "mk_expert_down_mx_lut", "mk_expert_down_mx_lut_bf16" }, bf16_io, lut);
+                try gpu.dispatch(self.ctx, kname, buffers, p, @as(usize, p.n / 4) * 256, 256);
             }
         } else if (self.knobs.expert_simd and self.knobs.expert_wide_dot and p.top_k <= 8 and projection_rows % 4 == 0 and
             (if (p.nvfp4 != 0) p.k % 16 == 0 and p.w % 4 == 0 else p.k % 32 == 0))
@@ -968,7 +1170,10 @@ pub const Engine = struct {
     }
 
     fn encodeRound(self: *Engine, op: ir.Op, row0: u32, rows: u32, round_out: bool) !void {
-        if (op != .expert_gate_up and op != .expert_down) self.expert_routes = null;
+        if (op != .expert_gate_up and op != .expert_down) {
+            self.expert_routes = null;
+            self.expert_up_bf16 = null;
+        }
         var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position, .flags = if (round_out) gpu.flag_round_out else 0 };
         switch (op) {
             .embed => |e| {
@@ -1132,6 +1337,18 @@ pub const Engine = struct {
                 const y = self.words(g.out);
                 const w = self.bound[g.weight];
                 if (w.quant != null or !w.tensor.dtype.isFloat()) return error.InvalidGroupedProjection;
+                if (rows == 1 and !self.cur_traced and self.cur_out_first == 0 and self.tap == null) if (self.inline_bias_ok) |ok| if (ok[g.out.state]) {
+                    self.inline_bias = .{
+                        .state = g.out.state,
+                        .r_off = x.off,
+                        .r_stride = x.stride,
+                        .w_buf = w.buffer,
+                        .w_off = w.tensor.offset,
+                        .row0 = row0,
+                    };
+                    self.force_barrier = true;
+                    return;
+                };
                 p.w = w.tensor.offset;
                 p.dtype = @backingInt(w.tensor.dtype);
                 p.x = x.off;
@@ -1455,10 +1672,28 @@ pub const Engine = struct {
                 try gpu.dispatch(self.ctx, "mk_route_topk", &.{ self.arena, correction.buffer }, &p, @as(usize, rows) * 32, 256);
             },
             .expert_gate_up => |e| {
+                const out_bf16 = self.expert_bf16_out;
+                defer self.expert_bf16_out = false;
                 var ep: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .k = e.x.width, .n = e.out.width / e.top_k, .experts = e.experts, .top_k = e.top_k, .gate_cap = e.gate_cap, .up_cap = e.up_cap, .round_bf16 = @intFromBool(e.round == .bf16) };
                 try self.expertProjection("mk_expert_gate_up", e.bank, e.x, e.routes, e.out, &ep, e.out.width, e.input_bf16);
+                if (out_bf16) {
+                    const o = self.words(e.out);
+                    const rv = self.words(e.routes);
+                    self.expert_up_bf16 = .{ .x_off = o.off, .x_stride = o.stride, .r_off = rv.off, .r_stride = rv.stride, .row0 = row0, .rows = rows, .experts = e.experts, .top_k = e.top_k };
+                } else {
+                    self.expert_up_bf16 = null;
+                }
             },
             .expert_down => |e| {
+                const u = self.expert_up_bf16;
+                self.expert_up_bf16 = null;
+                const xv = self.words(e.x);
+                const rv = self.words(e.routes);
+                self.expert_bf16_in = if (u) |upk|
+                    upk.x_off == xv.off and upk.x_stride == xv.stride and upk.r_off == rv.off and upk.r_stride == rv.stride and upk.row0 == row0 and upk.rows == rows and upk.experts == e.experts and upk.top_k == e.top_k
+                else
+                    false;
+                defer self.expert_bf16_in = false;
                 var ep: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .k = e.x.width / e.top_k, .n = e.out.width, .experts = e.experts, .top_k = e.top_k, .round_bf16 = @intFromBool(e.round == .bf16) };
                 try self.expertProjection("mk_expert_down", e.bank, e.x, e.routes, e.out, &ep, e.out.width, e.input_bf16);
             },
@@ -1499,6 +1734,36 @@ fn staticFusedQ4(self: *const Engine, x: *const gpu.ParamsX) bool {
 
 fn linearTile(self: *const Engine, rows: u32) struct { r: u32, t: u32 } {
     return if (rows == 1) .{ .r = self.knobs.decode_rows, .t = self.knobs.decode_tokens } else .{ .r = self.knobs.prefill_rows, .t = self.knobs.prefill_tokens };
+}
+
+fn encodeControllerMerge(self: *Engine, ops: []const ir.Op, i: u32, rows: u32, p: *gpu.Params) !bool {
+    const l0 = ops[i].linear;
+    const l1 = ops[i + 1].linear;
+    const m = ops[i + 2].inkling_message_merge;
+    const w0 = self.bound[l0.w];
+    const w1 = self.bound[l1.w];
+    if (rows != 1 or w0.tensor.dtype != .bf16 or w0.quant != null or
+        w1.tensor.dtype != .bf16 or w1.quant != null or
+        m.out.width % 4 != 0 or w0.tensor.offset % 2 != 0 or w1.tensor.offset % 2 != 0) return false;
+    const xin = self.words(l0.x);
+    const hid = self.words(m.hidden);
+    const msg = self.words(m.message);
+    const out = self.words(m.out);
+    p.w = w0.tensor.offset;
+    p.s = w1.tensor.offset;
+    p.x = xin.off;
+    p.xs = xin.stride;
+    p.y = hid.off;
+    p.ys = hid.stride;
+    p.z = msg.off;
+    p.zs = msg.stride;
+    p.every = out.off;
+    p.pad_k = out.stride;
+    p.n = l0.x.width;
+    p.m = m.out.width;
+    if (m.round == .bf16) p.flags |= gpu.flag_round_bf16;
+    try gpu.dispatch(self.ctx, "mk_bf16_controller_merge", &.{ w0.buffer, w1.buffer, self.arena }, p, ((@as(usize, p.m) + 3) / 4) * 32, self.knobs.linear_group);
+    return true;
 }
 
 /// Fused steps (plan.zig); each kernel reproduces the reference arithmetic.
@@ -1732,36 +1997,55 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             }
         },
         .controller_merge => |i| {
-            const l0 = ops[i].linear;
-            const l1 = ops[i + 1].linear;
-            const m = ops[i + 2].inkling_message_merge;
-            const w0 = self.bound[l0.w];
-            const w1 = self.bound[l1.w];
-            if (rows == 1 and w0.tensor.dtype == .bf16 and w0.quant == null and
-                w1.tensor.dtype == .bf16 and w1.quant == null and
-                m.out.width % 4 == 0 and w0.tensor.offset % 2 == 0 and w1.tensor.offset % 2 == 0)
-            {
-                const xin = self.words(l0.x);
-                const hid = self.words(m.hidden);
-                const msg = self.words(m.message);
-                const out = self.words(m.out);
-                p.w = w0.tensor.offset;
-                p.s = w1.tensor.offset;
-                p.x = xin.off;
-                p.xs = xin.stride;
-                p.y = hid.off;
-                p.ys = hid.stride;
-                p.z = msg.off;
-                p.zs = msg.stride;
-                p.every = out.off;
-                p.pad_k = out.stride;
-                p.n = l0.x.width;
-                p.m = m.out.width;
-                if (m.round == .bf16) p.flags |= gpu.flag_round_bf16;
-                try gpu.dispatch(self.ctx, "mk_bf16_controller_merge", &.{ w0.buffer, w1.buffer, self.arena }, &p, ((@as(usize, p.m) + 3) / 4) * 32, self.knobs.linear_group);
-            } else {
+            var mp = p;
+            if (try encodeControllerMerge(self, ops, i, rows, &mp)) return;
+            self.ctx.nano_dispatch_flags = null;
+            for (0..3) |k| try self.encode(ops[i + k], row0, rows);
+        },
+        .controller_merge_norm => |cmn| {
+            const ops_base = cmn.first;
+            if (rows == 1) {
+                var mp = p;
+                const fused_merge = if (self.knobs.fuse_controller_merge) try encodeControllerMerge(self, ops, ops_base, 1, &mp) else false;
                 self.ctx.nano_dispatch_flags = null;
-                for (0..3) |k| try self.encode(ops[i + k], row0, rows);
+                if (!fused_merge) {
+                    for (0..3) |k| try self.encode(ops[ops_base + k], row0, 1);
+                }
+                try self.encodeRound(ops[ops_base + 3], row0, 1, cmn.round_out);
+                return;
+            }
+            self.ctx.nano_dispatch_flags = null;
+            try self.encode(ops[ops_base], row0, rows);
+            try self.encode(ops[ops_base + 1], row0, rows);
+            const m = ops[ops_base + 2].inkling_message_merge;
+            const n = ops[ops_base + 3].rmsnorm;
+            const hid = self.words(m.hidden);
+            const msg = self.words(m.message);
+            const gates = self.words(m.gates);
+            const out = self.words(n.out);
+            const tg = gpu.normThreads(n.group);
+            const aligned = n.group % 4 == 0 and n.group <= 4 * tg and hid.off % 4 == 0 and hid.stride % 4 == 0 and
+                msg.off % 4 == 0 and msg.stride % 4 == 0 and gates.off % 4 == 0 and gates.stride % 4 == 0 and
+                out.off % 4 == 0 and out.stride % 4 == 0 and
+                (if (n.weight) |id| ((self.bound[id].tensor.dtype == .bf16 and self.bound[id].tensor.offset % 8 == 0) or
+                    (self.bound[id].tensor.dtype == .f32 and self.bound[id].tensor.offset % 16 == 0)) else true);
+            if (aligned) {
+                var np: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position, .x = hid.off, .xs = hid.stride, .y = msg.off, .ys = msg.stride, .z = gates.off, .zs = gates.stride, .every = out.off, .pad_k = out.stride, .n = n.group, .eps = n.eps };
+                var wbuf = self.arena;
+                if (n.weight) |id| {
+                    const w = self.bound[id];
+                    np.w = w.tensor.offset;
+                    np.dtype = @backingInt(w.tensor.dtype);
+                    np.flags |= gpu.flag_has_weight;
+                    wbuf = w.buffer;
+                }
+                if (m.round == .bf16) np.flags |= 64;
+                if (n.round_normalized == .bf16) np.flags |= gpu.flag_round_bf16;
+                if (cmn.round_out) np.flags |= gpu.flag_round_out;
+                try gpu.dispatch(self.ctx, "mk_inkling_merge_norm_vec", &.{ wbuf, self.arena }, &np, @as(usize, rows) * tg, tg);
+            } else {
+                try self.encode(ops[ops_base + 2], row0, rows);
+                try self.encodeRound(ops[ops_base + 3], row0, rows, cmn.round_out);
             }
         },
         .bf16_projections => |m| {
@@ -1976,6 +2260,120 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 try self.encode(ops[i + 3], row0, rows);
             }
         },
+        .qkvr_sconv_prep => |i| try encodeQkvrPrep(self, true, i, row0, rows),
+        .qkvr_dyn_prep => |i| try encodeQkvrPrep(self, false, i, row0, rows),
+    }
+}
+
+fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: u32) !void {
+    const ops = self.program.ops;
+    const ops_len: usize = if (sconv) 15 else 13;
+    const tail = if (sconv) i + 4 else i;
+    const nv = ops[tail].rmsnorm;
+    const cl_q = ops[tail + 2].l2_clip;
+    const cl_k = ops[tail + 4].l2_clip;
+    const cl_r = ops[tail + 6].l2_clip;
+    const gp_idx = if (sconv) i + 12 else i + 10;
+    const st_k = ops[gp_idx + 1].store;
+    const st_v = ops[gp_idx + 2].store;
+    const q = self.words(cl_q.x);
+    const r = self.words(cl_r.x);
+    const dim = cl_q.group;
+    const heads = cl_q.x.width / dim;
+    const kv_heads = st_k.src.width / dim;
+    const rel_dim = cl_r.group;
+    const wq = self.bound[cl_q.scale.?];
+    const wr = self.bound[cl_r.scale.?];
+    const keys_cap = self.program.states[st_k.dst].capacity(self.batch, self.context);
+    const vals_cap = self.program.states[st_v.dst].capacity(self.batch, self.context);
+    var can_fuse = self.tap == null and self.relative_half != null and dim == 128 and rel_dim == 16 and
+        wq.quant == null and wq.tensor.dtype.isFloat() and wr.quant == null and wr.tensor.dtype.isFloat() and
+        q.off % 4 == 0 and q.stride % 4 == 0 and r.off % 4 == 0 and r.stride % 4 == 0;
+    var half_k: metal.Buffer = undefined;
+    var half_v: metal.Buffer = undefined;
+    if (can_fuse) {
+        const hs = self.relative_half.?;
+        if (hs[st_k.dst]) |hk| half_k = hk else can_fuse = false;
+        if (hs[st_v.dst]) |hv| half_v = hv else can_fuse = false;
+    }
+    var x: gpu.ParamsX = .{ .p = .{
+        .rows = rows,
+        .row0 = row0,
+        .pos = self.position,
+        .x = q.off,
+        .xs = q.stride,
+        .y = r.off,
+        .ys = r.stride,
+        .heads = heads,
+        .kv_heads = kv_heads,
+        .dim = dim,
+        .rot = rel_dim,
+        .every = keys_cap,
+        .pad_k = vals_cap,
+        .eps = nv.eps,
+    } };
+    x.mat[0] = .{ .w = wq.tensor.offset, .sdtype = @backingInt(wq.tensor.dtype), .m = @bitCast(cl_q.threshold) };
+    x.mat[1] = .{ .w = wr.tensor.offset, .sdtype = @backingInt(wr.tensor.dtype), .m = @bitCast(cl_r.threshold), .pad = @bitCast(cl_k.threshold) };
+
+    if (can_fuse) {
+        if (sconv) {
+            const c_k = ops[i + 1].inkling_short_conv;
+            const c_v = ops[i + 3].inkling_short_conv;
+            const k_ring_cap = self.program.states[c_k.src].capacity(self.batch, self.context);
+            const v_ring_cap = self.program.states[c_v.src].capacity(self.batch, self.context);
+            const kin = self.words(c_k.residual);
+            const vin = self.words(c_v.residual);
+            const wk = self.bound[c_k.weight];
+            const wv = self.bound[c_v.weight];
+            if (wk.quant != null or !wk.tensor.dtype.isFloat() or wv.quant != null or !wv.tensor.dtype.isFloat() or
+                wk.buffer.handle != wv.buffer.handle or wk.buffer.handle != wq.buffer.handle or wk.buffer.handle != wr.buffer.handle or
+                kin.off % 4 != 0 or kin.stride % 4 != 0 or vin.off % 4 != 0 or vin.stride % 4 != 0 or
+                k_ring_cap < c_k.taps or v_ring_cap < c_v.taps or
+                (self.position + row0 != 0 and (k_ring_cap < rows + c_k.taps - 1 or v_ring_cap < rows + c_v.taps - 1)))
+            {
+                can_fuse = false;
+            } else {
+                x.p.taps = c_k.taps;
+                x.p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c_k.taps + 1)));
+                x.mat[2] = .{ .w = wk.tensor.offset, .sdtype = @backingInt(wk.tensor.dtype), .m = k_ring_cap, .y = kin.off, .ys = kin.stride };
+                x.mat[3] = .{ .w = wv.tensor.offset, .sdtype = @backingInt(wv.tensor.dtype), .m = v_ring_cap, .y = vin.off, .ys = vin.stride };
+                const total_threads = @as(usize, rows) * (2 * heads + 2 * kv_heads) * 32;
+                const tg: usize = if (rows == 1) 32 else 128;
+                try gpu.dispatch(self.ctx, "mk_inkling_qkvr_sconv_fused", &.{
+                    self.arena, self.caches[c_k.src].?, self.caches[c_v.src].?,
+                    self.caches[st_k.dst].?, half_k, self.caches[st_v.dst].?, half_v, wk.buffer,
+                }, &x, total_threads, tg);
+            }
+        } else {
+            const ck_v = self.words(cl_k.x);
+            const cv_v = self.words(nv.x);
+            const tau = ops[i + 8].row_transform.transform.log_position_scale;
+            if (ck_v.off % 4 != 0 or ck_v.stride % 4 != 0 or cv_v.off % 4 != 0 or cv_v.stride % 4 != 0) {
+                can_fuse = false;
+            } else {
+                x.p.m = tau.floor;
+                x.p.scale = tau.alpha;
+                x.mat[2] = .{ .y = ck_v.off, .ys = ck_v.stride };
+                x.mat[3] = .{ .y = cv_v.off, .ys = cv_v.stride };
+                const total_threads = @as(usize, rows) * (2 * heads + 2 * kv_heads) * 32;
+                const tg: usize = if (rows == 1) 32 else 128;
+                try gpu.dispatch(self.ctx, "mk_inkling_qkvr_dyn_prep_fused", &.{
+                    self.arena, self.caches[st_k.dst].?, half_k, self.caches[st_v.dst].?, half_v, wq.buffer, wr.buffer,
+                }, &x, total_threads, tg);
+            }
+        }
+    }
+    if (can_fuse) {
+        self.ctx.nano_dispatch_flags = null;
+        const gp_row0 = if (!self.cur_traced and self.tap == null) if (self.op_needs) |needs| @min(row0 + rows, needs[gp_idx].firstRow(self.cur_T, self.cur_out_first, self.knobs.tail_trim)) else row0 else row0;
+        if (gp_row0 < row0 + rows) try self.encode(ops[gp_idx], gp_row0, row0 + rows - gp_row0);
+        return;
+    }
+    self.ctx.nano_dispatch_flags = null;
+    for (0..ops_len) |k| {
+        const op_idx = i + @as(u32, @intCast(k));
+        const r0 = if (!self.cur_traced and self.tap == null) if (self.op_needs) |needs| @min(row0 + rows, needs[op_idx].firstRow(self.cur_T, self.cur_out_first, self.knobs.tail_trim)) else row0 else row0;
+        if (r0 < row0 + rows) try self.encode(ops[op_idx], r0, row0 + rows - r0);
     }
 }
 
@@ -1988,9 +2386,24 @@ fn encodeRelativeStriped(self: *Engine, a: @FieldType(ir.Op, "relative_attention
     if (p.taps > Engine.max_stripe_parts) return false;
     const parts = self.stripe_parts.?;
     if (gate_view != null and !fast) return false;
-    const keys_kernel: [:0]const u8 = if (fast) "mk_relative_long_keys_fast" else "mk_relative_long_keys";
+    const inline_bias: @FieldType(Engine, "inline_bias") = if (self.inline_bias) |ib| blk: {
+        if (ib.state == a.bias.state and ib.row0 == p.row0) {
+            self.inline_bias = null;
+            break :blk ib;
+        }
+        break :blk null;
+    } else null;
+    if (inline_bias != null and !fast) return false;
+    const keys_kernel: [:0]const u8 = if (inline_bias != null) "mk_relative_long_keys_inline_fast" else if (fast) "mk_relative_long_keys_fast" else "mk_relative_long_keys";
     const threads: usize = if (fast) 256 else Engine.stripe_threads;
-    try gpu.dispatch(self.ctx, keys_kernel, &.{ self.arena, half_keys, hs[a.values].?, parts }, p, @as(usize, a.kv_heads) * p.taps * threads, threads);
+    if (inline_bias) |ib| {
+        p.z = ib.r_off;
+        p.zs = ib.r_stride;
+        p.w = ib.w_off;
+        try gpu.dispatch(self.ctx, keys_kernel, &.{ self.arena, half_keys, hs[a.values].?, parts, ib.w_buf }, p, @as(usize, a.kv_heads) * p.taps * threads, threads);
+    } else {
+        try gpu.dispatch(self.ctx, keys_kernel, &.{ self.arena, half_keys, hs[a.values].?, parts }, p, @as(usize, a.kv_heads) * p.taps * threads, threads);
+    }
     const o = self.words(out_view);
     p.y = o.off;
     p.ys = o.stride;
@@ -2224,10 +2637,16 @@ fn d2Encode(self: *Engine, pos: u32, gen: ?u32) !void {
     const saved = self.position;
     self.position = pos;
     defer self.position = saved;
+    self.cur_T = 1;
+    self.cur_out_first = 0;
+    self.cur_traced = false;
     self.prep_key = null;
     self.x2_key = null; // exact prefill's prepared inputs: single-row forwards never use them
     self.expert_routes = null;
+    self.expert_up_bf16 = null;
     self.bias16 = null;
+    self.inline_bias = null;
+    self.force_barrier = false;
     if (gen) |g| {
         if (self.independent_launches != null) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
         defer self.ctx.nano_dispatch_flags = null;
@@ -2237,16 +2656,26 @@ fn d2Encode(self: *Engine, pos: u32, gen: ?u32) !void {
     for (self.steps, 0..) |step, step_i| {
         if (self.independent_launches) |v| {
             // When gated, step 0 needs a barrier after mk_d2_gate_packed before running.
-            if ((gen == null and step_i == 0) or (step_i > 0 and v[step_i])) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
+            if (((gen == null and step_i == 0) or (step_i > 0 and v[step_i])) and !self.force_barrier) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
         }
+        self.force_barrier = false;
         defer self.ctx.nano_dispatch_flags = null;
         switch (step) {
             .op => |i| {
                 const op = self.program.ops[i];
+                self.expert_bf16_out = false;
+                if (self.knobs.expert_bf16_io and op == .expert_gate_up and step_i + 1 < self.steps.len and self.steps[step_i + 1] == .op) {
+                    const next_op = self.program.ops[self.steps[step_i + 1].op];
+                    if (next_op == .expert_down and self.canPairExpertBf16(op.expert_gate_up, next_op.expert_down, 1)) {
+                        self.expert_bf16_out = true;
+                    }
+                }
+                defer self.expert_bf16_out = false;
                 if (gen != null and op == .embed) try d2EncodeEmbed(self, op.embed, gen.?) else try self.encode(op, 0, 1);
             },
             else => {
                 self.expert_routes = null;
+                self.expert_up_bf16 = null;
                 try encodeFused(self, step, 0, 1);
             },
         }

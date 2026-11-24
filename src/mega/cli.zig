@@ -16,7 +16,7 @@ const Knobs = @import("knobs.zig").Knobs;
 const metal = @import("weights").metal;
 const Allocator = std.mem.Allocator;
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 const exact_preset = @embedFile("presets/exact.json");
 const mlx_preset = @embedFile("presets/mlx-prefill.json");
 
