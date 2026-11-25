@@ -2225,3 +2225,289 @@ test "Inkling split expert tiles cover full blocks and tails without writing unu
         };
     }
 }
+
+test "select_halves splits interleaved group halves into contiguous outputs" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const groups: u32 = 4;
+    const half: u32 = 5;
+    const width: u32 = groups * 2 * half;
+    const rows: u32 = 3;
+    const row0: u32 = 1;
+    const arena = try ctx.alloc((rows + row0) * width * 2);
+    defer arena.deinit();
+    const f = arena.floats();
+    @memset(f, -777);
+    for (row0..row0 + rows) |r| {
+        for (0..groups) |g| {
+            for (0..half) |d| {
+                f[r * width + g * (2 * half) + d] = @floatFromInt(r * 1000 + g * 10 + d);
+                f[r * width + g * (2 * half) + half + d] = @floatFromInt(-(@as(i64, @intCast(r * 1000 + g * 10 + d)) + 1));
+            }
+        }
+    }
+    const out_off: u32 = (rows + row0) * width;
+    const p: gpu.Params = .{
+        .rows = rows,
+        .row0 = row0,
+        .x = 0,
+        .xs = width,
+        .y = out_off,
+        .ys = width,
+        .n = width,
+        .m = width / 2,
+        .heads = groups,
+        .dim = half,
+    };
+    try gpu.dispatch(ctx, "mk_select_halves", &.{arena}, &p, @as(usize, rows) * width, 256);
+    try ctx.finish();
+    for (0..width) |c| try testing.expectEqual(@as(f32, -777), f[out_off + c]);
+    for (row0..row0 + rows) |r| {
+        for (0..groups) |g| {
+            for (0..half) |d| {
+                const base = out_off + r * width;
+                try testing.expectEqual(@as(f32, @floatFromInt(r * 1000 + g * 10 + d)), f[base + g * half + d]);
+                try testing.expectEqual(@as(f32, @floatFromInt(-(@as(i64, @intCast(r * 1000 + g * 10 + d)) + 1))), f[base + groups * half + g * half + d]);
+            }
+        }
+    }
+}
+
+test "gated_delta_net matches CPU reference and batched prefill equals 1-by-1 decode" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const hk: u32 = 2;
+    const hv: u32 = 4;
+    const dk: u32 = 128;
+    const dv: u32 = 6;
+    const rows: u32 = 5;
+    const key_dim = hk * dk;
+    const val_dim = hv * dv;
+    const qkv_w = 2 * key_dim + val_dim;
+    const row_w = qkv_w + hv + hv + val_dim;
+    const eps: f32 = 1e-6;
+
+    const a_log_buf = try ctx.alloc(hv);
+    defer a_log_buf.deinit();
+    const dt_bias_buf = try ctx.alloc(hv);
+    defer dt_bias_buf.deinit();
+    const arena = try ctx.alloc(rows * row_w);
+    defer arena.deinit();
+    const st_batch = try ctx.alloc(hv * dv * dk);
+    defer st_batch.deinit();
+    const st_seq = try ctx.alloc(hv * dv * dk);
+    defer st_seq.deinit();
+
+    const a_log_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(a_log_buf.floats()))[0..hv];
+    const dt_bias_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(dt_bias_buf.floats()))[0..hv];
+    var a_log_f64: [4]f64 = undefined;
+    var dt_bias_f64: [4]f64 = undefined;
+    for (0..hv) |h| {
+        const av = bf16(@as(f32, @floatFromInt(h)) * 0.35 - 0.7);
+        const dv_b = bf16(@as(f32, @floatFromInt(h)) * 0.25 - 0.3);
+        a_log_u16[h] = av;
+        dt_bias_u16[h] = dv_b;
+        a_log_f64[h] = @floatCast(fromBf16(av));
+        dt_bias_f64[h] = @floatCast(fromBf16(dv_b));
+    }
+
+    var r = rng(4242);
+    const rand = r.random();
+    const af = arena.floats();
+    for (0..rows) |t| {
+        const base = t * row_w;
+        for (0..qkv_w) |i| af[base + i] = (rand.float(f32) - 0.5) * 0.8;
+        for (0..hv) |h| {
+            af[base + qkv_w + h] = (rand.float(f32) - 0.5) * 3.0;
+            af[base + qkv_w + hv + h] = (rand.float(f32) - 0.5) * 3.0;
+        }
+        @memset(af[base + qkv_w + 2 * hv .. base + row_w], -999);
+    }
+
+    const qkv_off: u32 = 0;
+    const a_off: u32 = qkv_w;
+    const b_off: u32 = qkv_w + hv;
+    const out_off: u32 = qkv_w + 2 * hv;
+    const total_simds = @as(usize, hv) * dv;
+    const total_threads = total_simds * 32;
+
+    @memset(st_batch.floats(), 0);
+    var pb: gpu.Params = .{
+        .rows = rows,
+        .row0 = 0,
+        .x = qkv_off,
+        .xs = row_w,
+        .y = a_off,
+        .ys = row_w,
+        .z = b_off,
+        .zs = row_w,
+        .every = out_off,
+        .pad_k = row_w,
+        .kv_heads = hk,
+        .heads = hv,
+        .dim = dk,
+        .m = dv,
+        .dtype = 2,
+        .sdtype = 2,
+        .eps = eps,
+    };
+    try gpu.dispatch(ctx, "mk_gated_delta_net", &.{ a_log_buf, dt_bias_buf, arena, st_batch }, &pb, total_threads, @min(total_threads, 128));
+    try ctx.finish();
+
+    var batch_out: [rows * val_dim]f32 = undefined;
+    for (0..rows) |t| @memcpy(batch_out[t * val_dim ..][0..val_dim], af[t * row_w + out_off ..][0..val_dim]);
+    for (0..rows) |t| @memset(af[t * row_w + out_off ..][0..val_dim], -999);
+    @memset(st_seq.floats(), 0);
+
+    var seq_out: [rows * val_dim]f32 = undefined;
+    for (0..rows) |t| {
+        var ps = pb;
+        ps.rows = 1;
+        ps.row0 = @intCast(t);
+        try gpu.dispatch(ctx, "mk_gated_delta_net", &.{ a_log_buf, dt_bias_buf, arena, st_seq }, &ps, total_threads, @min(total_threads, 128));
+        try ctx.finish();
+        @memcpy(seq_out[t * val_dim ..][0..val_dim], af[t * row_w + out_off ..][0..val_dim]);
+    }
+
+    try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&batch_out)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&seq_out)));
+    try testing.expectEqualSlices(u32, st_batch.structs(u32), st_seq.structs(u32));
+
+    var cpu_state = try testing.allocator.alloc(f64, hv * dv * dk);
+    defer testing.allocator.free(cpu_state);
+    @memset(cpu_state, 0);
+    for (0..rows) |t| {
+        const base = t * row_w;
+        for (0..hv) |h| {
+            const h_k = h / (hv / hk);
+            var q2: f64 = 0;
+            var k2: f64 = 0;
+            for (0..dk) |i| {
+                const qv: f64 = af[base + h_k * dk + i];
+                const kv: f64 = af[base + key_dim + h_k * dk + i];
+                q2 += qv * qv;
+                k2 += kv * kv;
+            }
+            const q_inv = 1.0 / (@sqrt(q2 + eps) * @sqrt(@as(f64, dk)));
+            const k_inv = 1.0 / @sqrt(k2 + eps);
+            const sp_in: f64 = @as(f64, af[base + a_off + h]) + dt_bias_f64[h];
+            const sp: f64 = if (sp_in > 20.0) sp_in else @log(1.0 + @exp(sp_in));
+            const g: f64 = @exp(-@exp(a_log_f64[h]) * sp);
+            const bv: f64 = af[base + b_off + h];
+            const beta: f64 = 1.0 / (1.0 + @exp(-bv));
+            for (0..dv) |d| {
+                const st_row = cpu_state[(h * dv + d) * dk ..][0..dk];
+                var kv_mem: f64 = 0;
+                for (0..dk) |i| {
+                    st_row[i] *= g;
+                    kv_mem += st_row[i] * (@as(f64, af[base + key_dim + h_k * dk + i]) * k_inv);
+                }
+                const delta = (@as(f64, af[base + 2 * key_dim + h * dv + d]) - kv_mem) * beta;
+                var out_v: f64 = 0;
+                for (0..dk) |i| {
+                    st_row[i] += (@as(f64, af[base + key_dim + h_k * dk + i]) * k_inv) * delta;
+                    out_v += st_row[i] * (@as(f64, af[base + h_k * dk + i]) * q_inv);
+                }
+                try close(out_v, batch_out[t * val_dim + h * dv + d], 1e-5);
+            }
+        }
+    }
+    for (cpu_state, st_batch.floats()) |exp_s, act_s| try close(exp_s, act_s, 1e-5);
+}
+
+test "odd safetensors byte offsets match aligned offsets bit for bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(777);
+    const rand = r.random();
+    const pad: usize = 3;
+
+    // 1. mk_load (BF16 + F32) via mk_rmsnorm
+    const nw: u32 = 32;
+    const nw_f32_aligned = try ctx.alloc(nw);
+    defer nw_f32_aligned.deinit();
+    const nw_f32_odd = try ctx.alloc(nw + 2);
+    defer nw_f32_odd.deinit();
+    const nw_bf16_aligned = try ctx.alloc(nw);
+    defer nw_bf16_aligned.deinit();
+    const nw_bf16_odd = try ctx.alloc(nw + 2);
+    defer nw_bf16_odd.deinit();
+    for (nw_f32_aligned.floats()) |*v| v.* = 0.5 + rand.float(f32);
+    @memcpy(std.mem.sliceAsBytes(nw_f32_odd.floats())[pad..][0 .. nw * 4], std.mem.sliceAsBytes(nw_f32_aligned.floats())[0 .. nw * 4]);
+    const bf_a = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(nw_bf16_aligned.floats()))[0..nw];
+    for (bf_a) |*h| h.* = bf16(0.5 + rand.float(f32));
+    @memcpy(std.mem.sliceAsBytes(nw_bf16_odd.floats())[pad..][0 .. nw * 2], std.mem.sliceAsBytes(nw_bf16_aligned.floats())[0 .. nw * 2]);
+
+    const norm_arena = try ctx.alloc(3 * nw);
+    defer norm_arena.deinit();
+    for (norm_arena.floats()[0..nw]) |*v| v.* = rand.floatNorm(f32);
+    for ([_]u32{ 0, 2 }) |dt| {
+        const wa = if (dt == 0) nw_f32_aligned else nw_bf16_aligned;
+        const wo = if (dt == 0) nw_f32_odd else nw_bf16_odd;
+        var p0: gpu.Params = .{ .rows = 1, .x = 0, .xs = nw, .y = nw, .ys = nw, .n = nw, .heads = 1, .w = 0, .dtype = dt, .flags = gpu.flag_has_weight, .eps = 1e-5 };
+        var p3 = p0;
+        p3.y = 2 * nw;
+        p3.w = pad;
+        try gpu.dispatch(ctx, "mk_rmsnorm", &.{ wa, norm_arena }, &p0, 32, 32);
+        try gpu.dispatch(ctx, "mk_rmsnorm", &.{ wo, norm_arena }, &p3, 32, 32);
+        try ctx.finish();
+        try testing.expectEqualSlices(u32, norm_arena.structs(u32)[nw .. 2 * nw], norm_arena.structs(u32)[2 * nw .. 3 * nw]);
+    }
+
+    // 2. mk_word + mk_load + mk_mlx_sb via mk_linear_q4_r2_t1, mk_mlx_qmm_t, mk_mlx2_qmm
+    const rows: u32 = 8;
+    const m: u32 = 4;
+    const n: u32 = 64;
+    const group: u32 = 32;
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const q = try quantize(ctx, arena_alloc.allocator(), &r, m, n, group);
+    defer {
+        q.w.deinit();
+        q.s.deinit();
+        q.b.deinit();
+    }
+    const w_odd = try ctx.alloc(q.w.floats().len + 2);
+    defer w_odd.deinit();
+    const s_odd = try ctx.alloc(q.s.floats().len + 2);
+    defer s_odd.deinit();
+    const b_odd = try ctx.alloc(q.b.floats().len + 2);
+    defer b_odd.deinit();
+    const w_bytes = m * n / 2;
+    const sb_bytes = m * (n / group) * 2;
+    @memcpy(std.mem.sliceAsBytes(w_odd.floats())[pad..][0..w_bytes], std.mem.sliceAsBytes(q.w.floats())[0..w_bytes]);
+    @memcpy(std.mem.sliceAsBytes(s_odd.floats())[pad..][0..sb_bytes], std.mem.sliceAsBytes(q.s.floats())[0..sb_bytes]);
+    @memcpy(std.mem.sliceAsBytes(b_odd.floats())[pad..][0..sb_bytes], std.mem.sliceAsBytes(q.b.floats())[0..sb_bytes]);
+
+    const x_buf = try ctx.alloc(rows * n + 2 * rows * m);
+    defer x_buf.deinit();
+    const partials = try ctx.alloc(16);
+    defer partials.deinit();
+    for (x_buf.floats()[0 .. rows * n]) |*v| v.* = rand.floatNorm(f32);
+
+    const out0 = rows * n;
+    const out1 = rows * n + rows * m;
+    // q4 fast single-row kernel (mk_word + mk_load)
+    var p_ref: gpu.Params = .{ .rows = 1, .x = 0, .xs = n, .y = out0, .ys = m, .n = n, .m = m, .bits = 4, .group = group, .sdtype = 2, .bdtype = 2 };
+    var p_odd = p_ref;
+    p_odd.w = pad;
+    p_odd.s = pad;
+    p_odd.b = pad;
+    p_odd.y = out1;
+    try gpu.dispatch(ctx, "mk_linear_q4_r2_t1", &.{ q.w, q.s, q.b, x_buf }, &p_ref, ((m + 1) / 2) * 32, 32);
+    try gpu.dispatch(ctx, "mk_linear_q4_r2_t1", &.{ w_odd, s_odd, b_odd, x_buf }, &p_odd, ((m + 1) / 2) * 32, 32);
+    try ctx.finish();
+    try testing.expectEqualSlices(u32, x_buf.structs(u32)[out0 .. out0 + m], x_buf.structs(u32)[out1 .. out1 + m]);
+
+    // mlx + mlx2 multi-row kernels (mk_mlx_sb + bytewise code load)
+    p_ref.rows = rows;
+    p_odd.rows = rows;
+    try gpu.dispatch(ctx, "mk_mlx_qmm_t_bf16_g32", &.{ q.w, q.s, q.b, x_buf, partials }, &p_ref, 128, 128);
+    try gpu.dispatch(ctx, "mk_mlx_qmm_t_bf16_g32", &.{ w_odd, s_odd, b_odd, x_buf, partials }, &p_odd, 128, 128);
+    try ctx.finish();
+    try testing.expectEqualSlices(u32, x_buf.structs(u32)[out0 .. out0 + rows * m], x_buf.structs(u32)[out1 .. out1 + rows * m]);
+
+    try gpu.dispatch(ctx, "mk_mlx2_qmm_bf16_g32", &.{ q.w, q.s, q.b, x_buf }, &p_ref, 64, 64);
+    try gpu.dispatch(ctx, "mk_mlx2_qmm_bf16_g32", &.{ w_odd, s_odd, b_odd, x_buf }, &p_odd, 64, 64);
+    try ctx.finish();
+    try testing.expectEqualSlices(u32, x_buf.structs(u32)[out0 .. out0 + rows * m], x_buf.structs(u32)[out1 .. out1 + rows * m]);
+}

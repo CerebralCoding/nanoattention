@@ -20,6 +20,8 @@ pub const StateKind = enum(u8) {
     /// Readers look back at most `horizon` positions before the row being computed,
     /// so capacity = horizon + batch keeps batch writes off rows an earlier row reads.
     ring,
+    /// Persistent fixed-size recurrent state (one snapshot per layer, zeroed on reset).
+    recurrent,
     /// The host-held number of cached positions. Exactly one per program.
     position,
 };
@@ -33,7 +35,7 @@ pub const State = struct {
     rows: u32 = 0,
 
     pub fn persistent(self: State) bool {
-        return self.kind == .sequence or self.kind == .ring;
+        return self.kind == .sequence or self.kind == .ring or self.kind == .recurrent;
     }
     /// Rows allocated for this state under a given batch and context.
     pub fn capacity(self: State, batch: u32, context: u32) u32 {
@@ -42,6 +44,7 @@ pub const State = struct {
             .scratch => if (self.rows != 0) @min(self.rows, batch) else batch,
             .sequence => context,
             .ring => @min(self.horizon + batch, context),
+            .recurrent => 1,
             .position => 1,
         };
     }
@@ -49,6 +52,7 @@ pub const State = struct {
     pub fn validRows(self: State, batch: u32, context: u32, position: u32) u32 {
         return switch (self.kind) {
             .sequence, .ring => @min(position, self.capacity(batch, context)),
+            .recurrent => if (position > 0) 1 else 0,
             .position => 1,
             else => 0,
         };
@@ -141,6 +145,25 @@ pub const Op = union(enum) {
     expert_gate_up: struct { x: View, routes: View, out: View, bank: PackedProjection, experts: u32, top_k: u32, gate_cap: f32, up_cap: f32, round: Round, input_bf16: bool = false },
     /// Project the selected experts and combine in route order in float32.
     expert_down: struct { x: View, routes: View, out: View, bank: PackedProjection, experts: u32, top_k: u32, round: Round, input_bf16: bool = false },
+    /// Split interleaved `[groups, 2, width]` rows into two contiguous halves
+    /// `[first_halves, second_halves]`.
+    select_halves: struct { x: View, out: View, groups: u32 },
+    /// Gated delta rule linear attention over conv+silu QKV (`[q | k | v]`),
+    /// updating a persistent `[v_heads, v_head_dim, k_head_dim]` recurrent state.
+    gated_delta_net: struct {
+        qkv: View,
+        a: View,
+        b: View,
+        a_log: WeightId,
+        dt_bias: WeightId,
+        state: StateId,
+        out: View,
+        k_heads: u32,
+        v_heads: u32,
+        k_head_dim: u32,
+        v_head_dim: u32,
+        eps: f32 = 1e-6,
+    },
     /// out[r] = lowest index of the maximum of x[r]; all-u32 sentinel on non-finite input.
     argmax: struct { x: View, out: View },
 
@@ -413,6 +436,33 @@ pub const Program = struct {
                 try self.checkExpertViews(e.x, e.routes, e.out, e.experts, e.top_k);
                 if (e.x.width % e.top_k != 0) return error.ShapeMismatch;
                 try self.checkPackedProjection(e.bank, e.experts, e.out.width, e.x.width / e.top_k);
+            },
+            .select_halves => |s| {
+                try self.checkView(s.x, .scratch);
+                try self.checkView(s.out, .scratch);
+                if (s.groups == 0 or s.x.width != s.out.width or s.x.width % (2 * s.groups) != 0) return error.ShapeMismatch;
+                if (s.x.state == s.out.state and s.x.col < s.out.col + s.out.width and s.out.col < s.x.col + s.x.width) return error.ShapeMismatch;
+            },
+            .gated_delta_net => |g| {
+                try self.checkView(g.qkv, .scratch);
+                try self.checkView(g.a, .scratch);
+                try self.checkView(g.b, .scratch);
+                try self.checkView(g.out, .scratch);
+                const st = try self.checkCache(g.state);
+                if (st.kind != .recurrent) return error.InvalidCacheKind;
+                if (g.k_heads == 0 or g.v_heads == 0 or g.k_head_dim == 0 or g.v_head_dim == 0 or
+                    g.v_heads % g.k_heads != 0 or g.k_head_dim > 256 or
+                    !std.math.isFinite(g.eps) or g.eps <= 0) return error.ShapeMismatch;
+                const key_dim = @as(u64, g.k_heads) * g.k_head_dim;
+                const val_dim = @as(u64, g.v_heads) * g.v_head_dim;
+                const state_words = @as(u64, g.v_heads) * g.v_head_dim * g.k_head_dim;
+                if (g.qkv.width != 2 * key_dim + val_dim or g.a.width != g.v_heads or g.b.width != g.v_heads or
+                    g.out.width != val_dim or st.width != state_words) return error.ShapeMismatch;
+                const a_log = try self.weight(g.a_log);
+                const dt_bias = try self.weight(g.dt_bias);
+                if (a_log.raw_dtype != null or dt_bias.raw_dtype != null or
+                    !std.mem.eql(usize, a_log.shape, &.{g.v_heads}) or
+                    !std.mem.eql(usize, dt_bias.shape, &.{g.v_heads})) return error.ShapeMismatch;
             },
             .argmax => |a| {
                 try self.checkView(a.x, .scratch);

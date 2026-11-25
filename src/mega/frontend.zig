@@ -17,6 +17,10 @@ pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []con
     const opts: lfm3.Options = .{ .sliding_visible = options.sliding_visible, .embed_round = options.embed_round };
     if (std.mem.eql(u8, model_type, "lfm3")) return lfm3.build(gpa, config_bytes, checkpoint, opts);
     if (std.mem.eql(u8, model_type, "lfm2")) return lfm2.build(gpa, config_bytes, checkpoint, opts);
+    if (std.mem.eql(u8, model_type, "qwen3_5") or std.mem.eql(u8, model_type, "qwen3_5_text")) {
+        if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedQwen35Options;
+        return @import("qwen3_5.zig").build(gpa, config_bytes, checkpoint);
+    }
     if (std.mem.eql(u8, model_type, "inkling2_loop")) {
         if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedInklingOptions;
         return inkling2_loop.build(gpa, config_bytes);

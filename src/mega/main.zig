@@ -256,9 +256,9 @@ fn inspect(gpa: std.mem.Allocator, a: std.mem.Allocator, directory: []const u8, 
     }
     try io.print(a, "model_type={s} vocab={d} max_context={d} weights={d} states={d} ops={d} head_ops={d} traces={d}\n", .{ program.meta.model_type, program.meta.vocab, program.meta.max_context, program.weights.len, program.states.len, program.ops.len, program.ops.len - program.head_start, program.traces.len });
     for (names.items, counts.items) |name, count| try io.print(a, "  op {s}: {d}\n", .{ name, count });
-    var kinds: [5]u32 = @splat(0);
+    var kinds: [6]u32 = @splat(0);
     for (program.states) |s| kinds[@backingInt(s.kind)] += 1;
-    try io.print(a, "  states: tokens={d} scratch={d} sequence={d} ring={d} position={d}\n", .{ kinds[0], kinds[1], kinds[2], kinds[3], kinds[4] });
+    try io.print(a, "  states: tokens={d} scratch={d} sequence={d} ring={d} recurrent={d} position={d}\n", .{ kinds[0], kinds[1], kinds[2], kinds[3], kinds[4], kinds[5] });
     var bound: usize = 0;
     for (program.weights) |w| {
         _ = try exec.bindWeight(&store, w);
@@ -400,6 +400,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
 test {
     _ = @import("ir.zig");
     _ = @import("lfm3.zig");
+    _ = @import("qwen3_5.zig");
     _ = @import("inkling2_loop.zig");
     _ = @import("packed.zig");
     _ = @import("knobs.zig");

@@ -1,0 +1,16 @@
+{
+ "fuse_projections": true,
+ "fuse_glu": true,
+ "decode_argmax": 1,
+ "batch": 256,
+ "scratch_reuse": true,
+ "head_trim": true,
+ "prefill_mm": true,
+ "mm_rows": 2,
+ "mm_tokens": 8,
+ "mm_half": true,
+ "mlx_linear": true,
+ "mlx_multi": true,
+ "mlx_qmm2": true,
+ "mlx_glu2": true
+}

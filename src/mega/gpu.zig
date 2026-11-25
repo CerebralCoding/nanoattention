@@ -125,7 +125,11 @@ pub fn openSource(src: [:0]const u8) !metal.Context {
 }
 
 pub fn openForModel(model_type: []const u8) !metal.Context {
-    if (std.mem.eql(u8, model_type, "lfm2") or std.mem.eql(u8, model_type, "lfm3")) {
+    if (std.mem.eql(u8, model_type, "lfm2") or
+        std.mem.eql(u8, model_type, "lfm3") or
+        std.mem.eql(u8, model_type, "qwen3_5") or
+        std.mem.eql(u8, model_type, "qwen3_5_text"))
+    {
         return openSource(lfm_source);
     }
     return openSource(source);

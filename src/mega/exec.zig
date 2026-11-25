@@ -216,7 +216,7 @@ pub const Engine = struct {
                     total += @as(usize, s.capacity(batch, context)) * s.width;
                     total = (total + 63) / 64 * 64;
                 },
-                .sequence, .ring => {
+                .sequence, .ring, .recurrent => {
                     const buf = try ctx.alloc(@as(usize, s.capacity(batch, context)) * s.width);
                     @memset(buf.floats(), 0);
                     caches[i] = buf;
@@ -598,6 +598,9 @@ pub const Engine = struct {
     pub fn reset(self: *Engine) void {
         self.d2Settle() catch {
             self.failed = true;
+        };
+        for (self.program.states, self.caches) |s, mb| if (s.kind == .recurrent) {
+            if (mb) |buf| @memset(buf.floats(), 0);
         };
         self.d2_last = null;
         self.position = 0;
@@ -1697,6 +1700,49 @@ pub const Engine = struct {
                 var ep: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .k = e.x.width / e.top_k, .n = e.out.width, .experts = e.experts, .top_k = e.top_k, .round_bf16 = @intFromBool(e.round == .bf16) };
                 try self.expertProjection("mk_expert_down", e.bank, e.x, e.routes, e.out, &ep, e.out.width, e.input_bf16);
             },
+            .select_halves => |s| {
+                const x = self.words(s.x);
+                const o = self.words(s.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = s.x.width;
+                p.m = s.x.width / 2;
+                p.heads = s.groups;
+                p.dim = s.x.width / (2 * s.groups);
+                try gpu.dispatch(self.ctx, "mk_select_halves", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+            },
+            .gated_delta_net => |g| {
+                const qkv = self.words(g.qkv);
+                const a = self.words(g.a);
+                const b = self.words(g.b);
+                const o = self.words(g.out);
+                const a_log = self.bound[g.a_log];
+                const dt_bias = self.bound[g.dt_bias];
+                if (a_log.quant != null or !a_log.tensor.dtype.isFloat() or
+                    dt_bias.quant != null or !dt_bias.tensor.dtype.isFloat()) return error.InvalidGatedDeltaWeight;
+                p.w = a_log.tensor.offset;
+                p.dtype = @backingInt(a_log.tensor.dtype);
+                p.s = dt_bias.tensor.offset;
+                p.sdtype = @backingInt(dt_bias.tensor.dtype);
+                p.x = qkv.off;
+                p.xs = qkv.stride;
+                p.y = a.off;
+                p.ys = a.stride;
+                p.z = b.off;
+                p.zs = b.stride;
+                p.every = o.off;
+                p.pad_k = o.stride;
+                p.kv_heads = g.k_heads;
+                p.heads = g.v_heads;
+                p.dim = g.k_head_dim;
+                p.m = g.v_head_dim;
+                p.eps = g.eps;
+                const total_simds = @as(usize, g.v_heads) * g.v_head_dim;
+                const total_threads = total_simds * 32;
+                try gpu.dispatch(self.ctx, "mk_gated_delta_net", &.{ a_log.buffer, dt_bias.buffer, self.arena, self.caches[g.state].? }, &p, total_threads, @min(total_threads, 128));
+            },
             .argmax => |m| {
                 const x = self.words(m.x);
                 const o = self.words(m.out);
@@ -2624,9 +2670,13 @@ fn d2GatedForward(self: *Engine, token: u32) !void {
 /// keeps at least one row beyond its horizon plus the current row (capacity >=
 /// horizon + 2, i.e. batch >= 2). Otherwise the engine decodes ungated.
 fn d2GateSafe(p: *const ir.Program, batch: u32, context: u32) bool {
-    for (p.states) |st| if (st.kind == .ring) {
-        const cap = st.capacity(batch, context);
-        if (cap < context and cap < st.horizon + 2) return false;
+    for (p.states) |st| switch (st.kind) {
+        .recurrent => return false,
+        .ring => {
+            const cap = st.capacity(batch, context);
+            if (cap < context and cap < st.horizon + 2) return false;
+        },
+        else => {},
     };
     return true;
 }
@@ -2890,7 +2940,7 @@ pub fn rowNeeds(gpa: std.mem.Allocator, p: *const ir.Program) ![]RowNeed {
     const demand = try gpa.alloc(RowNeed, p.states.len);
     defer gpa.free(demand);
     for (p.states, demand) |s, *d| d.* = switch (s.kind) {
-        .sequence => RowNeed.all,
+        .sequence, .recurrent => RowNeed.all,
         .ring => .{ .tail = s.horizon },
         else => .{},
     };
@@ -2903,7 +2953,7 @@ pub fn rowNeeds(gpa: std.mem.Allocator, p: *const ir.Program) ![]RowNeed {
         var write: ?ir.View = null;
         plan.access(op, &reads, &write);
         const row_wise = switch (op) {
-            .embed, .rmsnorm, .linear, .binary, .concat, .activate, .row_transform, .grouped_project, .softcapped_swiglu, .l2_clip, .depth_attention, .inkling_message_merge, .rope, .route_topk, .expert_gate_up, .expert_down, .argmax => true,
+            .embed, .rmsnorm, .linear, .binary, .concat, .activate, .row_transform, .grouped_project, .softcapped_swiglu, .l2_clip, .depth_attention, .inkling_message_merge, .rope, .route_topk, .expert_gate_up, .expert_down, .select_halves, .argmax => true,
             else => false,
         };
         var need: RowNeed = if (write) |w| demand[w.state] else .{};
@@ -2918,6 +2968,10 @@ pub fn rowNeeds(gpa: std.mem.Allocator, p: *const ir.Program) ![]RowNeed {
             .conv => |c| {
                 need = RowNeed.all;
                 demand[c.src] = RowNeed.all;
+            },
+            .gated_delta_net => |g| {
+                need = RowNeed.all;
+                demand[g.state] = RowNeed.all;
             },
             .attention => |a| {
                 need = RowNeed.all;
@@ -2993,7 +3047,7 @@ test "tail_trim: only the last visit's attention output and feed-forward are tri
 /// ops). Every row it still runs keeps its own expression tree.
 pub fn trimmedHead(p: *const ir.Program) u32 {
     var last: ?usize = null;
-    for (p.ops, 0..) |op, i| if (op == .store) {
+    for (p.ops, 0..) |op, i| if (op == .store or op == .gated_delta_net) {
         last = i;
     };
     const t: u32 = if (last) |i| @intCast(i + 1) else 0;
@@ -3373,11 +3427,9 @@ fn mmKernel(comptime base: []const u8, k: Knobs) [:0]const u8 {
 
 pub fn q4Fast(w: weights.Weight, cols: u32) bool {
     const q = w.quant orelse return false;
-    // Even offsets: mk_word reads a 2-aligned code word as two halves; float32
-    // scales and biases (dtype 0) still need 4-byte alignment.
-    const sa: u64 = if (q.scale_dtype == 0) 4 else 2;
-    const ba: u64 = if (q.bias_dtype == 0) 4 else 2;
-    return q.bits == 4 and q.group_size % 16 == 0 and cols % 16 == 0 and w.tensor.offset % 2 == 0 and q.scale_offset % sa == 0 and q.bias_offset % ba == 0;
+    // mk_word and mk_load handle arbitrary byte offsets safely (safetensors
+    // shard data sections can start at odd byte boundaries).
+    return q.bits == 4 and q.group_size % 16 == 0 and cols % 16 == 0;
 }
 
 /// Group size from config.json's MLX "quantization" object (0 = unquantized).
