@@ -34,6 +34,11 @@ pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []con
         if (has_loop_opts) return error.UnsupportedLoopOptions;
         return lfm2.build(gpa, config_bytes, checkpoint, opts);
     }
+    if (std.mem.eql(u8, model_type, "qwen3_5") or std.mem.eql(u8, model_type, "qwen3_5_text")) {
+        if (has_loop_opts) return error.UnsupportedLoopOptions;
+        if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedQwen35Options;
+        return @import("qwen3_5.zig").build(gpa, config_bytes, checkpoint);
+    }
     if (std.mem.eql(u8, model_type, "inkling2_loop")) {
         if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedInklingOptions;
         return inkling2_loop.buildWithOptions(gpa, config_bytes, .{

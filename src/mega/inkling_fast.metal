@@ -350,6 +350,275 @@ kernel void mk_bf16_linear_4x2_softcap_dual_vec8(device const uchar *w [[buffer(
     mk_bf16_softcap_loopcd_impl<true, false>(w, arena, p, gid, lane);
 }
 
+// Coalesced 2-output-row-per-SIMD BF16 linear core for small batches (rows = 2..8).
+// Exact FMA order matches 4x1_vec8 / 4x1_vec / 4x1_softcap bit-for-bit.
+template <bool Wide, bool Softcap>
+inline void mk_bf16_2xR_core(device const uchar *w, ulong w_off, device float *arena,
+                             uint x_off, uint xs, uint y_off, uint ys,
+                             uint row0, uint rows, uint m, uint n, uint row,
+                             bool round_out, float softcap, uint lane) {
+    float acc0[8] = {};
+    float acc1[8] = {};
+    const bool has1 = (row + 1u) < m;
+    const uint xs4 = xs / 4u;
+    device const float4 *xbase = (device const float4 *)(arena + x_off + row0 * xs);
+    if constexpr (Wide) {
+        const uint wstride = n / 8u;
+        device const uint4 *w8 = (device const uint4 *)(w + w_off) + ulong(row) * wstride;
+        for (uint k = lane; k < wstride; k += 32u) {
+            const uint4 raw0 = w8[k];
+            const ushort4 u00(ushort(raw0.x), ushort(raw0.x >> 16), ushort(raw0.y), ushort(raw0.y >> 16));
+            const ushort4 u01(ushort(raw0.z), ushort(raw0.z >> 16), ushort(raw0.w), ushort(raw0.w >> 16));
+            const float4 b00 = as_type<float4>(uint4(u00) << 16);
+            const float4 b01 = as_type<float4>(uint4(u01) << 16);
+            float4 b10 = float4(0.0f), b11 = float4(0.0f);
+            if (has1) {
+                const uint4 raw1 = w8[wstride + k];
+                const ushort4 u10(ushort(raw1.x), ushort(raw1.x >> 16), ushort(raw1.y), ushort(raw1.y >> 16));
+                const ushort4 u11(ushort(raw1.z), ushort(raw1.z >> 16), ushort(raw1.w), ushort(raw1.w >> 16));
+                b10 = as_type<float4>(uint4(u10) << 16);
+                b11 = as_type<float4>(uint4(u11) << 16);
+            }
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                if (r < rows) {
+                    const float4 a0 = xbase[ulong(r) * xs4 + 2u * k];
+                    const float4 a1 = xbase[ulong(r) * xs4 + 2u * k + 1u];
+                    acc0[r] = fma(a0.x, b00.x, fma(a0.y, b00.y, fma(a0.z, b00.z, fma(a0.w, b00.w, acc0[r]))));
+                    acc0[r] = fma(a1.x, b01.x, fma(a1.y, b01.y, fma(a1.z, b01.z, fma(a1.w, b01.w, acc0[r]))));
+                    if (has1) {
+                        acc1[r] = fma(a0.x, b10.x, fma(a0.y, b10.y, fma(a0.z, b10.z, fma(a0.w, b10.w, acc1[r]))));
+                        acc1[r] = fma(a1.x, b11.x, fma(a1.y, b11.y, fma(a1.z, b11.z, fma(a1.w, b11.w, acc1[r]))));
+                    }
+                }
+            }
+        }
+    } else {
+        const uint stride = n / 4u;
+        device const ushort4 *w4 = (device const ushort4 *)(w + w_off) + ulong(row) * stride;
+        for (uint k = lane; k < stride; k += 32u) {
+            const float4 b0 = as_type<float4>(uint4(w4[k]) << 16);
+            const float4 b1 = has1 ? as_type<float4>(uint4(w4[stride + k]) << 16) : float4(0.0f);
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                if (r < rows) {
+                    const float4 a = xbase[ulong(r) * xs4 + k];
+                    #pragma unroll
+                    for (uint i = 0u; i < 4u; ++i) {
+                        acc0[r] = fma(a[i], b0[i], acc0[r]);
+                        if (has1) acc1[r] = fma(a[i], b1[i], acc1[r]);
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0u; r < 8u; ++r) {
+        if (r < rows) {
+            const float s0 = simd_sum(acc0[r]);
+            const float s1 = has1 ? simd_sum(acc1[r]) : 0.0f;
+            if (lane == 0u) {
+                device float *dst = arena + y_off + ulong(row0 + r) * ys + row;
+                if constexpr (Softcap) {
+                    const float v0 = mk_bf16(s0);
+                    dst[0] = tanh(v0 / softcap) * softcap;
+                    if (has1) {
+                        const float v1 = mk_bf16(s1);
+                        dst[1] = tanh(v1 / softcap) * softcap;
+                    }
+                } else {
+                    dst[0] = round_out ? mk_bf16(s0) : s0;
+                    if (has1) dst[1] = round_out ? mk_bf16(s1) : s1;
+                }
+            }
+        }
+    }
+}
+
+kernel void mk_bf16_linear_2xR_vec(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                   constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = (gid / 32u) * 2u;
+    if (row >= p.m) return;
+    mk_bf16_2xR_core<false, false>(w, p.w, arena, p.x, p.xs, p.y, p.ys, p.row0, p.rows, p.m, p.n, row, (p.flags & MK_ROUND_OUT) != 0u, 0.0f, lane);
+}
+
+kernel void mk_bf16_linear_2xR_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                    constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = (gid / 32u) * 2u;
+    if (row >= p.m) return;
+    mk_bf16_2xR_core<true, false>(w, p.w, arena, p.x, p.xs, p.y, p.ys, p.row0, p.rows, p.m, p.n, row, (p.flags & MK_ROUND_OUT) != 0u, 0.0f, lane);
+}
+
+kernel void mk_bf16_linear_2xR_softcap(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                       constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = (gid / 32u) * 2u;
+    if (row >= p.m) return;
+    mk_bf16_2xR_core<false, true>(w, p.w, arena, p.x, p.xs, p.y, p.ys, p.row0, p.rows, p.m, p.n, row, false, p.scale, lane);
+}
+
+kernel void mk_bf16_linear_2xR_softcap_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                            constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                            uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = (gid / 32u) * 2u;
+    if (row >= p.m) return;
+    mk_bf16_2xR_core<true, true>(w, p.w, arena, p.x, p.xs, p.y, p.ys, p.row0, p.rows, p.m, p.n, row, false, p.scale, lane);
+}
+
+template <bool Wide>
+inline void mk_multi_bf16_2xR_impl(device const uchar *w, device float *arena, constant MKX &x, uint gid, uint lane) {
+    constant MK &p = x.p;
+    const uint p1 = x.mat[0].m >> 1;
+    const uint p2 = p1 + (x.count > 1u ? (x.mat[1].m >> 1) : 0u);
+    const uint p3 = p2 + (x.count > 2u ? (x.mat[2].m >> 1) : 0u);
+    const uint p4 = p3 + (x.count > 3u ? (x.mat[3].m >> 1) : 0u);
+    const uint p5 = p4 + (x.count > 4u ? (x.mat[4].m >> 1) : 0u);
+    const uint total = p5 + (x.count > 5u ? (x.mat[5].m >> 1) : 0u);
+    const uint simd = gid / 32u;
+    if (simd >= total) return;
+    const uint which = inkling_multi_proj_index(simd, p1, p2, p3, p4, p5);
+    const uint loc = inkling_multi_proj_local_tile(simd, p1, p2, p3, p4, p5);
+    constant MKMat &mat = x.mat[which];
+    const uint row = loc * 2u;
+    const bool round_out = ((x.kind >> which) & 1u) != 0u;
+    mk_bf16_2xR_core<Wide, false>(w, mat.w, arena, p.x, p.xs, mat.y, mat.ys, p.row0, p.rows, mat.m, p.n, row, round_out, 0.0f, lane);
+}
+
+kernel void mk_multi_bf16_2xR_vec(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                  constant MKX &x [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    mk_multi_bf16_2xR_impl<false>(w, arena, x, gid, lane);
+}
+
+kernel void mk_multi_bf16_2xR_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                   constant MKX &x [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    mk_multi_bf16_2xR_impl<true>(w, arena, x, gid, lane);
+}
+
+// Low-register 1-output-row-per-SIMD BF16 linear core for small batches (rows = 2..8).
+// Preserves exact 4x1_vec8 FMA order bit-for-bit with 8x fewer accumulators/row than 4xR_tg and 4x higher grid parallelism.
+template <bool Full8>
+inline void mk_bf16_1xR_vec8_core(device const uchar *w, ulong w_off, device float *arena,
+                                  uint x_off, uint xs, uint y_off, uint ys,
+                                  uint row0, uint rows, uint n, uint row,
+                                  bool round_out, uint lane) {
+    float acc[8] = {};
+    const uint xs4 = xs / 4u;
+    const uint wstride = n / 8u;
+    device const uint4 *w8 = (device const uint4 *)(w + w_off) + ulong(row) * wstride;
+    device const float4 *xbase = (device const float4 *)(arena + x_off + ulong(row0) * xs);
+    for (uint k = lane; k < wstride; k += 32u) {
+        const uint4 raw = w8[k];
+        const ushort4 u0(ushort(raw.x), ushort(raw.x >> 16), ushort(raw.y), ushort(raw.y >> 16));
+        const ushort4 u1(ushort(raw.z), ushort(raw.z >> 16), ushort(raw.w), ushort(raw.w >> 16));
+        const float4 b0 = as_type<float4>(uint4(u0) << 16);
+        const float4 b1 = as_type<float4>(uint4(u1) << 16);
+        #pragma unroll
+        for (uint r = 0u; r < 8u; ++r) {
+            if (Full8 || r < rows) {
+                const float4 a0 = xbase[ulong(r) * xs4 + 2u * k];
+                const float4 a1 = xbase[ulong(r) * xs4 + 2u * k + 1u];
+                acc[r] = fma(a0.x, b0.x, fma(a0.y, b0.y, fma(a0.z, b0.z, fma(a0.w, b0.w, acc[r]))));
+                acc[r] = fma(a1.x, b1.x, fma(a1.y, b1.y, fma(a1.z, b1.z, fma(a1.w, b1.w, acc[r]))));
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0u; r < 8u; ++r) {
+        if (Full8 || r < rows) {
+            const float s = simd_sum(acc[r]);
+            if (lane == 0u) arena[y_off + ulong(row0 + r) * ys + row] = round_out ? mk_bf16(s) : s;
+        }
+    }
+}
+
+kernel void mk_bf16_linear_1xR_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                    constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = gid / 32u;
+    if (row >= p.m) return;
+    if (p.rows == 8u) {
+        mk_bf16_1xR_vec8_core<true>(w, p.w, arena, p.x, p.xs, p.y, p.ys, p.row0, 8u, p.n, row, (p.flags & MK_ROUND_OUT) != 0u, lane);
+    } else {
+        mk_bf16_1xR_vec8_core<false>(w, p.w, arena, p.x, p.xs, p.y, p.ys, p.row0, p.rows, p.n, row, (p.flags & MK_ROUND_OUT) != 0u, lane);
+    }
+}
+
+kernel void mk_multi_bf16_1xR_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                   constant MKX &x [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    constant MK &p = x.p;
+    const uint p1 = x.mat[0].m;
+    const uint p2 = p1 + (x.count > 1u ? x.mat[1].m : 0u);
+    const uint p3 = p2 + (x.count > 2u ? x.mat[2].m : 0u);
+    const uint p4 = p3 + (x.count > 3u ? x.mat[3].m : 0u);
+    const uint p5 = p4 + (x.count > 4u ? x.mat[4].m : 0u);
+    const uint total = p5 + (x.count > 5u ? x.mat[5].m : 0u);
+    const uint simd_id = gid / 32u;
+    if (simd_id >= total) return;
+    const uint which = inkling_multi_proj_index(simd_id, p1, p2, p3, p4, p5);
+    const uint row = inkling_multi_proj_local_tile(simd_id, p1, p2, p3, p4, p5);
+    constant MKMat &mat = x.mat[which];
+    const bool round_out = ((x.kind >> which) & 1u) != 0u;
+    if (p.rows == 8u) {
+        mk_bf16_1xR_vec8_core<true>(w, mat.w, arena, p.x, p.xs, mat.y, mat.ys, p.row0, 8u, p.n, row, round_out, lane);
+    } else {
+        mk_bf16_1xR_vec8_core<false>(w, mat.w, arena, p.x, p.xs, mat.y, mat.ys, p.row0, p.rows, p.n, row, round_out, lane);
+    }
+}
+
+// 1-output-row-per-TG Split-K small-M BF16 linear (8 SIMDs = 256 threads per output row, rows <= 8).
+kernel void mk_bf16_linear_splitk_rows(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                       constant MK &p [[buffer(8)]], uint row [[threadgroup_position_in_grid]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint simd [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= p.m) return;
+    const uint stride = p.n / 4u;
+    const uint xs4 = p.xs / 4u;
+    device const ushort4 *weights = (device const ushort4 *)(w + p.w) + ulong(row) * stride;
+    device const float4 *xbase = (device const float4 *)(arena + p.x + ulong(p.row0) * p.xs);
+    float acc[8] = {};
+    if (p.rows == 8u) {
+        for (uint k = tid; k < stride; k += INKLING_SPLITK_THREADS) {
+            const float4 b = as_type<float4>(uint4(weights[k]) << 16);
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                const float4 a = xbase[ulong(r) * xs4 + k];
+                acc[r] = fma(a.w, b.w, fma(a.z, b.z, fma(a.y, b.y, fma(a.x, b.x, acc[r]))));
+            }
+        }
+    } else {
+        for (uint k = tid; k < stride; k += INKLING_SPLITK_THREADS) {
+            const float4 b = as_type<float4>(uint4(weights[k]) << 16);
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                if (r < p.rows) {
+                    const float4 a = xbase[ulong(r) * xs4 + k];
+                    acc[r] = fma(a.w, b.w, fma(a.z, b.z, fma(a.y, b.y, fma(a.x, b.x, acc[r]))));
+                }
+            }
+        }
+    }
+    threadgroup float partials[8][INKLING_SPLITK_SIMDS];
+    #pragma unroll
+    for (uint r = 0u; r < 8u; ++r) {
+        if (r < p.rows) {
+            const float s = simd_sum(acc[r]);
+            if (lane == 0u) partials[r][simd] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd < p.rows) {
+        const uint r = simd;
+        const float total = simd_sum(lane < INKLING_SPLITK_SIMDS ? partials[r][lane] : 0.0f);
+        if (lane == 0u) arena[p.y + ulong(p.row0 + r) * p.ys + row] = (p.flags & MK_ROUND_OUT) ? mk_bf16(total) : total;
+    }
+}
+
 // ---- Step 3C kernels: depth attention, depth+norm fusions, rmsnorm_fast, add_norm, store_pack, conv, l2_clip, relbias ----
 constant uint MK_INKLING_ROUND_RES = 64u;
 
@@ -797,35 +1066,44 @@ static constant half2 mk_fp4_pair_h2_lut[256] = {
 };
 
 template <bool Lut>
-inline float mk_nvfp4_dot16(uint2 raw, float4 x0, float4 x1, float4 x2, float4 x3) {
+inline void mk_nvfp4_decode16(uint2 raw, thread float4 &d0, thread float4 &d1, thread float4 &d2, thread float4 &d3) {
     if constexpr (Lut) {
         const uchar4 a0 = as_type<uchar4>(raw.x), a1 = as_type<uchar4>(raw.y);
-        const float4 d0 = float4(half4(mk_fp4_pair_h2_lut[a0[0]], mk_fp4_pair_h2_lut[a0[1]]));
-        const float4 d1 = float4(half4(mk_fp4_pair_h2_lut[a0[2]], mk_fp4_pair_h2_lut[a0[3]]));
-        const float4 d2 = float4(half4(mk_fp4_pair_h2_lut[a1[0]], mk_fp4_pair_h2_lut[a1[1]]));
-        const float4 d3 = float4(half4(mk_fp4_pair_h2_lut[a1[2]], mk_fp4_pair_h2_lut[a1[3]]));
-        return dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3);
+        d0 = float4(half4(mk_fp4_pair_h2_lut[a0[0]], mk_fp4_pair_h2_lut[a0[1]]));
+        d1 = float4(half4(mk_fp4_pair_h2_lut[a0[2]], mk_fp4_pair_h2_lut[a0[3]]));
+        d2 = float4(half4(mk_fp4_pair_h2_lut[a1[0]], mk_fp4_pair_h2_lut[a1[1]]));
+        d3 = float4(half4(mk_fp4_pair_h2_lut[a1[2]], mk_fp4_pair_h2_lut[a1[3]]));
     } else {
-        const float4 d0 = inkling_nvfp4_decode4(raw.x);
-        const float4 d1 = inkling_nvfp4_decode4(raw.x >> 16);
-        const float4 d2 = inkling_nvfp4_decode4(raw.y);
-        const float4 d3 = inkling_nvfp4_decode4(raw.y >> 16);
-        return dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3);
+        d0 = inkling_nvfp4_decode4(raw.x);
+        d1 = inkling_nvfp4_decode4(raw.x >> 16);
+        d2 = inkling_nvfp4_decode4(raw.y);
+        d3 = inkling_nvfp4_decode4(raw.y >> 16);
+    }
+}
+
+template <bool Lut>
+inline float mk_nvfp4_dot16(uint2 raw, float4 x0, float4 x1, float4 x2, float4 x3) {
+    float4 d0, d1, d2, d3;
+    mk_nvfp4_decode16<Lut>(raw, d0, d1, d2, d3);
+    return dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3);
+}
+
+template <bool Lut>
+inline float4 mk_e4m3x4_decode(uint packed) {
+    if constexpr (Lut) {
+        const uchar4 b = as_type<uchar4>(packed);
+        return float4(mk_e4m3_f32_lut[b[0]], mk_e4m3_f32_lut[b[1]], mk_e4m3_f32_lut[b[2]], mk_e4m3_f32_lut[b[3]]);
+    } else {
+        return float4(mk_expert_e4m3(uchar(packed)),
+                      mk_expert_e4m3(uchar(packed >> 8)),
+                      mk_expert_e4m3(uchar(packed >> 16)),
+                      mk_expert_e4m3(uchar(packed >> 24)));
     }
 }
 
 template <bool Lut>
 inline float mk_e4m3x4_dot(uint packed, float4 xv) {
-    if constexpr (Lut) {
-        const uchar4 b = as_type<uchar4>(packed);
-        return dot(float4(mk_e4m3_f32_lut[b[0]], mk_e4m3_f32_lut[b[1]], mk_e4m3_f32_lut[b[2]], mk_e4m3_f32_lut[b[3]]), xv);
-    } else {
-        const float4 wv(mk_expert_e4m3(uchar(packed)),
-                        mk_expert_e4m3(uchar(packed >> 8)),
-                        mk_expert_e4m3(uchar(packed >> 16)),
-                        mk_expert_e4m3(uchar(packed >> 24)));
-        return dot(wv, xv);
-    }
+    return dot(mk_e4m3x4_decode<Lut>(packed), xv);
 }
 
 // 16-lane sub-SIMD NVFP4 gate+up decode: 2 pairs (4 rows) per sub-SIMD, 8 rows per SIMD.
@@ -1112,6 +1390,591 @@ MK_EXPERT_MX_DOWN(mk_expert_down_mx_bf16, false, true)
 MK_EXPERT_MX_DOWN(mk_expert_down_mx_lut_bf16, true, true)
 #undef MK_EXPERT_MX_DOWN
 
+// ---- Exact 0-ULP grouped MoE kernels for rows = 2..8 (consumes mk_expert_group_tiles) ----
+template <bool Lut, bool Bf16Out>
+inline void mk_expert_grouped_up_nv16_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                           device const uchar *amax, device const uchar *denom,
+                                           device const uint *lists, constant MKExpert &p,
+                                           uint gid, uint lane) {
+    const uint cols4 = p.n / 4u;
+    const uint simd_id = gid / 32u;
+    const uint tile_idx = simd_id / cols4;
+    const uint tile_count = lists[p.experts + 1u];
+    if (tile_idx >= tile_count) return;
+    const uint sub = lane >> 4;
+    const uint l16 = lane & 15u;
+    const uint j = (simd_id % cols4) * 4u + sub * 2u;
+
+    const uint total = p.rows * p.top_k;
+    device const uint *expert_off = lists;
+    device const uint *sorted_routes = lists + p.experts + 2u;
+    device const uint *tile_e = sorted_routes + total;
+    const uint expert = tile_e[tile_idx];
+    const uint off = expert_off[expert];
+    const uint count = expert_off[expert + 1u] - off;
+    device const uint *entries = sorted_routes + off;
+
+    const ulong base = (ulong(expert) * p.n + j) * 2u * p.k;
+    device const uint2 *wp = (device const uint2 *)(w + p.w + base / 2u);
+    device const uchar *sp = s + p.s + base / 16u;
+    const uint wstep = p.k / 16u;
+    const uint sstep = p.k / 16u;
+    const float outer = mk_load(amax, p.amax, 0u, expert) / mk_load(denom, p.denominator, 0u, 0u);
+
+    if (count == 1u) {
+        const uint route = entries[0];
+        const uint tok_row = p.row0 + route / p.top_k;
+        const uint slot = route % p.top_k;
+        device const float4 *xp = (device const float4 *)(arena + p.x + tok_row * p.xs);
+        float4 acc = 0.0f;
+        for (uint k4 = l16 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD_LANES * 4u) {
+            const float4 x0 = xp[k4], x1 = xp[k4 + 1u], x2 = xp[k4 + 2u], x3 = xp[k4 + 3u];
+            const uint b = k4 / 4u;
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                const float d = mk_nvfp4_dot16<Lut>(wp[b + c * wstep], x0, x1, x2, x3);
+                acc[c] = fma(d, sc, acc[c]);
+            }
+        }
+        #pragma unroll
+        for (uint c = 0u; c < 4u; ++c) {
+            acc[c] += simd_shuffle_xor(acc[c], ushort(8));
+            acc[c] += simd_shuffle_xor(acc[c], ushort(4));
+            acc[c] += simd_shuffle_xor(acc[c], ushort(2));
+            acc[c] += simd_shuffle_xor(acc[c], ushort(1));
+        }
+        if (l16 == 0u) {
+            acc *= outer;
+            device float *out = arena + p.y + tok_row * p.ys + slot * p.n + j;
+            device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + tok_row * p.ys) + slot * p.n + j;
+            for (uint c = 0u; c < 2u; ++c) {
+                float gate = acc[c * 2u], up = acc[c * 2u + 1u];
+                if (p.round_bf16) { gate = mk_bf16(gate); up = mk_bf16(up); }
+                const float value = ((tanh(gate / p.gate_cap) * p.gate_cap) * mk_sigmoid(gate)) * (tanh(up / p.up_cap) * p.up_cap);
+                if constexpr (Bf16Out) out16[c] = bfloat(p.round_bf16 ? mk_bf16(value) : value);
+                else out[c] = p.round_bf16 ? mk_bf16(value) : value;
+            }
+        }
+        return;
+    }
+
+    if (count == 2u) {
+        const uint r0 = entries[0], r1 = entries[1];
+        const uint tr0 = p.row0 + r0 / p.top_k, sl0 = r0 % p.top_k;
+        const uint tr1 = p.row0 + r1 / p.top_k, sl1 = r1 % p.top_k;
+        device const float4 *xp0 = (device const float4 *)(arena + p.x + tr0 * p.xs);
+        device const float4 *xp1 = (device const float4 *)(arena + p.x + tr1 * p.xs);
+        float4 acc0 = 0.0f, acc1 = 0.0f;
+        for (uint k4 = l16 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD_LANES * 4u) {
+            const float4 x00 = xp0[k4], x01 = xp0[k4 + 1u], x02 = xp0[k4 + 2u], x03 = xp0[k4 + 3u];
+            const float4 x10 = xp1[k4], x11 = xp1[k4 + 1u], x12 = xp1[k4 + 2u], x13 = xp1[k4 + 3u];
+            const uint b = k4 / 4u;
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                float4 d0, d1, d2, d3;
+                mk_nvfp4_decode16<Lut>(wp[b + c * wstep], d0, d1, d2, d3);
+                acc0[c] = fma(dot(d0, x00) + dot(d1, x01) + dot(d2, x02) + dot(d3, x03), sc, acc0[c]);
+                acc1[c] = fma(dot(d0, x10) + dot(d1, x11) + dot(d2, x12) + dot(d3, x13), sc, acc1[c]);
+            }
+        }
+        #pragma unroll
+        for (uint c = 0u; c < 4u; ++c) {
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(8));
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(4));
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(2));
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(1));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(8));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(4));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(2));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(1));
+        }
+        if (l16 == 0u) {
+            acc0 *= outer;
+            acc1 *= outer;
+            const uint trs[2] = { tr0, tr1 }, sls[2] = { sl0, sl1 };
+            const float4 vals[2] = { acc0, acc1 };
+            for (uint ti = 0u; ti < 2u; ++ti) {
+                device float *out = arena + p.y + trs[ti] * p.ys + sls[ti] * p.n + j;
+                device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + trs[ti] * p.ys) + sls[ti] * p.n + j;
+                for (uint c = 0u; c < 2u; ++c) {
+                    float gate = vals[ti][c * 2u], up = vals[ti][c * 2u + 1u];
+                    if (p.round_bf16) { gate = mk_bf16(gate); up = mk_bf16(up); }
+                    const float value = ((tanh(gate / p.gate_cap) * p.gate_cap) * mk_sigmoid(gate)) * (tanh(up / p.up_cap) * p.up_cap);
+                    if constexpr (Bf16Out) out16[c] = bfloat(p.round_bf16 ? mk_bf16(value) : value);
+                    else out[c] = p.round_bf16 ? mk_bf16(value) : value;
+                }
+            }
+        }
+        return;
+    }
+
+    for (uint t0 = 0u; t0 < count; t0 += 4u) {
+        const uint n_cur = min(4u, count - t0);
+        device const float4 *xp_t[4];
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            const uint route = entries[t0 + min(ti, n_cur - 1u)];
+            xp_t[ti] = (device const float4 *)(arena + p.x + (p.row0 + route / p.top_k) * p.xs);
+        }
+        float4 acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint k4 = l16 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD_LANES * 4u) {
+            const uint b = k4 / 4u;
+            uint2 raw[4];
+            float sc[4];
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uchar sc_code = sp[b + c * sstep];
+                sc[c] = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                raw[c] = wp[b + c * wstep];
+            }
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    const float4 x0 = xp_t[ti][k4], x1 = xp_t[ti][k4 + 1u], x2 = xp_t[ti][k4 + 2u], x3 = xp_t[ti][k4 + 3u];
+                    #pragma unroll
+                    for (uint c = 0u; c < 4u; ++c) {
+                        acc[ti][c] = fma(mk_nvfp4_dot16<Lut>(raw[c], x0, x1, x2, x3), sc[c], acc[ti][c]);
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            if (ti < n_cur) {
+                #pragma unroll
+                for (uint c = 0u; c < 4u; ++c) {
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(8));
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(4));
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(2));
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(1));
+                }
+            }
+        }
+        if (l16 == 0u) {
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    const uint route = entries[t0 + ti];
+                    const uint tok_row = p.row0 + route / p.top_k;
+                    const uint slot = route % p.top_k;
+                    const float4 v = acc[ti] * outer;
+                    device float *out = arena + p.y + tok_row * p.ys + slot * p.n + j;
+                    device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + tok_row * p.ys) + slot * p.n + j;
+                    for (uint c = 0u; c < 2u; ++c) {
+                        float gate = v[c * 2u], up = v[c * 2u + 1u];
+                        if (p.round_bf16) { gate = mk_bf16(gate); up = mk_bf16(up); }
+                        const float value = ((tanh(gate / p.gate_cap) * p.gate_cap) * mk_sigmoid(gate)) * (tanh(up / p.up_cap) * p.up_cap);
+                        if constexpr (Bf16Out) out16[c] = bfloat(p.round_bf16 ? mk_bf16(value) : value);
+                        else out[c] = p.round_bf16 ? mk_bf16(value) : value;
+                    }
+                }
+            }
+        }
+    }
+}
+
+inline void mk_expert_grouped_down_store_weighted(device const float *arena, device float *partial,
+                                                  constant MKExpert &p, uint route, uint j, float4 acc) {
+    const uint tok_row = p.row0 + route / p.top_k;
+    const uint slot = route % p.top_k;
+    const float rw = arena[p.routes + tok_row * p.rs + p.top_k + slot];
+    acc *= rw;
+    reinterpret_cast<device float4 *>(partial)[ulong(route) * (p.n / 4u) + (j / 4u)] = acc;
+}
+
+template <bool Lut, bool Bf16Io>
+inline void mk_expert_grouped_down_nv8_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                            device const uchar *amax, device const uchar *denom,
+                                            device const uint *lists, device float *partial,
+                                            constant MKExpert &p, uint gid) {
+    const uint cols4 = p.n / 4u;
+    const uint sub8_id = gid >> 3;
+    const uint l8 = gid & 7u;
+    const uint tile_idx = sub8_id / cols4;
+    const uint tile_count = lists[p.experts + 1u];
+    if (tile_idx >= tile_count) return;
+    const uint j = (sub8_id % cols4) * 4u;
+
+    const uint total = p.rows * p.top_k;
+    device const uint *expert_off = lists;
+    device const uint *sorted_routes = lists + p.experts + 2u;
+    device const uint *tile_e = sorted_routes + total;
+    const uint expert = tile_e[tile_idx];
+    const uint off = expert_off[expert];
+    const uint count = expert_off[expert + 1u] - off;
+    device const uint *entries = sorted_routes + off;
+
+    const ulong base = (ulong(expert) * p.n + j) * p.k;
+    device const uint2 *wp = (device const uint2 *)(w + p.w + base / 2u);
+    device const uchar *sp = s + p.s + base / 16u;
+    const uint wstep = p.k / 16u;
+    const uint sstep = p.k / 16u;
+    const float outer = mk_load(amax, p.amax, 0u, expert) / mk_load(denom, p.denominator, 0u, 0u);
+
+    if (count == 1u) {
+        const uint route = entries[0];
+        const uint tok_row = p.row0 + route / p.top_k, slot = route % p.top_k;
+        device const float4 *xp = Bf16Io ? nullptr : (device const float4 *)(arena + p.x + tok_row * p.xs + slot * p.k);
+        device const bfloat4 *xp16 = Bf16Io ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + tok_row * p.xs) + (slot * p.k) / 4u) : nullptr;
+        float4 acc = 0.0f;
+        for (uint k4 = l8 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD8_LANES * 4u) {
+            const float4 x0 = Bf16Io ? float4(xp16[k4]) : xp[k4];
+            const float4 x1 = Bf16Io ? float4(xp16[k4 + 1u]) : xp[k4 + 1u];
+            const float4 x2 = Bf16Io ? float4(xp16[k4 + 2u]) : xp[k4 + 2u];
+            const float4 x3 = Bf16Io ? float4(xp16[k4 + 3u]) : xp[k4 + 3u];
+            const uint b = k4 / 4u;
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                acc[c] = fma(mk_nvfp4_dot16<Lut>(wp[b + c * wstep], x0, x1, x2, x3), sc, acc[c]);
+            }
+        }
+        #pragma unroll
+        for (uint c = 0u; c < 4u; ++c) {
+            acc[c] += simd_shuffle_xor(acc[c], ushort(4));
+            acc[c] += simd_shuffle_xor(acc[c], ushort(2));
+            acc[c] += simd_shuffle_xor(acc[c], ushort(1));
+        }
+        if (l8 == 0u) {
+            acc *= outer;
+            if (p.round_bf16) for (uint c = 0u; c < 4u; ++c) acc[c] = mk_bf16(acc[c]);
+            mk_expert_grouped_down_store_weighted(arena, partial, p, route, j, acc);
+        }
+        return;
+    }
+
+    if (count == 2u) {
+        const uint r0 = entries[0], r1 = entries[1];
+        const uint tr0 = p.row0 + r0 / p.top_k, sl0 = r0 % p.top_k;
+        const uint tr1 = p.row0 + r1 / p.top_k, sl1 = r1 % p.top_k;
+        device const float4 *xp0 = Bf16Io ? nullptr : (device const float4 *)(arena + p.x + tr0 * p.xs + sl0 * p.k);
+        device const float4 *xp1 = Bf16Io ? nullptr : (device const float4 *)(arena + p.x + tr1 * p.xs + sl1 * p.k);
+        device const bfloat4 *xp16_0 = Bf16Io ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + tr0 * p.xs) + (sl0 * p.k) / 4u) : nullptr;
+        device const bfloat4 *xp16_1 = Bf16Io ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + tr1 * p.xs) + (sl1 * p.k) / 4u) : nullptr;
+        float4 acc0 = 0.0f, acc1 = 0.0f;
+        for (uint k4 = l8 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD8_LANES * 4u) {
+            const float4 x00 = Bf16Io ? float4(xp16_0[k4]) : xp0[k4];
+            const float4 x01 = Bf16Io ? float4(xp16_0[k4 + 1u]) : xp0[k4 + 1u];
+            const float4 x02 = Bf16Io ? float4(xp16_0[k4 + 2u]) : xp0[k4 + 2u];
+            const float4 x03 = Bf16Io ? float4(xp16_0[k4 + 3u]) : xp0[k4 + 3u];
+            const float4 x10 = Bf16Io ? float4(xp16_1[k4]) : xp1[k4];
+            const float4 x11 = Bf16Io ? float4(xp16_1[k4 + 1u]) : xp1[k4 + 1u];
+            const float4 x12 = Bf16Io ? float4(xp16_1[k4 + 2u]) : xp1[k4 + 2u];
+            const float4 x13 = Bf16Io ? float4(xp16_1[k4 + 3u]) : xp1[k4 + 3u];
+            const uint b = k4 / 4u;
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                float4 d0, d1, d2, d3;
+                mk_nvfp4_decode16<Lut>(wp[b + c * wstep], d0, d1, d2, d3);
+                acc0[c] = fma(dot(d0, x00) + dot(d1, x01) + dot(d2, x02) + dot(d3, x03), sc, acc0[c]);
+                acc1[c] = fma(dot(d0, x10) + dot(d1, x11) + dot(d2, x12) + dot(d3, x13), sc, acc1[c]);
+            }
+        }
+        #pragma unroll
+        for (uint c = 0u; c < 4u; ++c) {
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(4));
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(2));
+            acc0[c] += simd_shuffle_xor(acc0[c], ushort(1));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(4));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(2));
+            acc1[c] += simd_shuffle_xor(acc1[c], ushort(1));
+        }
+        if (l8 == 0u) {
+            acc0 *= outer;
+            acc1 *= outer;
+            if (p.round_bf16) {
+                for (uint c = 0u; c < 4u; ++c) { acc0[c] = mk_bf16(acc0[c]); acc1[c] = mk_bf16(acc1[c]); }
+            }
+            mk_expert_grouped_down_store_weighted(arena, partial, p, r0, j, acc0);
+            mk_expert_grouped_down_store_weighted(arena, partial, p, r1, j, acc1);
+        }
+        return;
+    }
+
+    for (uint t0 = 0u; t0 < count; t0 += 4u) {
+        const uint n_cur = min(4u, count - t0);
+        device const float4 *xp_t[4];
+        device const bfloat4 *xp16_t[4];
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            const uint route = entries[t0 + min(ti, n_cur - 1u)];
+            const uint tok_row = p.row0 + route / p.top_k, slot = route % p.top_k;
+            xp_t[ti] = Bf16Io ? nullptr : (device const float4 *)(arena + p.x + tok_row * p.xs + slot * p.k);
+            xp16_t[ti] = Bf16Io ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + tok_row * p.xs) + (slot * p.k) / 4u) : nullptr;
+        }
+        float4 acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint k4 = l8 * 4u; k4 < p.k / 4u; k4 += INKLING_NVFP4_SUBSIMD8_LANES * 4u) {
+            const uint b = k4 / 4u;
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uchar sc_code = sp[b + c * sstep];
+                const float sc = Lut ? mk_e4m3_f32_lut[sc_code] : mk_expert_e4m3(sc_code);
+                float4 d0, d1, d2, d3;
+                mk_nvfp4_decode16<Lut>(wp[b + c * wstep], d0, d1, d2, d3);
+                #pragma unroll
+                for (uint ti = 0u; ti < 4u; ++ti) {
+                    if (ti < n_cur) {
+                        const float4 x0 = Bf16Io ? float4(xp16_t[ti][k4]) : xp_t[ti][k4];
+                        const float4 x1 = Bf16Io ? float4(xp16_t[ti][k4 + 1u]) : xp_t[ti][k4 + 1u];
+                        const float4 x2 = Bf16Io ? float4(xp16_t[ti][k4 + 2u]) : xp_t[ti][k4 + 2u];
+                        const float4 x3 = Bf16Io ? float4(xp16_t[ti][k4 + 3u]) : xp_t[ti][k4 + 3u];
+                        acc[ti][c] = fma(dot(d0, x0) + dot(d1, x1) + dot(d2, x2) + dot(d3, x3), sc, acc[ti][c]);
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            if (ti < n_cur) {
+                #pragma unroll
+                for (uint c = 0u; c < 4u; ++c) {
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(4));
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(2));
+                    acc[ti][c] += simd_shuffle_xor(acc[ti][c], ushort(1));
+                }
+            }
+        }
+        if (l8 == 0u) {
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    float4 v = acc[ti] * outer;
+                    if (p.round_bf16) for (uint c = 0u; c < 4u; ++c) v[c] = mk_bf16(v[c]);
+                    mk_expert_grouped_down_store_weighted(arena, partial, p, entries[t0 + ti], j, v);
+                }
+            }
+        }
+    }
+}
+
+template <bool Lut, bool Bf16Out>
+inline void mk_expert_grouped_up_mx_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                         device const uint *lists, constant MKExpert &p,
+                                         uint gid, uint lane) {
+    const uint columns = p.n / 2u;
+    const uint simd_id = gid / 32u;
+    const uint tile_idx = simd_id / columns;
+    const uint tile_count = lists[p.experts + 1u];
+    if (tile_idx >= tile_count) return;
+    const uint j = (simd_id % columns) * 2u;
+
+    const uint total = p.rows * p.top_k;
+    device const uint *expert_off = lists;
+    device const uint *sorted_routes = lists + p.experts + 2u;
+    device const uint *tile_e = sorted_routes + total;
+    const uint expert = tile_e[tile_idx];
+    const uint off = expert_off[expert];
+    const uint count = expert_off[expert + 1u] - off;
+    device const uint *entries = sorted_routes + off;
+
+    const ulong base = (ulong(expert) * p.n + j) * 2u * p.k;
+    device const uint2 *wp = (device const uint2 *)(w + p.w + base);
+    device const uchar *sp = s + p.s + base / 32u;
+    const uint wstep = p.k / 8u;
+    const uint sstep = p.k / 32u;
+
+    for (uint t0 = 0u; t0 < count; t0 += 4u) {
+        const uint n_cur = min(4u, count - t0);
+        device const float4 *xp_t[4];
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            const uint route = entries[t0 + min(ti, n_cur - 1u)];
+            xp_t[ti] = (device const float4 *)(arena + p.x + (p.row0 + route / p.top_k) * p.xs);
+        }
+        float4 acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint k8 = lane; k8 < p.k / 8u; k8 += 32u) {
+            const uint sb = k8 / 4u;
+            uint2 packed[4];
+            float scale[4];
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uint e = sp[sb + c * sstep];
+                scale[c] = as_type<float>(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23);
+                packed[c] = wp[k8 + c * wstep];
+            }
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    const float4 x0 = xp_t[ti][2u * k8];
+                    const float4 x1 = xp_t[ti][2u * k8 + 1u];
+                    #pragma unroll
+                    for (uint c = 0u; c < 4u; ++c) {
+                        const float part = mk_e4m3x4_dot<Lut>(packed[c].x, x0) + mk_e4m3x4_dot<Lut>(packed[c].y, x1);
+                        acc[ti][c] = fma(part, scale[c], acc[ti][c]);
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            if (ti < n_cur) {
+                acc[ti] = float4(simd_sum(acc[ti].x), simd_sum(acc[ti].y), simd_sum(acc[ti].z), simd_sum(acc[ti].w));
+            }
+        }
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    const uint route = entries[t0 + ti];
+                    const uint tok_row = p.row0 + route / p.top_k;
+                    const uint slot = route % p.top_k;
+                    device float *out = arena + p.y + tok_row * p.ys + slot * p.n + j;
+                    device bfloat *out16 = reinterpret_cast<device bfloat *>(arena + p.y + tok_row * p.ys) + slot * p.n + j;
+                    for (uint c = 0u; c < 2u; ++c) {
+                        float gate = acc[ti][c * 2u], up = acc[ti][c * 2u + 1u];
+                        if (p.round_bf16) { gate = mk_bf16(gate); up = mk_bf16(up); }
+                        const float value = ((tanh(gate / p.gate_cap) * p.gate_cap) * mk_sigmoid(gate)) * (tanh(up / p.up_cap) * p.up_cap);
+                        if constexpr (Bf16Out) out16[c] = bfloat(p.round_bf16 ? mk_bf16(value) : value);
+                        else out[c] = p.round_bf16 ? mk_bf16(value) : value;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <bool Lut, bool Bf16Io>
+inline void mk_expert_grouped_down_mx_impl(device float *arena, device const uchar *w, device const uchar *s,
+                                           device const uint *lists, device float *partial,
+                                           constant MKExpert &p, uint gid, uint lane) {
+    const uint columns = p.n / 4u;
+    const uint simd_id = gid / 32u;
+    const uint tile_idx = simd_id / columns;
+    const uint tile_count = lists[p.experts + 1u];
+    if (tile_idx >= tile_count) return;
+    const uint j = (simd_id % columns) * 4u;
+
+    const uint total = p.rows * p.top_k;
+    device const uint *expert_off = lists;
+    device const uint *sorted_routes = lists + p.experts + 2u;
+    device const uint *tile_e = sorted_routes + total;
+    const uint expert = tile_e[tile_idx];
+    const uint off = expert_off[expert];
+    const uint count = expert_off[expert + 1u] - off;
+    device const uint *entries = sorted_routes + off;
+
+    const ulong base = (ulong(expert) * p.n + j) * p.k;
+    device const uint *wp = (device const uint *)(w + p.w + base);
+    device const uchar *sp = s + p.s + base / 32u;
+    const uint wstep = p.k / 4u;
+    const uint sstep = p.k / 32u;
+
+    for (uint t0 = 0u; t0 < count; t0 += 4u) {
+        const uint n_cur = min(4u, count - t0);
+        device const float4 *xp_t[4];
+        device const bfloat4 *xp16_t[4];
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            const uint route = entries[t0 + min(ti, n_cur - 1u)];
+            const uint tok_row = p.row0 + route / p.top_k, slot = route % p.top_k;
+            xp_t[ti] = Bf16Io ? nullptr : (device const float4 *)(arena + p.x + tok_row * p.xs + slot * p.k);
+            xp16_t[ti] = Bf16Io ? (reinterpret_cast<device const bfloat4 *>(arena + p.x + tok_row * p.xs) + (slot * p.k) / 4u) : nullptr;
+        }
+        float4 acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint k4 = lane; k4 < p.k / 4u; k4 += 32u) {
+            const uint sb = k4 / 8u;
+            uint packed[4];
+            float scale[4];
+            #pragma unroll
+            for (uint c = 0u; c < 4u; ++c) {
+                const uint e = sp[sb + c * sstep];
+                scale[c] = as_type<float>(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23);
+                packed[c] = wp[k4 + c * wstep];
+            }
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    const float4 xv = Bf16Io ? float4(xp16_t[ti][k4]) : xp_t[ti][k4];
+                    #pragma unroll
+                    for (uint c = 0u; c < 4u; ++c) {
+                        acc[ti][c] = fma(mk_e4m3x4_dot<Lut>(packed[c], xv), scale[c], acc[ti][c]);
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (uint ti = 0u; ti < 4u; ++ti) {
+            if (ti < n_cur) {
+                acc[ti] = float4(simd_sum(acc[ti].x), simd_sum(acc[ti].y), simd_sum(acc[ti].z), simd_sum(acc[ti].w));
+            }
+        }
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint ti = 0u; ti < 4u; ++ti) {
+                if (ti < n_cur) {
+                    float4 v = acc[ti];
+                    if (p.round_bf16) for (uint c = 0u; c < 4u; ++c) v[c] = mk_bf16(v[c]);
+                    mk_expert_grouped_down_store_weighted(arena, partial, p, entries[t0 + ti], j, v);
+                }
+            }
+        }
+    }
+}
+
+#define MK_EXPERT_GROUPED_SIMD(NAME, FN, LUT, BF16IO) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
+                     device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], \
+                     uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+        (void)partial; \
+        FN<LUT, BF16IO>(arena, w, s, amax, denom, lists, p, gid, lane); \
+    }
+#define MK_EXPERT_GROUPED_MX_UP(NAME, LUT, BF16IO) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
+                     device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], \
+                     uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+        (void)amax; (void)denom; (void)partial; \
+        mk_expert_grouped_up_mx_impl<LUT, BF16IO>(arena, w, s, lists, p, gid, lane); \
+    }
+#define MK_EXPERT_GROUPED_DOWN_NV8(NAME, LUT, BF16IO) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
+                     device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], \
+                     uint gid [[thread_position_in_grid]]) { \
+        mk_expert_grouped_down_nv8_impl<LUT, BF16IO>(arena, w, s, amax, denom, lists, partial, p, gid); \
+    }
+#define MK_EXPERT_GROUPED_MX_DOWN(NAME, LUT, BF16IO) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], \
+                     device const uchar *s [[buffer(2)]], device const uchar *amax [[buffer(3)]], \
+                     device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
+                     device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], \
+                     uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+        (void)amax; (void)denom; \
+        mk_expert_grouped_down_mx_impl<LUT, BF16IO>(arena, w, s, lists, partial, p, gid, lane); \
+    }
+
+MK_EXPERT_GROUPED_SIMD(mk_expert_grouped_up_nv16, mk_expert_grouped_up_nv16_impl, false, false)
+MK_EXPERT_GROUPED_SIMD(mk_expert_grouped_up_nv16_bf16, mk_expert_grouped_up_nv16_impl, false, true)
+MK_EXPERT_GROUPED_SIMD(mk_expert_grouped_up_nv16_lut, mk_expert_grouped_up_nv16_impl, true, false)
+MK_EXPERT_GROUPED_SIMD(mk_expert_grouped_up_nv16_lut_bf16, mk_expert_grouped_up_nv16_impl, true, true)
+MK_EXPERT_GROUPED_DOWN_NV8(mk_expert_grouped_down_nv8, false, false)
+MK_EXPERT_GROUPED_DOWN_NV8(mk_expert_grouped_down_nv8_bf16, false, true)
+MK_EXPERT_GROUPED_DOWN_NV8(mk_expert_grouped_down_nv8_lut, true, false)
+MK_EXPERT_GROUPED_DOWN_NV8(mk_expert_grouped_down_nv8_lut_bf16, true, true)
+MK_EXPERT_GROUPED_MX_UP(mk_expert_grouped_up_mx, false, false)
+MK_EXPERT_GROUPED_MX_UP(mk_expert_grouped_up_mx_bf16, false, true)
+MK_EXPERT_GROUPED_MX_UP(mk_expert_grouped_up_mx_lut, true, false)
+MK_EXPERT_GROUPED_MX_UP(mk_expert_grouped_up_mx_lut_bf16, true, true)
+MK_EXPERT_GROUPED_MX_DOWN(mk_expert_grouped_down_mx, false, false)
+MK_EXPERT_GROUPED_MX_DOWN(mk_expert_grouped_down_mx_bf16, false, true)
+MK_EXPERT_GROUPED_MX_DOWN(mk_expert_grouped_down_mx_lut, true, false)
+MK_EXPERT_GROUPED_MX_DOWN(mk_expert_grouped_down_mx_lut_bf16, true, true)
+#undef MK_EXPERT_GROUPED_SIMD
+#undef MK_EXPERT_GROUPED_MX_UP
+#undef MK_EXPERT_GROUPED_DOWN_NV8
+#undef MK_EXPERT_GROUPED_MX_DOWN
+
 // ---- Qwegn Wave 2 kernels: fused sliding/dynamic QKVR prep + KV f32/u16 store ----
 inline float4 mk_bf16_vec4(float4 v) {
     return float4(mk_bf16(v.x), mk_bf16(v.y), mk_bf16(v.z), mk_bf16(v.w));
@@ -1294,10 +2157,15 @@ kernel void mk_inkling_qkvr_dyn_prep_fused(device float *arena [[buffer(0)]], de
                                      wq_scale, wr_scale, nullptr, nullptr, x, gid, lane);
 }
 
-// ---- Step 3E kernels: fast single-pass log2 striped decode attention + gated merge ----
+// ---- Step 3E kernels: fast single-pass log2 striped decode/verify attention (rows = 1..8) + gated merge ----
 // Single-pass online softmax per SIMD in registers (~8.3 KB TG reduction instead of 30.9 KB);
 // maxima stored in parts[*][128] are in log2 units and pair with mk_relative_long_merge_fast / _gated.
 #define MK_LONG_FAST_SIMDS 8u
+inline uint mk_long_fast_taps(uint visible) {
+    const uint stripe = (visible <= 2048u) ? 64u : (visible <= 16384u) ? 256u : 512u;
+    return (visible + stripe - 1u) / stripe;
+}
+
 template <bool InlineBias>
 inline void mk_relative_long_keys_fast_impl(device const float *arena, device const ushort *key,
                                             device const ushort *val, device float *parts,
@@ -1305,12 +2173,17 @@ inline void mk_relative_long_keys_fast_impl(device const float *arena, device co
                                             uint lane, uint simd, uint simds, uint g,
                                             threadgroup float4 *red_acc, threadgroup float *red_m,
                                             threadgroup float *red_d) {
-    const uint kvh = g / p.taps, part = g % p.taps;
-    const uint row = p.row0, pos = p.pos + row;
+    const uint kv_parts = p.kv_heads * p.taps;
+    const uint r = g / kv_parts, rem = g % kv_parts;
+    if (r >= p.rows) return;
+    const uint kvh = rem / p.taps, part = rem % p.taps;
+    const uint row = p.row0 + r, pos = p.pos + row;
     const uint visible = p.window ? min(p.window, pos + 1u) : pos + 1u;
+    const uint row_taps = (p.rows == 1u) ? p.taps : mk_long_fast_taps(visible);
+    if (part >= row_taps) return;
     const uint first = pos + 1u - visible;
-    const uint s_off = inkling_stripe_start(visible, p.taps, part);
-    const uint e_off = inkling_stripe_end(visible, p.taps, part);
+    const uint s_off = inkling_stripe_start(visible, row_taps, part);
+    const uint e_off = inkling_stripe_end(visible, row_taps, part);
     const uint start = first + s_off;
     const uint n = e_off - s_off;
     const uint stride = p.kv_heads * 128u;
@@ -1414,7 +2287,7 @@ inline void mk_relative_long_keys_fast_impl(device const float *arena, device co
             const float ws = simd_shuffle(scale_my, ushort(s));
             gout = fma(red_acc[(off + s) * 32u + lane], ws, gout);
         }
-        device float *dst = parts + (ulong(h0 + h) * p.taps + part) * 130u;
+        device float *dst = parts + ((ulong(r) * p.heads + (h0 + h)) * p.taps + part) * 130u;
         *(device packed_float4 *)(dst + lane * 4u) = packed_float4(gout);
         if (lane == 0u) {
             dst[128] = gm;
@@ -1448,20 +2321,24 @@ kernel void mk_relative_long_keys_inline_fast(device const float *arena [[buffer
 
 template <bool Gated>
 inline void mk_relative_long_merge_impl(device float *arena, device const float *parts, constant MK &p,
-                                        uint tid, uint lane, uint simd, uint h,
+                                        uint tid, uint lane, uint simd, uint gid,
                                         threadgroup float *group, threadgroup float *factor) {
-    const uint row = p.row0;
-    device const float *src = parts + ulong(h) * p.taps * 130u;
+    const uint r = gid / p.heads, h = gid % p.heads;
+    if (r >= p.rows) return;
+    const uint row = p.row0 + r, pos = p.pos + row;
+    const uint visible = p.window ? min(p.window, pos + 1u) : pos + 1u;
+    const uint row_taps = (p.rows == 1u || (p.flags & MK_FIXED_TAPS) != 0u) ? p.taps : mk_long_fast_taps(visible);
+    device const float *src = parts + (ulong(r) * p.heads + h) * p.taps * 130u;
     const float sink = arena[p.s + row * p.every + h] * M_LOG2E_F;
     float m = -INFINITY;
-    for (uint k = tid; k < p.taps; k += 128u) m = max(m, src[ulong(k) * 130u + 128u]);
+    for (uint k = tid; k < row_taps; k += 128u) m = max(m, src[ulong(k) * 130u + 128u]);
     m = simd_max(m);
     if (lane == 0u) group[simd] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     m = max(max(max(group[0], group[1]), max(group[2], group[3])), sink);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float d = 0.0f;
-    for (uint k = tid; k < p.taps; k += 128u) {
+    for (uint k = tid; k < row_taps; k += 128u) {
         const float dk = src[ulong(k) * 130u + 129u];
         const float f = (dk > 0.0f) ? fast::exp2(src[ulong(k) * 130u + 128u] - m) : 0.0f;
         factor[k] = f;
@@ -1472,7 +2349,7 @@ inline void mk_relative_long_merge_impl(device float *arena, device const float 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float denominator = fast::exp2(sink - m) + ((group[0] + group[1]) + (group[2] + group[3]));
     float acc = 0.0f;
-    for (uint k = 0u; k < p.taps; ++k) acc += factor[k] * src[ulong(k) * 130u + tid];
+    for (uint k = 0u; k < row_taps; ++k) acc += factor[k] * src[ulong(k) * 130u + tid];
     float val = acc / denominator;
     if constexpr (Gated) {
         if (p.flags & MK_ROUND_BF16) val = mk_bf16(val);
@@ -1630,6 +2507,21 @@ kernel void mk_expert_combine_mm_bf16(device float *arena [[buffer(0)]], device 
             const ulong idx4 = (ulong(r) * p.top_k + s) * cols4 + j4;
             sum += float4(bp[idx4]) * rw;
         }
+    }
+    device float4 *dst = reinterpret_cast<device float4 *>(arena + p.y + (p.row0 + r) * p.ys);
+    dst[j4] = p.round_bf16 ? float4(mk_bf16(sum.x), mk_bf16(sum.y), mk_bf16(sum.z), mk_bf16(sum.w)) : sum;
+}
+
+kernel void mk_expert_combine_sum4(device float *arena [[buffer(0)]], device const float *partial [[buffer(1)]],
+                                   constant MKExpert &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    const uint cols4 = p.n / 4u;
+    const uint r = i / cols4, j4 = i % cols4;
+    if (r >= p.rows) return;
+    device const float *routes = arena + p.routes + (p.row0 + r) * p.rs;
+    device const float4 *p4 = reinterpret_cast<const device float4 *>(partial);
+    float4 sum = 0.0f;
+    for (uint s = 0u; s < p.top_k; ++s) {
+        if (uint(routes[s]) < p.experts) sum += p4[(ulong(r) * p.top_k + s) * cols4 + j4];
     }
     device float4 *dst = reinterpret_cast<device float4 *>(arena + p.y + (p.row0 + r) * p.ys);
     dst[j4] = p.round_bf16 ? float4(mk_bf16(sum.x), mk_bf16(sum.y), mk_bf16(sum.z), mk_bf16(sum.w)) : sum;
@@ -1897,10 +2789,12 @@ inline void mk_expert_block_m64n64_core(device float *arena, device const uchar 
     constexpr uint B = 32u, L = B + 8u, TG = 128u;
     constexpr uint ALoads = (M * (B / 4u) + TG - 1u) / TG;
     constexpr uint RM = M >= 16u ? M / 16u : 1u;
+    constexpr uint RN = (M == 8u) ? 2u : 4u;
     const uint n = Down ? p.n : 2u * p.n;
     const float outer = Nv ? mk_load(amax, p.amax, 0, expert) / mk_load(denom, p.denominator, 0, 0) : 1.0f;
     const uint sr = simd / 2u, sc = simd % 2u;
     const uint row_base = M >= 16u ? sr * (M / 2u) : 0u;
+    const uint col_simd_base = (M == 8u) ? (simd * 16u) : (sc * 32u);
     const uint fr = ((lane / 4u) & 4u) + (lane / 2u) % 4u;
     const uint fc = (((lane / 4u) & 2u) + lane % 2u) * 2u;
     device const bfloat *x16_base = reinterpret_cast<device const bfloat *>(partial);
@@ -1927,11 +2821,11 @@ inline void mk_expert_block_m64n64_core(device float *arena, device const uchar 
         }
         const uint wc = tid / 2u, wk = (tid % 2u) * 16u;
         const ulong w_off = (ulong(expert) * n + c0 + wc) * p.k + wk;
-        simdgroup_float8x8 acc[RM][4];
+        simdgroup_float8x8 acc[RM][RN];
         #pragma unroll
         for (uint i = 0u; i < RM; ++i) {
             #pragma unroll
-            for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint j = 0u; j < RN; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
         for (uint k = 0u; k < p.k; k += B) {
             #pragma unroll
@@ -1984,34 +2878,30 @@ inline void mk_expert_block_m64n64_core(device float *arena, device const uchar 
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (M >= 16u || sr == 0u) {
+            #pragma unroll
+            for (uint kf = 0u; kf < B; kf += 8u) {
+                simdgroup_bfloat8x8 bf[RN];
                 #pragma unroll
-                for (uint kf = 0u; kf < B; kf += 8u) {
-                    simdgroup_bfloat8x8 bf[4];
+                for (uint j = 0u; j < RN; ++j) simdgroup_load(bf[j], b + (col_simd_base + j * 8u) * L + kf, L, ulong2(0), true);
+                #pragma unroll
+                for (uint i = 0u; i < RM; ++i) {
+                    simdgroup_bfloat8x8 af;
+                    simdgroup_load(af, a + (row_base + i * 8u) * L + kf, L);
                     #pragma unroll
-                    for (uint j = 0u; j < 4u; ++j) simdgroup_load(bf[j], b + (sc * 32u + j * 8u) * L + kf, L, ulong2(0), true);
-                    #pragma unroll
-                    for (uint i = 0u; i < RM; ++i) {
-                        simdgroup_bfloat8x8 af;
-                        simdgroup_load(af, a + (row_base + i * 8u) * L + kf, L);
-                        #pragma unroll
-                        for (uint j = 0u; j < 4u; ++j) simdgroup_multiply_accumulate(acc[i][j], af, bf[j], acc[i][j]);
-                    }
+                    for (uint j = 0u; j < RN; ++j) simdgroup_multiply_accumulate(acc[i][j], af, bf[j], acc[i][j]);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        if (M >= 16u || sr == 0u) {
-            const uint col0 = c0 + sc * 32u + fc;
+        const uint col0 = c0 + col_simd_base + fc;
+        #pragma unroll
+        for (uint i = 0u; i < RM; ++i) {
+            const uint t = t0 + row_base + i * 8u + fr;
+            if (t >= count) continue;
+            const uint r = entries[t];
             #pragma unroll
-            for (uint i = 0u; i < RM; ++i) {
-                const uint t = t0 + row_base + i * 8u + fr;
-                if (t >= count) continue;
-                const uint r = entries[t];
-                #pragma unroll
-                for (uint j = 0u; j < 4u; ++j) {
-                    mk_expert_block_store<Down, Bf16Io>(arena, partial, p, r, col0 + j * 8u, acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
-                }
+            for (uint j = 0u; j < RN; ++j) {
+                mk_expert_block_store<Down, Bf16Io>(arena, partial, p, r, col0 + j * 8u, acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
             }
         }
     }
@@ -2136,6 +3026,58 @@ MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_up_mx64_m64_ct_lut_bf16, false, false,
 MK_EXPERT_BLOCK_M64N64_CT(mk_expert_block_down_mx64_m64_ct_lut_bf16, true, false, true, true)
 #undef MK_EXPERT_BLOCK_M64N64_STRIPE
 #undef MK_EXPERT_BLOCK_M64N64_CT
+
+#define MK_EXPERT_BLOCK_M8N64_CT(NAME, DOWN, NV, LUT, BF16IO) \
+    kernel void NAME(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]], device const uchar *s [[buffer(2)]], \
+                     device const uchar *amax [[buffer(3)]], device const uchar *denom [[buffer(4)]], device const uint *lists [[buffer(5)]], \
+                     device float *partial [[buffer(6)]], constant MKExpert &p [[buffer(8)]], uint g [[threadgroup_position_in_grid]], \
+                     uint tid [[thread_index_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+        const uint n = DOWN ? p.n : 2u * p.n; \
+        const uint cols = n / INKLING_EXPERT_BLOCK_N64; \
+        const uint tile_idx = g / cols; \
+        const uint tile_count = lists[p.experts + 1u]; \
+        if (tile_idx >= tile_count) return; \
+        alignas(8) threadgroup bfloat a[8u * 40u], b[64u * 40u]; \
+        threadgroup half tg8[LUT ? 256u : 1u]; \
+        threadgroup half2 tg4[LUT ? 256u : 1u]; \
+        if constexpr (LUT) { \
+            for (uint i = tid; i < 256u; i += 128u) { \
+                tg8[i] = mk_e4m3_h_lut[i]; \
+                if constexpr (NV) tg4[i] = mk_fp4_pair_h2_lut[i]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        const uint total = p.rows * p.top_k; \
+        const uint max_tiles = inkling_moe_max_tiles(p.experts, total); \
+        device const uint *expert_off = lists; \
+        device const uint *sorted_routes = lists + p.experts + 2u; \
+        device const uint *tile_e = sorted_routes + total; \
+        const uint expert = tile_e[tile_idx]; \
+        const uint off = expert_off[expert]; \
+        const uint count = expert_off[expert + 1u] - off; \
+        const uint c0 = (g % cols) * INKLING_EXPERT_BLOCK_N64; \
+        device const uint *entries = sorted_routes + off; \
+        constexpr bool X16 = (!DOWN) || BF16IO; \
+        mk_expert_block_m64n64_core<DOWN, NV, 8u, X16, LUT, BF16IO>(arena, w, s, amax, denom, entries, count, partial, p, expert, c0, tid, simd, lane, 0u, count, 8u, a, b, tg8, tg4); \
+    }
+
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_nv64_m8_ct, false, true, false, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_nv64_m8_ct, true, true, false, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_mx64_m8_ct, false, false, false, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_mx64_m8_ct, true, false, false, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_nv64_m8_ct_lut, false, true, true, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_nv64_m8_ct_lut, true, true, true, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_mx64_m8_ct_lut, false, false, true, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_mx64_m8_ct_lut, true, false, true, false)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_nv64_m8_ct_bf16, false, true, false, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_nv64_m8_ct_bf16, true, true, false, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_mx64_m8_ct_bf16, false, false, false, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_mx64_m8_ct_bf16, true, false, false, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_nv64_m8_ct_lut_bf16, false, true, true, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_nv64_m8_ct_lut_bf16, true, true, true, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_up_mx64_m8_ct_lut_bf16, false, false, true, true)
+MK_EXPERT_BLOCK_M8N64_CT(mk_expert_block_down_mx64_m8_ct_lut_bf16, true, false, true, true)
+#undef MK_EXPERT_BLOCK_M8N64_CT
 
 // Wave 4: Fused controller message merge + RMSNorm(+BF16 cast) for batched forwards.
 kernel void mk_inkling_merge_norm_vec(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],

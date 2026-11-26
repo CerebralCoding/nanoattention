@@ -23,10 +23,22 @@ constant uint MK_HAS_WEIGHT = 2u;
 constant uint MK_FAST_TRIG = 4u;
 constant uint MK_ROUND_OUT = 16u;
 constant uint MK_BIAS16 = 32u;
+constant uint MK_FIXED_TAPS = 128u;
 
 inline float mk_load(device const uchar *base, ulong offset, uint dtype, ulong i) {
-    if (dtype == 0) return ((device const float *)(base + offset))[i];
-    ushort h = ((device const ushort *)(base + offset))[i];
+    if (dtype == 0) {
+        if ((offset & 3u) == 0) return ((device const float *)(base + offset))[i];
+        device const uchar *q = base + offset + i * 4ul;
+        uint u = uint(q[0]) | (uint(q[1]) << 8) | (uint(q[2]) << 16) | (uint(q[3]) << 24);
+        return as_type<float>(u);
+    }
+    ushort h;
+    if ((offset & 1u) == 0) {
+        h = ((device const ushort *)(base + offset))[i];
+    } else {
+        device const uchar *q = base + offset + i * 2ul;
+        h = ushort(uint(q[0]) | (uint(q[1]) << 8));
+    }
     return dtype == 1 ? float(as_type<half>(h)) : as_type<float>(uint(h) << 16);
 }
 inline float mk_bf16(float v) {
@@ -47,13 +59,17 @@ inline float mk_act(float x, uint act) {
     if (act == 3) return tanh(x);
     return x;
 }
-// Packed code word i of a weight at byte `offset`. Safetensors data can start
-// 2 bytes off a word boundary (LFM3's does); then the word is read as two
-// halves. Either way the word, and so every later operation, is the same.
+// Packed code word i of a weight at byte `offset`. Safetensors data in
+// unpadded multi-shard files can start at any byte offset (`(offset & 3) != 0`),
+// including odd offsets; handle 4-byte, 2-byte, and unaligned byte loads.
 inline uint mk_word(device const uchar *w, ulong offset, ulong i) {
-    if ((offset & 3) == 0) return ((device const uint *)(w + offset))[i];
-    device const ushort *h = (device const ushort *)(w + offset);
-    return uint(h[2 * i]) | (uint(h[2 * i + 1]) << 16);
+    if ((offset & 3u) == 0) return ((device const uint *)(w + offset))[i];
+    if ((offset & 1u) == 0) {
+        device const ushort *h = (device const ushort *)(w + offset);
+        return uint(h[2 * i]) | (uint(h[2 * i + 1]) << 16);
+    }
+    device const uchar *q = w + offset + i * 4ul;
+    return uint(q[0]) | (uint(q[1]) << 8) | (uint(q[2]) << 16) | (uint(q[3]) << 24);
 }
 inline float mk_code(device const uchar *w, ulong offset, uint bits, ulong i) {
     ulong bit = i * bits;
@@ -403,4 +419,112 @@ kernel void mk_argmax(device float *arena [[buffer(0)]], constant MK &p [[buffer
     uint w = simd_min(v == t ? i : 0xffffffffu);
     b = simd_max(b);
     if (lane == 0) arena[p.y + row * p.ys] = as_type<float>(b ? 0xffffffffu : w);
+}
+
+// ---- select_halves ------------------------------------------------------------
+// Grid: rows * n threads (n = 2 * heads * dim). Splits interleaved
+// [heads, 2, dim] rows into contiguous [first_halves, second_halves].
+kernel void mk_select_halves(device float *arena [[buffer(0)]], constant MK &p [[buffer(8)]],
+                             uint i [[thread_position_in_grid]]) {
+    uint r = i / p.n, c = i % p.n;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    uint half_n = p.m;
+    bool second = c >= half_n;
+    uint k = second ? c - half_n : c;
+    uint g = k / p.dim;
+    uint d = k % p.dim;
+    uint src_c = g * (2u * p.dim) + (second ? p.dim : 0u) + d;
+    arena[p.y + row * p.ys + c] = arena[p.x + row * p.xs + src_c];
+}
+
+// ---- gated_delta_net ----------------------------------------------------------
+// One SIMD group (32 threads) per (v_head, v_dim), walking rows sequentially so
+// batched prefill is bit-identical to tokens fed one at a time.
+kernel void mk_gated_delta_net(device const uchar *a_log [[buffer(0)]],
+                               device const uchar *dt_bias [[buffer(1)]],
+                               device float *arena [[buffer(2)]],
+                               device float *state [[buffer(3)]],
+                               constant MK &p [[buffer(8)]],
+                               uint gid [[thread_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    uint simd_id = gid / 32u;
+    if (simd_id >= p.heads * p.m) return;
+    uint hv = simd_id / p.m;
+    uint dv = simd_id % p.m;
+    uint hk = hv / (p.heads / p.kv_heads);
+    uint key_dim = p.kv_heads * p.dim;
+    uint E = (p.dim + 31u) / 32u;
+
+    device float *st_ptr = state + (ulong(hv) * p.m + dv) * p.dim;
+    float st[8];
+    for (uint e = 0; e < E; ++e) {
+        uint c = E * lane + e;
+        st[e] = (c < p.dim) ? st_ptr[c] : 0.0f;
+    }
+
+    float a_exp = metal::precise::exp(mk_load(a_log, p.w, p.dtype, hv));
+    float dt_b = mk_load(dt_bias, p.s, p.sdtype, hv);
+    float scale_q = metal::rsqrt(float(p.dim));
+
+    for (uint r = 0; r < p.rows; ++r) {
+        uint row = p.row0 + r;
+        device const float *row_qkv = arena + p.x + ulong(row) * p.xs;
+        device const float *q_ptr = row_qkv + ulong(hk) * p.dim;
+        device const float *k_ptr = row_qkv + key_dim + ulong(hk) * p.dim;
+        float v_val = row_qkv[2u * key_dim + ulong(hv) * p.m + dv];
+        float a_val = arena[p.y + ulong(row) * p.ys + hv];
+        float b_val = arena[p.z + ulong(row) * p.zs + hv];
+
+        float sp_in = a_val + dt_b;
+        float sp = sp_in > 20.0f ? sp_in : metal::precise::log(1.0f + metal::precise::exp(sp_in));
+        float g_val = metal::precise::exp(-a_exp * sp);
+        float beta_val = mk_sigmoid(b_val);
+
+        float qv[8], kv[8], q2 = 0.0f, k2 = 0.0f;
+        for (uint e = 0; e < E; ++e) {
+            uint c = E * lane + e;
+            float qq = (c < p.dim) ? q_ptr[c] : 0.0f;
+            float kk = (c < p.dim) ? k_ptr[c] : 0.0f;
+            qv[e] = qq;
+            kv[e] = kk;
+            q2 += qq * qq;
+            k2 += kk * kk;
+        }
+        float q_inv = metal::rsqrt(simd_sum(q2) + p.eps) * scale_q;
+        float k_inv = metal::rsqrt(simd_sum(k2) + p.eps);
+
+        float kv_mem = 0.0f;
+        for (uint e = 0; e < E; ++e) {
+            st[e] *= g_val;
+            kv_mem += st[e] * (kv[e] * k_inv);
+        }
+        kv_mem = simd_sum(kv_mem);
+        float delta = (v_val - kv_mem) * beta_val;
+
+        float out = 0.0f;
+        for (uint e = 0; e < E; ++e) {
+            st[e] += (kv[e] * k_inv) * delta;
+            out += st[e] * (qv[e] * q_inv);
+        }
+        out = simd_sum(out);
+        if (lane == 0) arena[p.every + ulong(row) * p.pad_k + ulong(hv) * p.m + dv] = out;
+    }
+
+    for (uint e = 0; e < E; ++e) {
+        uint c = E * lane + e;
+        if (c < p.dim) st_ptr[c] = st[e];
+    }
+}
+
+kernel void mk_copy_slot(
+    device const float *arena [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    constant MK &p [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+    ulong total = ulong(p.rows) * p.n;
+    if (gid >= total) return;
+    uint r = uint(gid / p.n);
+    uint c = uint(gid % p.n);
+    dst[ulong(p.row0 + r) * p.ys + p.y + c] = arena[ulong(p.x) + ulong(p.pos + r) * p.xs + c];
 }

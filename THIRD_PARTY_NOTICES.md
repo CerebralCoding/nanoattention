@@ -100,3 +100,15 @@ training-free Loop Contrastive Decoding methods from:
 
 All LoopCD IR lowering and Metal kernels here are original implementations written for
 `nano`.
+
+## DFlash 2 block-diffusion speculative decoding (`nano`)
+
+The native DFlash 2 speculative drafting engine and Metal kernels in
+`src/mega/dflash2.zig` and `src/mega/dflash2.metal` are implemented after:
+
+- **Z Lab** ([`z-lab/dflash`](https://github.com/z-lab/dflash); MIT License, copyright (c) 2026 Z Lab — see `licenses/zlab-dflash-MIT.txt`): the DFlash 2 block-diffusion draft architecture (`DFlash2DraftModel`, `GroupedDynamicCausalConv` two-tap grouped dynamic convolutions, `CandidateSelector` bilinear predecessor/successor path scoring, bidirectional sliding-window `DFlashAttention`, and exact verification/rewind cadence in `dflash/model.py` and `dflash/model_mlx.py`).
+- **Inco AI** ([`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [`incoai/splash`](https://github.com/incoai/splash); Apache License, Version 2.0 — see `licenses/incoai-APACHE-2.0.txt`): the Inkling 2 Mini DFlash 2 integration specification (`sglang_inkling_dflash2.py`, `runtime/model/Inkling2LoopTarget.cpp`, `runtime/model/DFlashDraft.cpp`, `runtime/ops/DraftSelector.hpp`), specifically target feature capture slots `[5, 23, 41, 48]` (`traces[5, 23, 41]` and post-`norm.weight`), draft embedding (`embed.weight` + `embed_norm.weight`), unpadded candidate vocab (`200058`), and `"after_correction"` candidate selector softcapping.
+
+`nano`'s implementation is written natively in Zig + Metal (`df_bf16_linear`,
+`df_bf16_linear_tile`, `df_grouped_dyn_conv`, `df_attention`, `df_top16_*`,
+`df_select_path`) using `exec.Capture` and zero-copy target `Engine.rewind()`.

@@ -209,6 +209,16 @@ pub fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
             reads[1] = e.routes;
             writes.* = e.out;
         },
+        .select_halves => |s| {
+            reads[0] = s.x;
+            writes.* = s.out;
+        },
+        .gated_delta_net => |g| {
+            reads[0] = g.qkv;
+            reads[1] = g.a;
+            reads[2] = g.b;
+            writes.* = g.out;
+        },
         .argmax => |m| {
             reads[0] = m.x;
             writes.* = m.out;
@@ -249,6 +259,7 @@ fn launchAccess(step: Step, p: *const ir.Program, info: []const WeightInfo) ?Lau
                 .linear => |l| if (!info[l.w].dense) return null,
                 .embed, .rmsnorm, .binary, .row_transform, .grouped_project, .concat, .activate,
                 .softcapped_swiglu, .depth_attention, .inkling_message_merge, .loopcd_contrast, .l2_clip, .route_topk,
+                .select_halves, .gated_delta_net,
                 .store, .conv, .inkling_short_conv, .inkling_dynamic_conv => {},
                 else => return null,
             }
@@ -263,6 +274,10 @@ fn launchAccess(step: Step, p: *const ir.Program, info: []const WeightInfo) ?Lau
             // whole cache as read or written, even when only one position is used.
             switch (op) {
                 .store => |o| write = cacheView(p, o.dst),
+                .gated_delta_net => |o| {
+                    out.reads[3] = cacheView(p, o.state);
+                    out.writes[1] = cacheView(p, o.state);
+                },
                 .conv => |o| out.reads[2] = cacheView(p, o.src),
                 .inkling_short_conv => |o| out.reads[2] = cacheView(p, o.src),
                 .inkling_dynamic_conv => |o| out.reads[2] = cacheView(p, o.src),
@@ -396,6 +411,7 @@ pub fn independentLaunches(gpa: std.mem.Allocator, steps: []const Step, p: *cons
 pub fn deadAfter(p: *const ir.Program, v: ir.View, last_reader: u32) bool {
     if (overlaps(v, p.logits) or overlaps(v, p.next)) return false;
     for (p.traces) |t| if (t.view.state == v.state) return false;
+    if (p.draft_final_norm) |dfn| if (dfn.view.state == v.state) return false;
     var i = last_reader + 1;
     while (i < p.ops.len) : (i += 1) {
         var reads: [3]?ir.View = undefined;

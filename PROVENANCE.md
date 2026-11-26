@@ -27,6 +27,11 @@ KV ownership, protocol adapters, proofs, tests and tuning tools are kept here.
   attribution and `licenses/qwegn-APACHE-2.0.txt` for the six adapted Inkling 2
   Mini kernel optimization designs (`src/mega/inkling_fast.metal` and
   `THIRD_PARTY_NOTICES.md`).
+- Z Lab (`z-lab/dflash`, MIT) and Inco AI (`incoai/Inkling-2-Mini-DFlash2`,
+  `incoai/splash`, Apache-2.0): preserve attribution, `licenses/zlab-dflash-MIT.txt`,
+  and `licenses/incoai-APACHE-2.0.txt` for the native DFlash 2 block-diffusion
+  speculative decoding engine and kernels (`src/mega/dflash2.zig`,
+  `src/mega/dflash2.metal`, and `THIRD_PARTY_NOTICES.md`).
 - Checkpoints and tokenizers: not included in this source repository. Their
   licenses are separate; the source MIT license does not relicense model files.
 

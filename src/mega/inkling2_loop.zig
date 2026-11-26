@@ -626,6 +626,7 @@ fn lowerWithOptions(gpa: std.mem.Allocator, c: Config, options: Options) !ir.Pro
     const partial = try l.norm(hidden, null, h, .none);
     const final = try l.depth(Lowering.slice(blocks, 0, count * h), partial, output_query, 0);
     const normed = try l.norm(final, norm_w, h, .bf16);
+    try b.setDraftFinalNorm(normed);
     var weak_normed_opt: ?ir.View = null;
     if (options.loopcd == .logits or options.loopcd == .logits_adaptive) {
         const weak_partial = try l.norm(weak_hidden.?, null, h, .none);
@@ -2925,6 +2926,139 @@ test "Inkling2 NoPE global and all lowering, reference vs tuned parity, and LSA"
         for (lsa_pbase_out, try lsa_tuned.logits(0)) |pv, tv| {
             try std.testing.expect(std.math.isFinite(tv));
             try std.testing.expectApproxEqAbs(pv, tv, 1e-3);
+        }
+    }
+}
+
+test "Engine.Capture and Engine.rewind preserve exact logits and traces" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 128;
+    c.heads = 2;
+    c.kv_heads = 1;
+    c.head_dim = 8;
+    c.rel_dim = 4;
+    c.rel_extent = 4;
+    c.window = 4;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 32;
+    var p = try lower(gpa, c);
+    defer p.deinit();
+    try std.testing.expect(p.draft_final_norm != null);
+
+    var tmp = "/tmp/nano-inkling-cap-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const exec_mod = @import("exec.zig");
+    const Engine = exec_mod.Engine;
+
+    const knobs: @import("knobs.zig").Knobs = .{
+        .batch = 16,
+        .bf16_linear_tile = true,
+        .bf16_prefill_tile = 8,
+        .fuse_bf16_cast = true,
+        .tail_trim = 2,
+        .scratch_reuse = true,
+        .concurrent_scratch = true,
+    };
+
+    // Reference: uninterrupted execution of prefix[0..8] + kept[8..10] + next[10..12]
+    const tokens = [_]u32{ 1, 4, 11, 2, 3, 6, 8, 9, 5, 7, 10, 12 };
+    var ref = try Engine.init(gpa, &p, ctx, &store, knobs, 32);
+    defer ref.deinit();
+    try ref.forward(tokens[0..10], 9);
+    var ref_trace = try a.alloc(f32, p.traces.len * 10 * c.hidden);
+    var ref2 = try Engine.init(gpa, &p, ctx, &store, .{ .batch = 16 }, 32);
+    defer ref2.deinit();
+    try ref2.forwardTraced(tokens[0..10], 0, .{ .data = ref_trace, .width = c.hidden });
+
+    // Speculative capture on tail rows [4..10) with out_first = 9 (so head trims unembed but computes draft_final_norm on rows 4..9!).
+    var spec = try Engine.init(gpa, &p, ctx, &store, knobs, 32);
+    defer spec.deinit();
+    const cap_indices = [_]u32{ 1, 5 };
+    const cap_buf = try ctx.alloc(6 * 3 * c.hidden);
+    defer cap_buf.deinit();
+    var cap: exec_mod.Capture = .{
+        .trace_indices = &cap_indices,
+        .include_final_norm = true,
+        .row0 = 4,
+        .rows = 6,
+        .dest = cap_buf,
+        .width = c.hidden,
+        .stride = 3 * c.hidden,
+    };
+    spec.capture = &cap;
+    try spec.forward(tokens[0..10], 9);
+    spec.capture = null;
+    try std.testing.expectEqualSlices(f32, try ref.logits(9), try spec.logits(9));
+    // Verify captured trace[1] and trace[5] match exact reference traces for rows 4..9.
+    const cf = cap_buf.floats();
+    for (0..6) |r| {
+        const ref_row = 4 + r;
+        const t1_ref = ref_trace[(1 * 10 + ref_row) * c.hidden ..][0..c.hidden];
+        const t5_ref = ref_trace[(5 * 10 + ref_row) * c.hidden ..][0..c.hidden];
+        for (0..c.hidden) |d| {
+            try std.testing.expectApproxEqAbs(t1_ref[d], cf[r * 3 * c.hidden + d], 1e-4);
+            try std.testing.expectApproxEqAbs(t5_ref[d], cf[r * 3 * c.hidden + c.hidden + d], 1e-4);
+        }
+    }
+
+    // Now test rewind: feed 4 candidate tokens [10, 0, 1, 2], keep first 1 (`10`), rewind to 11, then feed `12`.
+    try ref.forward(tokens[10..12], 0);
+    const cand = [_]u32{ tokens[10], 0, 1, 2 };
+    try spec.forward(&cand, 0);
+    try spec.rewind(11);
+    try std.testing.expectEqual(@as(u32, 11), spec.position);
+    // Logits for kept token `cand[0]` remain intact after rewind.
+    try std.testing.expectEqualSlices(f32, try ref.logits(0), try spec.logits(0));
+    try spec.forward(tokens[11..12], 0);
+    try std.testing.expectEqualSlices(f32, try ref.logits(1), try spec.logits(0));
+
+    // Verify fast verify T=5 & T=7 paths (mk_bf16_linear_2xR_vec, mk_expert_block_*_m8_ct, mk_relative_prefill_stripes).
+    var fast_k = knobs;
+    fast_k.bf16_decode_vec = true;
+    fast_k.bf16_decode_splitk = true;
+    fast_k.expert_mlx_scale = true;
+    fast_k.expert_block_m64n64 = true;
+    fast_k.expert_fp_lut = true;
+    fast_k.expert_compact_tiles = true;
+    fast_k.expert_bf16_io = true;
+    fast_k.bf16_prefill_matrix = true;
+    fast_k.bf16_matrix_small = true;
+    fast_k.relative_tile_prefill = true;
+    fast_k.relative_stripes = true;
+    var fast_ref = try Engine.init(gpa, &p, ctx, &store, .{ .batch = 16 }, 32);
+    defer fast_ref.deinit();
+    var fast_eng = try Engine.init(gpa, &p, ctx, &store, fast_k, 32);
+    defer fast_eng.deinit();
+    try fast_ref.forward(tokens[0..5], 0);
+    try fast_eng.forward(tokens[0..5], 0);
+    for (0..5) |r| {
+        for (try fast_ref.logits(@intCast(r)), try fast_eng.logits(@intCast(r))) |ev, av| {
+            try std.testing.expectApproxEqAbs(ev, av, 0.05);
+        }
+    }
+    try fast_ref.forward(tokens[5..12], 0);
+    try fast_eng.forward(tokens[5..12], 0);
+    for (0..7) |r| {
+        for (try fast_ref.logits(@intCast(r)), try fast_eng.logits(@intCast(r))) |ev, av| {
+            try std.testing.expectApproxEqAbs(ev, av, 0.05);
         }
     }
 }

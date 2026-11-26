@@ -153,6 +153,8 @@ pub const flag_dec_gated: u32 = 8;
 pub const flag_round_out: u32 = 16;
 /// mk_relative_prefill_tiles: the distance bias is 16-bit (knobs.relative_bias16).
 pub const flag_bias16: u32 = 32;
+/// mk_relative_long_merge_*: keep host-specified `p.taps` instead of recomputing dense taps.
+pub const flag_fixed_taps: u32 = 128;
 
 comptime {
     if (@sizeOf(ExpertParams) != 96) @compileError("ExpertParams must match MKExpert in inkling_ops.metal");
@@ -161,17 +163,35 @@ comptime {
     if (@sizeOf(LSAParams) != 240) @compileError("LSAParams must match MKLSA in inkling_lsa.metal");
 }
 
+pub const lfm_source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
+
 pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_plan.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_lsa.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("inkling_fast.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
     // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
     // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
-    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
+    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal") ++ "\n" ++ @embedFile("dflash2.metal");
 
-pub fn open() !metal.Context {
-    const handle = fm_open(source) orelse {
+pub fn openSource(src: [:0]const u8) !metal.Context {
+    const handle = fm_open(src) orelse {
         std.debug.print("Metal: {s}\n", .{std.mem.span(fm_error())});
         return error.MetalFailure;
     };
     return .{ .handle = handle };
+}
+
+pub fn openForModel(model_type: []const u8) !metal.Context {
+    if (std.mem.eql(u8, model_type, "lfm2") or
+        std.mem.eql(u8, model_type, "lfm3") or
+        std.mem.eql(u8, model_type, "qwen3_5") or
+        std.mem.eql(u8, model_type, "qwen3_5_text"))
+    {
+        return openSource(lfm_source);
+    }
+    return openSource(source);
+}
+
+pub fn open() !metal.Context {
+    return openSource(source);
 }
 
 pub fn dispatch(ctx: metal.Context, kernel: [:0]const u8, buffers: []const metal.Buffer, p: anytype, threads: usize, group: usize) !void {

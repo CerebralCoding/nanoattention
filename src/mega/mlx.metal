@@ -44,9 +44,13 @@ constant uint MK_MLX_LD = 36; // BK + 16 / sizeof(float): MLX's padded tile row
 // as a float: exact, as MLX's float32 model holds them after set_dtype.
 template <uint SDT>
 inline float mk_mlx_sb(device const uchar *a) {
-    if (SDT == 0) return *(device const float *)a;
-    if (SDT == 1) return float(*(device const half *)a);
-    return as_type<float>(uint(*(device const ushort *)a) << 16);
+    if (SDT == 0) {
+        uint u = uint(a[0]) | (uint(a[1]) << 8) | (uint(a[2]) << 16) | (uint(a[3]) << 24);
+        return as_type<float>(u);
+    }
+    ushort h = ushort(uint(a[0]) | (uint(a[1]) << 8));
+    if (SDT == 1) return float(as_type<half>(h));
+    return as_type<float>(uint(h) << 16);
 }
 // The K loop (MLX's load_unsafe path when FULL: every row and column of the tile in range).
 template <bool FULL, uint GROUP, uint SDT>

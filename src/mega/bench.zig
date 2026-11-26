@@ -4,6 +4,7 @@
 //! timed repeats from a reset state; medians reported. Loading is excluded.
 const std = @import("std");
 const exec = @import("exec.zig");
+const dflash2 = @import("dflash2.zig");
 const io = @import("io.zig");
 const Knobs = @import("knobs.zig").Knobs;
 
@@ -68,9 +69,14 @@ fn median(values: []f64) f64 {
 }
 
 pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knobs) !void {
+    return runWithDraft(engine, a, input, knobs, null);
+}
+
+pub fn runWithDraft(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knobs, draft: ?*dflash2.Draft) !void {
     if (input.repeats == 0 or input.prompt_tokens == 0) return error.InvalidBenchmark;
     const total = @as(u64, input.prompt_tokens) + input.decode_tokens;
     if (total > engine.context) return error.ContextExhausted;
+    if (draft != null and !input.greedy and input.decode_tokens > 0) return error.SpeculativeRequiresGreedy;
     const w = try workload(a, input, engine.program.meta.vocab);
     const prompt = w.prompt;
     const decode = w.decode;
@@ -79,41 +85,71 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
     var prefill_dispatches: u64 = 0;
     var decode_dispatches: u64 = 0;
     var prefill_forwards: u64 = 0;
+    var spec_batches: usize = 0;
+    var spec_proposed: usize = 0;
+    var spec_accepted: usize = 0;
     const predictions = try a.alloc(u32, decode.len + 1);
     const warmup_predictions = try a.alloc(u32, predictions.len);
     var checksum: u64 = 0;
     for (0..input.repeats + 1) |rep| {
         engine.reset();
+        if (draft) |d| d.reset();
         prefill_dispatches = 0;
         prefill_forwards = 0;
         decode_dispatches = 0;
         const t0 = try io.now();
-        var i: usize = 0;
-        while (i < prompt.len) {
-            const n = @min(engine.batch, prompt.len - i);
-            const last = i + n == prompt.len;
-            try engine.forward(prompt[i..][0..n], if (last) @intCast(n - 1) else @intCast(n));
-            prefill_dispatches += engine.last.dispatches;
-            prefill_forwards += 1;
-            i += n;
+        var last_row: u32 = 0;
+        if (draft) |d| {
+            const pf = try d.prefill(engine, prompt);
+            last_row = pf.last_row;
+            prefill_dispatches = pf.dispatches;
+            prefill_forwards = pf.forwards;
+        } else {
+            var i: usize = 0;
+            while (i < prompt.len) {
+                const n = @min(engine.batch, prompt.len - i);
+                const last = i + n == prompt.len;
+                try engine.forward(prompt[i..][0..n], if (last) @intCast(n - 1) else @intCast(n));
+                prefill_dispatches += engine.last.dispatches;
+                prefill_forwards += 1;
+                i += n;
+            }
+            last_row = engine.out_end - 1;
         }
-        predictions[0] = try engine.next(engine.out_end - 1);
+        predictions[0] = try engine.next(last_row);
         var sum: u64 = predictions[0];
         if (input.profile_decode and rep == input.repeats) try engine.ctx.beginProfile();
         const t1 = try io.now();
         var detail: [3]f64 = @splat(0); // decode climb 2: encode, wait, GPU seconds
-        for (decode, predictions[1..], 0..) |t, *prediction, step| {
-            try engine.forward(&.{if (input.greedy) predictions[step] else t}, 0);
-            decode_dispatches += engine.last.dispatches;
-            detail[0] += engine.last.encode_seconds;
-            detail[1] += engine.last.wait_seconds;
-            detail[2] += engine.last.gpu_seconds;
-            prediction.* = try engine.next(0);
-            sum +%= prediction.*;
+        if (draft) |d| {
+            const gen = try a.alloc(u32, decode.len);
+            const res = try d.decodeGreedy(engine, predictions[0], gen, .{ .stop_on_eos = false, .commit_all = true });
+            decode_dispatches = res.dispatches;
+            spec_batches = res.batches;
+            spec_proposed = res.proposed;
+            spec_accepted = res.accepted;
+            if (decode.len > 0) {
+                for (1..decode.len) |idx| {
+                    predictions[idx] = gen[idx];
+                    sum +%= gen[idx];
+                }
+                predictions[decode.len] = res.next_token;
+                sum +%= res.next_token;
+            }
+        } else {
+            for (decode, predictions[1..], 0..) |t, *prediction, step| {
+                try engine.forward(&.{if (input.greedy) predictions[step] else t}, 0);
+                decode_dispatches += engine.last.dispatches;
+                detail[0] += engine.last.encode_seconds;
+                detail[1] += engine.last.wait_seconds;
+                detail[2] += engine.last.gpu_seconds;
+                prediction.* = try engine.next(0);
+                sum +%= prediction.*;
+            }
         }
         const t2 = try io.now();
         try engine.d2Settle(); // decode climb 2 (d2_gate): nothing left at the gate before the next run
-        if (input.decode_detail and rep == input.repeats and decode.len > 0) {
+        if (input.decode_detail and draft == null and rep == input.repeats and decode.len > 0) {
             const n: f64 = @floatFromInt(decode.len);
             const us = 1e6 / n;
             std.debug.print("{{\"type\":\"nano_decode_detail\",\"prompt_tokens\":{d},\"wall_us\":{d:.2},\"encode_us\":{d:.2},\"wait_us\":{d:.2},\"gpu_us\":{d:.2},\"other_us\":{d:.2},\"gate_redos\":{d},\"dispatches\":{d:.1}}}\n", .{ input.prompt_tokens, (t2 - t1) * us, detail[0] * us, detail[1] * us, detail[2] * us, (t2 - t1 - detail[0] - detail[1]) * us, engine.d2_redos, @as(f64, @floatFromInt(decode_dispatches)) / n });
@@ -140,7 +176,7 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         .repeats = input.repeats,
         .warmup_runs = 1,
         .workload = if (input.tokens != null) "bos + code repeated (bench tokens file)" else "seeded LCG token stream",
-        .decode_mode = if (input.greedy) "free-running greedy (fixed length)" else "teacher-forced",
+        .decode_mode = if (draft != null) "dflash2 speculative greedy" else if (input.greedy) "free-running greedy (fixed length)" else "teacher-forced",
         .batch = engine.batch,
         .knobs = knobs,
         .prefill_seconds = prefill_s,
@@ -150,6 +186,10 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         .prefill_forwards = prefill_forwards,
         .dispatches_per_prefill_forward = @as(f64, @floatFromInt(prefill_dispatches)) / @as(f64, @floatFromInt(prefill_forwards)),
         .dispatches_per_decode_token = if (input.decode_tokens == 0) 0 else @as(f64, @floatFromInt(decode_dispatches)) / @as(f64, @floatFromInt(input.decode_tokens)),
+        .speculative_batches = spec_batches,
+        .speculative_proposed = spec_proposed,
+        .speculative_accepted = spec_accepted,
+        .mean_accepted_per_step = if (spec_batches == 0) @as(f64, 0) else @as(f64, @floatFromInt(input.decode_tokens)) / @as(f64, @floatFromInt(spec_batches)),
         .prediction_checksum = checksum,
         .predictions = predictions,
     };

@@ -1,6 +1,7 @@
 // Narrow, headless Objective-C ABI. Model scheduling and checkpoint logic live in Zig.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <TargetConditionals.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -104,7 +105,7 @@ static int profile_open(FMContext *c) {
     }
     BOOL dispatch_supported = NO, stage_supported = NO;
     id<MTLCounterSet> timestamp_set = nil;
-    if (@available(macOS 11.0, *)) {
+    if (@available(macOS 11.0, iOS 14.0, *)) {
         dispatch_supported = [c->device supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary];
         stage_supported = [c->device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
         for (id<MTLCounterSet> set in c->device.counterSets) {
@@ -122,7 +123,7 @@ static int profile_open(FMContext *c) {
         return 0;
     }
     if (method == FMProfileCommand) {
-        if (@available(macOS 10.15, *)) { /* GPUStartTime/GPUEndTime available. */ }
+        if (@available(macOS 10.15, iOS 13.0, *)) { /* GPUStartTime/GPUEndTime available. */ }
         else { fail(@"FLINT_PROFILE: no supported GPU timestamp method"); return 0; }
     }
     FMProfile *p = calloc(1, sizeof(*p));
@@ -236,12 +237,21 @@ int fm_is_m3_ultra(void *context) {
     return [c->device.name isEqualToString:@"Apple M3 Ultra"];
 }
 
+const char *fm_device_name(void *context) {
+    FMContext *c = context;
+    return c->device.name.UTF8String ?: "unknown";
+}
+
 void *fm_open(const char *source) {
     FMContext *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->pool = [[NSAutoreleasePool alloc] init];
     c->device = MTLCreateSystemDefaultDevice();
-    if (!c->device || !c->device.hasUnifiedMemory) {
+    if (!c->device
+#if !TARGET_OS_SIMULATOR
+        || !c->device.hasUnifiedMemory
+#endif
+    ) {
         fail(@"A unified-memory Apple GPU is required");
         goto bad;
     }
@@ -249,7 +259,11 @@ void *fm_open(const char *source) {
     NSError *error = nil;
     MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
     // Precise arithmetic makes the baseline easier to compare with a reference.
-    options.mathMode = MTLMathModeSafe;
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        options.mathMode = MTLMathModeSafe;
+        if (options.languageVersion < MTLLanguageVersion3_2)
+            options.languageVersion = MTLLanguageVersion3_2;
+    }
     c->library = [c->device newLibraryWithSource:[NSString stringWithUTF8String:source]
                                        options:options error:&error];
     [options release];
@@ -273,7 +287,7 @@ static id<MTLComputeCommandEncoder> encoder_for(FMContext *c,
     if (!c->command) c->command = [[c->queue commandBuffer] retain];
     if (!c->encoder) {
         if (c->profile && c->profile->method == FMProfileStage) {
-            if (@available(macOS 11.0, *)) {
+            if (@available(macOS 11.0, iOS 14.0, *)) {
                 MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
                 d.dispatchType = MTLDispatchTypeSerial;
                 MTLComputePassSampleBufferAttachmentDescriptor *a = d.sampleBufferAttachments[0];

@@ -3,6 +3,7 @@
 //! new suffix; every generated token (EOS included) is committed to state.
 const std = @import("std");
 const exec = @import("exec.zig");
+const dflash2 = @import("dflash2.zig");
 const io = @import("io.zig");
 const kv_cartridge = @import("kv_cartridge.zig");
 const Allocator = std.mem.Allocator;
@@ -143,11 +144,12 @@ fn finite(logits: []const f32) !void {
     for (logits) |v| if (!std.math.isFinite(v)) return error.NonFiniteLogits;
 }
 
-fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
+fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8, draft: ?*dflash2.Draft) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const request = try parse(a, line);
+    if (draft != null and request.kv_in != null) return error.DraftWithKvCartridgeUnsupported;
     if (request.kv_in) |kv_path| {
         _ = try kv_cartridge.load(engine, a, kv_path);
     }
@@ -159,21 +161,31 @@ fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
     const generated = try a.alloc(u32, request.max_tokens);
     const prefill_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, vocab) else null;
     const final_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, vocab) else null;
-    if (request.kv_in == null and request.reset) engine.reset();
+    if (request.kv_in == null and request.reset) {
+        engine.reset();
+        if (draft) |d| d.reset();
+    }
 
     var dispatches: u64 = 0;
     var forwards: usize = 0;
     const prefill_start = try io.now();
-    var i: usize = 0;
     var row: u32 = 0;
-    while (i < request.tokens.len) {
-        const n = @min(engine.batch, request.tokens.len - i);
-        const last = i + n == request.tokens.len;
-        try engine.forward(request.tokens[i..][0..n], if (last) @intCast(n - 1) else @intCast(n));
-        dispatches += engine.last.dispatches;
-        forwards += 1;
-        row = @intCast(n - 1);
-        i += n;
+    if (draft) |d| {
+        const pf = try d.prefill(engine, request.tokens);
+        dispatches += pf.dispatches;
+        forwards += pf.forwards;
+        row = pf.last_row;
+    } else {
+        var i: usize = 0;
+        while (i < request.tokens.len) {
+            const n = @min(engine.batch, request.tokens.len - i);
+            const last = i + n == request.tokens.len;
+            try engine.forward(request.tokens[i..][0..n], if (last) @intCast(n - 1) else @intCast(n));
+            dispatches += engine.last.dispatches;
+            forwards += 1;
+            row = @intCast(n - 1);
+            i += n;
+        }
     }
     try finite(try engine.logits(row));
     const prefill_seconds = try io.now() - prefill_start;
@@ -182,16 +194,33 @@ fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
     const decode_start = try io.now();
     var count: usize = 0;
     var eos = false;
-    while (count < request.max_tokens) {
-        const token = try engine.next(row);
-        try engine.forward(&.{token}, 0);
-        dispatches += engine.last.dispatches;
-        row = 0;
-        generated[count] = token;
-        count += 1;
-        if (std.mem.indexOfScalar(u32, engine.program.meta.eos, token) != null) {
-            eos = true;
-            break;
+    var spec_batches: usize = 0;
+    var spec_proposed: usize = 0;
+    var spec_accepted: usize = 0;
+    if (draft) |d| {
+        if (request.max_tokens > 0) {
+            const first_tok = try engine.next(row);
+            const res = try d.decodeGreedy(engine, first_tok, generated, .{ .stop_on_eos = true, .commit_all = true });
+            count = res.count;
+            eos = res.eos;
+            row = res.last_row;
+            spec_batches = res.batches;
+            spec_proposed = res.proposed;
+            spec_accepted = res.accepted;
+            dispatches += res.dispatches;
+        }
+    } else {
+        while (count < request.max_tokens) {
+            const token = try engine.next(row);
+            try engine.forward(&.{token}, 0);
+            dispatches += engine.last.dispatches;
+            row = 0;
+            generated[count] = token;
+            count += 1;
+            if (std.mem.indexOfScalar(u32, engine.program.meta.eos, token) != null) {
+                eos = true;
+                break;
+            }
         }
     }
     try finite(try engine.logits(row));
@@ -216,6 +245,9 @@ fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
         .decode_seconds = decode_seconds,
         .kv_allocated_bytes = bytes.allocated,
         .kv_valid_bytes = bytes.valid,
+        .speculative_batches = spec_batches,
+        .speculative_proposed = spec_proposed,
+        .speculative_accepted = spec_accepted,
         .prefill_forwards = forwards,
         .dispatches = dispatches,
         .prefill_logits = prefill_copy,
@@ -227,13 +259,17 @@ fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
 }
 
 pub fn run(engine: *exec.Engine, gpa: Allocator) !void {
-    return runImpl(engine, gpa) catch |err| {
+    return runWithDraft(engine, gpa, null);
+}
+
+pub fn runWithDraft(engine: *exec.Engine, gpa: Allocator, draft: ?*dflash2.Draft) !void {
+    return runImpl(engine, gpa, draft) catch |err| {
         std.debug.print("Session failed: {s}\n", .{@errorName(err)});
         return err;
     };
 }
 
-fn runImpl(engine: *exec.Engine, gpa: Allocator) !void {
+fn runImpl(engine: *exec.Engine, gpa: Allocator, draft: ?*dflash2.Draft) !void {
     const storage = try gpa.alloc(u8, max_line_bytes);
     defer gpa.free(storage);
     var lines: LineBuffer = .{ .storage = storage };
@@ -242,11 +278,11 @@ fn runImpl(engine: *exec.Engine, gpa: Allocator) !void {
         const n = read(0, &chunk, chunk.len);
         if (n < 0) return error.InputFailed;
         if (n == 0) {
-            if (lines.finish()) |line| try handle(engine, gpa, line);
+            if (lines.finish()) |line| try handle(engine, gpa, line, draft);
             return;
         }
         for (chunk[0..@intCast(n)]) |byte| {
-            if (try lines.push(byte)) |line| try handle(engine, gpa, line);
+            if (try lines.push(byte)) |line| try handle(engine, gpa, line, draft);
         }
     }
 }

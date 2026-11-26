@@ -2,6 +2,7 @@ const std = @import("std");
 extern fn fm_open([*:0]const u8) ?*anyopaque;
 extern fn fm_close(*anyopaque) void;
 extern fn fm_is_m3_ultra(*anyopaque) c_int;
+extern fn fm_device_name(*anyopaque) [*:0]const u8;
 extern fn fm_error() [*:0]const u8;
 extern fn fm_finish(*anyopaque) c_int;
 extern fn fm_profile_begin(*anyopaque) c_int;
@@ -60,6 +61,10 @@ pub const Params = extern struct {
     scale: f32 = 1,
 };
 
+pub fn lastError() []const u8 {
+    return std.mem.span(fm_error());
+}
+
 fn failure() error{MetalFailure} {
     std.debug.print("Metal: {s}\n", .{std.mem.span(fm_error())});
     return error.MetalFailure;
@@ -117,6 +122,9 @@ pub const Context = struct {
     }
     pub fn isM3Ultra(self: Context) bool {
         return fm_is_m3_ultra(self.handle) != 0;
+    }
+    pub fn deviceName(self: Context) []const u8 {
+        return std.mem.span(fm_device_name(self.handle));
     }
     pub fn deinit(self: Context) void {
         fm_close(self.handle);

@@ -1,16 +1,21 @@
 //! nano: the model-agnostic megakernel executable. The front end is chosen by
 //! the checkpoint's config.json model_type.
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const exec = @import("exec.zig");
 const loader = @import("loader.zig");
 const frontend = @import("frontend.zig");
 const session = @import("session.zig");
 const bench = @import("bench.zig");
+const dflash2 = @import("dflash2.zig");
 const io = @import("io.zig");
 const kv_cartridge = @import("kv_cartridge.zig");
 const Knobs = @import("knobs.zig").Knobs;
 const weights = @import("weights");
+
+pub const std_options_debug_threaded_io: ?*std.Io.Threaded = if (builtin.os.tag == .ios) null else std.Io.Threaded.global_single_threaded;
+pub const std_options_debug_io: std.Io = if (builtin.os.tag == .ios) io.ios_debug_io else std.Io.Threaded.global_single_threaded.io();
 
 const usage =
     \\nano: model-agnostic Zig + Metal megakernel (Apple Silicon)
@@ -61,7 +66,28 @@ fn parseTokens(a: std.mem.Allocator, bytes: []const u8, key: []const u8) ![]u32 
     return out;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init_arg: if (builtin.os.tag == .ios) std.process.Init.Minimal else std.process.Init) !void {
+    if (builtin.os.tag == .ios) {
+        const gpa = std.heap.c_allocator;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var environ_map = try init_arg.environ.createMap(gpa);
+        defer environ_map.deinit();
+        const preopens = try std.process.Preopens.init(arena.allocator());
+        return runMain(.{
+            .minimal = init_arg,
+            .arena = &arena,
+            .gpa = gpa,
+            .io = io.ios_debug_io,
+            .environ_map = &environ_map,
+            .preopens = preopens,
+        });
+    } else {
+        return runMain(init_arg);
+    }
+}
+
+fn runMain(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const gpa = init.gpa;
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -117,6 +143,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_out: ?[]const u8 = null;
     var kv_dtype: kv_cartridge.DType = .f32;
     var max_tokens: u32 = 32;
+    var draft_dir: ?[]const u8 = null;
     var bench_input: bench.Input = .{};
     // --knob flags apply after --knobs FILE whatever their order on the line.
     var knob_flags: std.ArrayList([]const u8) = .empty;
@@ -192,6 +219,8 @@ pub fn main(init: std.process.Init) !void {
             kv_out = value;
         } else if (std.mem.eql(u8, flag, "--kv-dtype")) {
             kv_dtype = kv_cartridge.parseDType(value) orelse return error.InvalidKvDType;
+        } else if (std.mem.eql(u8, flag, "--draft")) {
+            draft_dir = value;
         } else {
             std.debug.print("Unknown flag {s}\n", .{flag});
             return error.UnknownFlag;
@@ -201,6 +230,7 @@ pub fn main(init: std.process.Init) !void {
         const eq = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidKnob;
         try common.knobs.set(value[0..eq], value[eq + 1 ..]);
     }
+    if (draft_dir != null) common.knobs.d2_gate = false;
     try common.knobs.validate();
 
     if (std.mem.eql(u8, command, "inspect")) return inspect(gpa, a, directory, common);
@@ -209,16 +239,23 @@ pub fn main(init: std.process.Init) !void {
         loaded.deinit();
         gpa.destroy(loaded);
     }
+    if (draft_dir != null and kv_in != null) return error.DraftWithKvCartridgeUnsupported;
+    var draft: ?*dflash2.Draft = null;
+    if (draft_dir) |dd| {
+        if (loaded.engine.batch < 8 and common.context >= 8) return error.DraftRequiresLargerBatch;
+        draft = try dflash2.Draft.init(gpa, &loaded.engine, dd);
+    }
+    defer if (draft) |d| d.deinit();
     std.debug.print("nano: {s}, {d} ops, {d} states, context={d}, batch={d}, {d} mapped bytes\n", .{ loaded.program.meta.model_type, loaded.program.ops.len, loaded.program.states.len, loaded.engine.context, loaded.engine.batch, loaded.store.bytes });
     if (std.mem.eql(u8, command, "session")) {
         if (kv_in) |path| _ = try kv_cartridge.load(&loaded.engine, a, path);
-        return session.run(&loaded.engine, gpa);
+        return session.runWithDraft(&loaded.engine, gpa, draft);
     }
-    if (std.mem.eql(u8, command, "bench")) return bench.run(&loaded.engine, a, bench_input, common.knobs);
+    if (std.mem.eql(u8, command, "bench")) return bench.runWithDraft(&loaded.engine, a, bench_input, common.knobs, draft);
     const prompt = tokens orelse return error.MissingTokens;
     if (prompt.len == 0) return error.EmptyPrompt;
     if (std.mem.eql(u8, command, "encode")) return encodeCartridge(&loaded.engine, a, prompt, feed, kv_in, kv_out orelse return error.MissingKvOut, kv_dtype, hidden_out);
-    if (std.mem.eql(u8, command, "generate")) return generate(&loaded.engine, a, prompt, max_tokens, kv_in, kv_out, kv_dtype);
+    if (std.mem.eql(u8, command, "generate")) return generate(&loaded.engine, a, prompt, max_tokens, kv_in, kv_out, kv_dtype, draft);
     if (std.mem.eql(u8, command, "eval")) {
         var positions: []u32 = undefined;
         if (positions_file) |f| {
@@ -260,9 +297,9 @@ fn inspect(gpa: std.mem.Allocator, a: std.mem.Allocator, directory: []const u8, 
     }
     try io.print(a, "model_type={s} vocab={d} max_context={d} weights={d} states={d} ops={d} head_ops={d} traces={d}\n", .{ program.meta.model_type, program.meta.vocab, program.meta.max_context, program.weights.len, program.states.len, program.ops.len, program.ops.len - program.head_start, program.traces.len });
     for (names.items, counts.items) |name, count| try io.print(a, "  op {s}: {d}\n", .{ name, count });
-    var kinds: [5]u32 = @splat(0);
+    var kinds: [6]u32 = @splat(0);
     for (program.states) |s| kinds[@backingInt(s.kind)] += 1;
-    try io.print(a, "  states: tokens={d} scratch={d} sequence={d} ring={d} position={d}\n", .{ kinds[0], kinds[1], kinds[2], kinds[3], kinds[4] });
+    try io.print(a, "  states: tokens={d} scratch={d} sequence={d} ring={d} recurrent={d} position={d}\n", .{ kinds[0], kinds[1], kinds[2], kinds[3], kinds[4], kinds[5] });
     var bound: usize = 0;
     for (program.weights) |w| {
         _ = try exec.bindWeight(&store, w);
@@ -337,10 +374,39 @@ fn encodeCartridge(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u
     try io.out("\n");
 }
 
-fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max_tokens: u32, kv_in: ?[]const u8, kv_out: ?[]const u8, kv_dtype: kv_cartridge.DType) !void {
+fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max_tokens: u32, kv_in: ?[]const u8, kv_out: ?[]const u8, kv_dtype: kv_cartridge.DType, draft: ?*dflash2.Draft) !void {
+    if (draft != null and kv_in != null) return error.DraftWithKvCartridgeUnsupported;
     if (kv_in) |path| _ = try kv_cartridge.load(engine, a, path);
     const required: u64 = @as(u64, engine.position) + prompt.len + if (max_tokens == 0) 0 else max_tokens - 1;
     if (required > engine.context) return error.ContextExhausted;
+    if (draft) |d| {
+        const t0 = try io.now();
+        const pf = try d.prefill(engine, prompt);
+        const first_tok = try engine.next(pf.last_row);
+        const t1 = try io.now();
+        const out = try a.alloc(u32, max_tokens);
+        const res = try d.decodeGreedy(engine, first_tok, out, .{ .stop_on_eos = true, .commit_all = kv_out != null });
+        const t2 = try io.now();
+        const dt = t2 - t1;
+        const mean_acc = if (res.batches == 0) 0.0 else @as(f64, @floatFromInt(res.count)) / @as(f64, @floatFromInt(res.batches));
+        const tok_s = if (dt > 0) @as(f64, @floatFromInt(res.count)) / dt else 0.0;
+        std.debug.print("dflash2: prefill={d:.2}ms decode={d:.2}ms ({d:.1} tok/s) tokens={d} batches={d} proposed={d} accepted={d} mean_step={d:.2} draft={d:.2}ms verify={d:.2}ms\n", .{
+            (t1 - t0) * 1000.0,
+            dt * 1000.0,
+            tok_s,
+            res.count,
+            res.batches,
+            res.proposed,
+            res.accepted,
+            mean_acc,
+            res.draft_seconds * 1000.0,
+            res.verify_seconds * 1000.0,
+        });
+        if (kv_out) |path| _ = try kv_cartridge.save(engine, a, path, kv_dtype, "{}");
+        try io.out(try std.json.Stringify.valueAlloc(a, .{ .tokens = out[0..res.count] }, .{}));
+        try io.out("\n");
+        return;
+    }
     var row = try prefill(engine, prompt);
     var out: std.ArrayList(u32) = .empty;
     for (0..max_tokens) |i| {
@@ -458,11 +524,13 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
 test {
     _ = @import("ir.zig");
     _ = @import("lfm3.zig");
+    _ = @import("qwen3_5.zig");
     _ = @import("inkling2_loop.zig");
     _ = @import("packed.zig");
     _ = @import("knobs.zig");
     _ = @import("session.zig");
     _ = @import("kv_cartridge.zig");
+    _ = @import("dflash2.zig");
     _ = @import("kernel_tests.zig");
 }
 test { _ = @import("plan.zig"); }
