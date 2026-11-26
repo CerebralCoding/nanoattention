@@ -258,6 +258,98 @@ kernel void mk_bf16_linear_4x1_softcap_vec8(device const uchar *w [[buffer(0)]],
     mk_bf16_softcap_impl<true>(w, arena, p, gid, lane);
 }
 
+// Single-weight-read dual head linear + BF16 round + tanh softcap for LoopCD logits/logits-adaptive.
+// Reads BF16 unembed weights once across strong (`p.x`/`p.xs`) and weak (`p.z`/`p.zs`) hidden vectors.
+template <bool Wide, bool Fixed>
+inline void mk_bf16_softcap_loopcd_impl(device const uchar *w, device float *arena, constant MK &p, uint gid, uint lane) {
+    const uint row = (gid / 32u) * 4u;
+    if (row >= p.m) return;
+    const uint valid = min(4u, p.m - row);
+    const uint stride = p.n / 4u;
+    device const float4 *xs = (device const float4 *)(arena + p.x + p.row0 * p.xs);
+    device const float4 *xw = (device const float4 *)(arena + p.z + p.row0 * p.zs);
+    float ps[4] = {};
+    float pw[4] = {};
+    if constexpr (Wide) {
+        const uint wstride = p.n / 8u;
+        device const uint4 *w8 = (device const uint4 *)(w + p.w) + ulong(row) * wstride;
+        for (uint k = lane; k < wstride; k += 32u) {
+            const float4 as0 = xs[2u * k], as1 = xs[2u * k + 1u];
+            const float4 aw0 = xw[2u * k], aw1 = xw[2u * k + 1u];
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                if (j < valid) {
+                    const uint4 raw = w8[ulong(j) * wstride + k];
+                    const ushort4 u0(ushort(raw.x), ushort(raw.x >> 16), ushort(raw.y), ushort(raw.y >> 16));
+                    const ushort4 u1(ushort(raw.z), ushort(raw.z >> 16), ushort(raw.w), ushort(raw.w >> 16));
+                    const float4 b0 = as_type<float4>(uint4(u0) << 16);
+                    const float4 b1 = as_type<float4>(uint4(u1) << 16);
+                    ps[j] = fma(as0.x, b0.x, fma(as0.y, b0.y, fma(as0.z, b0.z, fma(as0.w, b0.w, ps[j]))));
+                    ps[j] = fma(as1.x, b1.x, fma(as1.y, b1.y, fma(as1.z, b1.z, fma(as1.w, b1.w, ps[j]))));
+                    pw[j] = fma(aw0.x, b0.x, fma(aw0.y, b0.y, fma(aw0.z, b0.z, fma(aw0.w, b0.w, pw[j]))));
+                    pw[j] = fma(aw1.x, b1.x, fma(aw1.y, b1.y, fma(aw1.z, b1.z, fma(aw1.w, b1.w, pw[j]))));
+                }
+            }
+        }
+    } else {
+        device const ushort4 *weights = (device const ushort4 *)(w + p.w) + ulong(row) * stride;
+        #pragma unroll 4
+        for (uint k = lane; k < stride; k += 32u) {
+            const float4 as = xs[k];
+            const float4 aw = xw[k];
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                if (j < valid) {
+                    const float4 b = as_type<float4>(uint4(weights[ulong(j) * stride + k]) << 16);
+                    for (uint i = 0u; i < 4u; ++i) {
+                        ps[j] = fma(as[i], b[i], ps[j]);
+                        pw[j] = fma(aw[i], b[i], pw[j]);
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        const float sum_s = simd_sum(ps[j]);
+        const float sum_w = simd_sum(pw[j]);
+        if (lane == 0u && j < valid) {
+            const float ss = tanh(mk_bf16(sum_s) / p.scale) * p.scale;
+            const float sw = tanh(mk_bf16(sum_w) / p.scale) * p.scale;
+            if constexpr (Fixed) {
+                arena[p.y + p.row0 * p.ys + row + j] = (p.eps == 0.0f) ? ss : (ss + p.eps * (ss - sw));
+            } else {
+                arena[p.y + p.row0 * p.ys + row + j] = ss;
+                arena[p.every + p.row0 * p.pad_k + row + j] = sw;
+            }
+        }
+    }
+}
+
+kernel void mk_bf16_linear_4x2_softcap_loopcd(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                              constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                              uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_softcap_loopcd_impl<false, true>(w, arena, p, gid, lane);
+}
+
+kernel void mk_bf16_linear_4x2_softcap_loopcd_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                   constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                                   uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_softcap_loopcd_impl<true, true>(w, arena, p, gid, lane);
+}
+
+kernel void mk_bf16_linear_4x2_softcap_dual(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                            constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                            uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_softcap_loopcd_impl<false, false>(w, arena, p, gid, lane);
+}
+
+kernel void mk_bf16_linear_4x2_softcap_dual_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                 constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                                 uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_softcap_loopcd_impl<true, false>(w, arena, p, gid, lane);
+}
+
 // ---- Step 3C kernels: depth attention, depth+norm fusions, rmsnorm_fast, add_norm, store_pack, conv, l2_clip, relbias ----
 constant uint MK_INKLING_ROUND_RES = 64u;
 

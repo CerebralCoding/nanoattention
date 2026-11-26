@@ -52,6 +52,10 @@ const run_help =
     \\                           second, time to first token, reply tokens and tokens a second
     \\  --context N              positions the model's state holds (default 4096)
     \\  --prefill exact|mlx      how the prompt is read (below; default exact)
+    \\  --loop-passes N          Inkling core loop passes (1..3; default checkpoint)
+    \\  --loopcd MODE            Inkling LoopCD: off, hidden, logits, logits-adaptive
+    \\  --loopcd-omega W         LoopCD contrast scale omega >= 0 (default 1.0)
+    \\  --loopcd-weak-pass N     1-based weak pass index < loop passes (default 1)
     \\  --knobs FILE.json, --knob name=value   engine knobs instead of / over the preset
     \\Sampling (default greedy: deterministic, the engine's GPU argmax):
     \\  --temperature T  --top-k K  --top-p P  --repetition-penalty R  --seed S
@@ -75,7 +79,8 @@ const chat_help =
     \\reads only the new tokens.
     \\Options: --system TEXT, --max-tokens N (per reply, default 1024), --think, --no-think,
     \\--no-thinking-output, --json (one JSON line per turn: fed ids, reply ids, text, timings),
-    \\--stats (after every reply), --context N, --prefill exact|mlx, --knobs, --knob, and the
+    \\--stats (after every reply), --context N, --prefill exact|mlx, --loop-passes,
+    \\--loopcd, --loopcd-omega, --loopcd-weak-pass, --knobs, --knob, and the
     \\sampling options of `nano run --help`.
     \\
 ;
@@ -173,6 +178,10 @@ const Options = struct {
     thinking_output: bool = true,
     context: u32 = 4096,
     prefill: Prefill = .exact,
+    loop_passes: ?u32 = null,
+    loopcd: frontend.LoopCdMode = .off,
+    loopcd_omega: f32 = 1.0,
+    loopcd_weak_pass: u32 = 1,
     knobs_file: ?[]const u8 = null,
     knob_flags: std.ArrayList([]const u8) = .empty,
     sampling_model: bool = false,
@@ -188,9 +197,10 @@ const Options = struct {
 };
 
 const generation_options = [_][]const u8{
-    "--system",     "--max-tokens", "--raw",         "--json",               "--stats",     "--think", "--no-think", "--no-thinking-output",
-    "--context",    "--prefill",    "--knobs",       "--knob",               "--sampling",  "--temperature",
-    "--top-k",      "--top-p",      "--repetition-penalty", "--seed",
+    "--system",       "--max-tokens",   "--raw",          "--json",               "--stats",           "--think",      "--no-think", "--no-thinking-output",
+    "--context",      "--prefill",      "--loop-passes",  "--loopcd",             "--loopcd-omega",    "--loopcd-weak-pass",
+    "--knobs",        "--knob",         "--sampling",     "--temperature",
+    "--top-k",        "--top-p",        "--repetition-penalty", "--seed",
 };
 
 fn allowed(command: Command, name: []const u8) bool {
@@ -205,7 +215,7 @@ fn allowed(command: Command, name: []const u8) bool {
 }
 
 fn takesValue(name: []const u8) bool {
-    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
+    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
         if (eql(v, name)) return true;
     return false;
 }
@@ -275,6 +285,20 @@ fn parseOptions(a: Allocator, command: Command, args: []const []const u8) !Optio
             o.context = try parseNumber(u32, name, value);
         } else if (eql(name, "--prefill")) {
             o.prefill = std.meta.stringToEnum(Prefill, value) orelse return usageError("--prefill is exact or mlx, not \"{s}\"", .{value});
+        } else if (eql(name, "--loop-passes")) {
+            const lp = try parseNumber(u32, name, value);
+            if (lp == 0) return usageError("--loop-passes must be positive", .{});
+            o.loop_passes = lp;
+        } else if (eql(name, "--loopcd")) {
+            o.loopcd = frontend.parseLoopCdMode(value) orelse return usageError("--loopcd is off, hidden, logits, or logits-adaptive, not \"{s}\"", .{value});
+        } else if (eql(name, "--loopcd-omega")) {
+            const w = try parseNumber(f32, name, value);
+            if (!std.math.isFinite(w) or w < 0) return usageError("--loopcd-omega must be finite and >= 0", .{});
+            o.loopcd_omega = w;
+        } else if (eql(name, "--loopcd-weak-pass")) {
+            const wp = try parseNumber(u32, name, value);
+            if (wp == 0) return usageError("--loopcd-weak-pass must be positive", .{});
+            o.loopcd_weak_pass = wp;
         } else if (eql(name, "--knobs")) {
             o.knobs_file = value;
         } else if (eql(name, "--knob")) {
@@ -751,7 +775,12 @@ fn samplingFor(ctx: *Context, dir: []const u8, o: *const Options) !sample.Params
 fn loadEngine(ctx: *Context, dir: []const u8, o: *const Options) !*loader.Loaded {
     const knobs = try knobsFor(ctx, o);
     if (o.context == 0) return usageError("--context must be positive", .{});
-    return loader.load(ctx.gpa, ctx.a, dir, knobs, o.context, .{}) catch |err| fail("cannot load {s}: {s}", .{ dir, @errorName(err) });
+    return loader.load(ctx.gpa, ctx.a, dir, knobs, o.context, .{
+        .loop_passes = o.loop_passes,
+        .loopcd = o.loopcd,
+        .loopcd_omega = o.loopcd_omega,
+        .loopcd_weak_pass = o.loopcd_weak_pass,
+    }) catch |err| fail("cannot load {s}: {s}", .{ dir, @errorName(err) });
 }
 
 fn stopName(s: Stop) []const u8 {
@@ -1031,6 +1060,15 @@ test "options: model-free parsing, values, unknown options" {
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{"--max-tokens"}));
     const d = try parseOptions(a, .detokenize, &.{ "--", "1", "2" });
     try std.testing.expectEqual(@as(usize, 2), d.positionals.items.len);
+    const lc = try parseOptions(a, .chat, &.{ "--loop-passes=2", "--loopcd", "logits-adaptive", "--loopcd-omega=1.25", "--loopcd-weak-pass", "1" });
+    try std.testing.expectEqual(@as(u32, 2), lc.loop_passes.?);
+    try std.testing.expectEqual(frontend.LoopCdMode.logits_adaptive, lc.loopcd);
+    try std.testing.expectEqual(@as(f32, 1.25), lc.loopcd_omega);
+    try std.testing.expectEqual(@as(u32, 1), lc.loopcd_weak_pass);
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loop-passes", "0" }));
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd", "invalid" }));
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd-omega", "-0.5" }));
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd-weak-pass", "0" }));
 }
 
 test "the embedded presets are valid knob sets" {

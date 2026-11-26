@@ -143,6 +143,10 @@ pub const Op = union(enum) {
     expert_down: struct { x: View, routes: View, out: View, bank: PackedProjection, experts: u32, top_k: u32, round: Round, input_bf16: bool = false },
     /// out[r] = lowest index of the maximum of x[r]; all-u32 sentinel on non-finite input.
     argmax: struct { x: View, out: View },
+    /// LoopCD off-the-shelf loop contrastive decoding: out = strong + w * (strong - weak).
+    /// When `adaptive` is true, computes w = omega * (1 - (p1 - p2)) from the top-2 softmax
+    /// probabilities of `strong` over the row; otherwise uses fixed weight `omega`.
+    loopcd_contrast: struct { strong: View, weak: View, out: View, omega: f32, adaptive: bool = false, round: Round = .none },
 
     pub fn name(self: Op) []const u8 {
         return @tagName(std.meta.activeTag(self));
@@ -418,6 +422,16 @@ pub const Program = struct {
                 try self.checkView(a.x, .scratch);
                 try self.checkView(a.out, .scratch);
                 if (a.out.width != 1) return error.ShapeMismatch;
+            },
+            .loopcd_contrast => |l| {
+                try self.checkView(l.strong, .scratch);
+                try self.checkView(l.weak, .scratch);
+                try self.checkView(l.out, .scratch);
+                if (l.strong.width == 0 or l.strong.width != l.weak.width or l.strong.width != l.out.width) return error.ShapeMismatch;
+                if (!std.math.isFinite(l.omega) or l.omega < 0) return error.InvalidScale;
+                const bad_strong = l.out.state == l.strong.state and l.out.col != l.strong.col;
+                const bad_weak = l.out.state == l.weak.state and l.out.col != l.weak.col;
+                if (bad_strong or bad_weak) return error.LoopCdContrastAliasing;
             },
         }
     }

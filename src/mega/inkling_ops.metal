@@ -1522,3 +1522,222 @@ kernel void mk_relative_split_merge(device float *arena [[buffer(0)]], device co
         if (d < p.dim) dst[d] = acc[e] / denominator;
     }
 }
+
+// ---- LoopCD (Loop Contrastive Decoding, arXiv:2610.02185) -------------------
+// Contrasts strong (final) and weak (earlier pass) representations or logits:
+//   out = strong + w * (strong - weak).
+// `fixed`: constant w = p.scale.
+// `adaptive`: per-row confidence-gated w = p.scale * (1 - (p1 - p2)), where p1
+// and p2 are the top-2 softmax probabilities of `strong` over the row.
+kernel void mk_loopcd_contrast_fixed(device float *arena [[buffer(0)]], constant MK &p [[buffer(8)]],
+                                     uint i [[thread_position_in_grid]]) {
+    uint r = i / p.n, c = i % p.n;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    float s = arena[p.x + row * p.xs + c];
+    float w = arena[p.y + row * p.ys + c];
+    float out = (p.scale == 0.0f) ? s : (s + p.scale * (s - w));
+    if (p.flags & MK_ROUND_BF16) out = mk_bf16(out);
+    arena[p.z + row * p.zs + c] = out;
+}
+
+kernel void mk_loopcd_contrast_adaptive(device float *arena [[buffer(0)]], constant MK &p [[buffer(8)]],
+                                        uint tid [[thread_index_in_threadgroup]],
+                                        uint lane [[thread_index_in_simdgroup]],
+                                        uint simd [[simdgroup_index_in_threadgroup]],
+                                        uint group [[threadgroup_position_in_grid]]) {
+    if (group >= p.rows || p.n == 0u) return;
+    uint row = p.row0 + group;
+    device const float *strong_row = arena + p.x + row * p.xs;
+
+    float m1 = -INFINITY, m2 = -INFINITY;
+    for (uint c = tid; c < p.n; c += 256u) {
+        float v = strong_row[c];
+        if (!isfinite(v)) continue;
+        if (v >= m1) {
+            m2 = m1;
+            m1 = v;
+        } else if (v > m2) {
+            m2 = v;
+        }
+    }
+    for (uint d = 16u; d > 0u; d >>= 1u) {
+        float o1 = simd_shuffle_down(m1, d);
+        float o2 = simd_shuffle_down(m2, d);
+        if (o1 >= m1) {
+            m2 = max(m1, o2);
+            m1 = o1;
+        } else if (o1 > m2) {
+            m2 = o1;
+        }
+    }
+    threadgroup float tg_m1[8], tg_m2[8], tg_d[8];
+    if (lane == 0u) {
+        tg_m1[simd] = m1;
+        tg_m2[simd] = m2;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float rm1 = -INFINITY, rm2 = -INFINITY;
+        for (uint s = 0u; s < 8u; ++s) {
+            float o1 = tg_m1[s], o2 = tg_m2[s];
+            if (o1 >= rm1) {
+                rm2 = max(rm1, o2);
+                rm1 = o1;
+            } else if (o1 > rm2) {
+                rm2 = o1;
+            }
+        }
+        tg_m1[0] = rm1;
+        tg_m2[0] = rm2;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float max1 = tg_m1[0], max2 = tg_m2[0];
+    float denom_acc = 0.0f;
+    if (isfinite(max1)) {
+        for (uint c = tid; c < p.n; c += 256u) {
+            float v = strong_row[c];
+            if (isfinite(v)) denom_acc += metal::precise::exp(v - max1);
+        }
+    }
+    denom_acc = simd_sum(denom_acc);
+    if (lane == 0u) tg_d[simd] = denom_acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float z = 0.0f;
+        for (uint s = 0u; s < 8u; ++s) z += tg_d[s];
+        float w = 0.0f;
+        if (p.scale != 0.0f && isfinite(max1) && z > 0.0f && isfinite(z)) {
+            float p1 = 1.0f / z;
+            float p2 = isfinite(max2) ? (metal::precise::exp(max2 - max1) / z) : 0.0f;
+            float gap = clamp(p1 - p2, 0.0f, 1.0f);
+            w = p.scale * (1.0f - gap);
+        }
+        tg_d[0] = w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float w = tg_d[0];
+    device const float *weak_row = arena + p.y + row * p.ys;
+    device float *out_row = arena + p.z + row * p.zs;
+    for (uint c = tid; c < p.n; c += 256u) {
+        float s = strong_row[c];
+        float out = (w == 0.0f) ? s : (s + w * (s - weak_row[c]));
+        if (p.flags & MK_ROUND_BF16) out = mk_bf16(out);
+        out_row[c] = out;
+    }
+}
+
+inline void mk_loopcd_merge(thread float &m1, thread float &m2, thread float &z,
+                            float o1, float o2, float oz) {
+    if (oz <= 0.0f) return;
+    if (z <= 0.0f) {
+        m1 = o1;
+        m2 = o2;
+        z = oz;
+        return;
+    }
+    if (o1 >= m1) {
+        z = z * metal::precise::exp(m1 - o1) + oz;
+        m2 = max(m1, o2);
+        m1 = o1;
+    } else {
+        z = z + oz * metal::precise::exp(o1 - m1);
+        if (o1 > m2) m2 = o1;
+    }
+}
+
+// Parallel 2-pass adaptive LoopCD contrast reusing `partials` (`rows * p.every * 3` floats).
+kernel void mk_loopcd_adaptive_part(device const float *arena [[buffer(0)]], device float *P [[buffer(1)]],
+                                    constant MK &p [[buffer(8)]], uint tgid [[threadgroup_position_in_grid]],
+                                    uint lid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                                    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint r = tgid / p.every, g = tgid % p.every;
+    if (r >= p.rows || p.n == 0u) return;
+    device const float *strong_row = arena + p.x + ulong(p.row0 + r) * p.xs;
+    uint lo = g * p.m, hi = min(lo + p.m, p.n);
+    float m1 = -INFINITY, m2 = -INFINITY, z = 0.0f;
+    for (uint i = lo + lid; i < hi; i += tg) {
+        float v = strong_row[i];
+        if (!isfinite(v)) continue;
+        mk_loopcd_merge(m1, m2, z, v, -INFINITY, 1.0f);
+    }
+    for (uint d = 16u; d > 0u; d >>= 1u) {
+        float o1 = simd_shuffle_down(m1, d);
+        float o2 = simd_shuffle_down(m2, d);
+        float oz = simd_shuffle_down(z, d);
+        mk_loopcd_merge(m1, m2, z, o1, o2, oz);
+    }
+    threadgroup float tg_m1[32], tg_m2[32], tg_z[32];
+    uint nsimd = (tg + 31u) / 32u;
+    if (lane == 0u) {
+        tg_m1[simd] = m1;
+        tg_m2[simd] = m2;
+        tg_z[simd] = z;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0u) {
+        m1 = (lane < nsimd) ? tg_m1[lane] : -INFINITY;
+        m2 = (lane < nsimd) ? tg_m2[lane] : -INFINITY;
+        z = (lane < nsimd) ? tg_z[lane] : 0.0f;
+        for (uint d = 16u; d > 0u; d >>= 1u) {
+            float o1 = simd_shuffle_down(m1, d);
+            float o2 = simd_shuffle_down(m2, d);
+            float oz = simd_shuffle_down(z, d);
+            mk_loopcd_merge(m1, m2, z, o1, o2, oz);
+        }
+        if (lane == 0u) {
+            device float *o = P + (ulong(r) * p.every + g) * 3u;
+            o[0] = m1;
+            o[1] = m2;
+            o[2] = z;
+        }
+    }
+}
+
+kernel void mk_loopcd_adaptive_apply(device float *arena [[buffer(0)]], device const float *P [[buffer(1)]],
+                                     constant MK &p [[buffer(8)]], uint tgid [[threadgroup_position_in_grid]],
+                                     uint lid [[thread_index_in_threadgroup]], uint tg [[threads_per_threadgroup]],
+                                     uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint r = tgid / p.every, g = tgid % p.every;
+    if (r >= p.rows || p.n == 0u) return;
+    threadgroup float sh_w[1];
+    if (simd == 0u) {
+        float m1 = -INFINITY, m2 = -INFINITY, z = 0.0f;
+        for (uint k = lane; k < p.every; k += 32u) {
+            device const float *q = P + (ulong(r) * p.every + k) * 3u;
+            mk_loopcd_merge(m1, m2, z, q[0], q[1], q[2]);
+        }
+        for (uint d = 16u; d > 0u; d >>= 1u) {
+            float o1 = simd_shuffle_down(m1, d);
+            float o2 = simd_shuffle_down(m2, d);
+            float oz = simd_shuffle_down(z, d);
+            mk_loopcd_merge(m1, m2, z, o1, o2, oz);
+        }
+        if (lane == 0u) {
+            float w = 0.0f;
+            if (p.scale != 0.0f && isfinite(m1) && z > 0.0f && isfinite(z)) {
+                float p1 = 1.0f / z;
+                float p2 = isfinite(m2) ? (metal::precise::exp(m2 - m1) / z) : 0.0f;
+                float gap = clamp(p1 - p2, 0.0f, 1.0f);
+                w = p.scale * (1.0f - gap);
+            }
+            sh_w[0] = w;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float w = sh_w[0];
+    uint row = p.row0 + r;
+    device const float *strong_row = arena + p.x + ulong(row) * p.xs;
+    device const float *weak_row = arena + p.y + ulong(row) * p.ys;
+    device float *out_row = arena + p.z + ulong(row) * p.zs;
+    uint lo = g * p.m, hi = min(lo + p.m, p.n);
+    for (uint i = lo + lid; i < hi; i += tg) {
+        float s = strong_row[i];
+        float out = (w == 0.0f) ? s : (s + w * (s - weak_row[i]));
+        if (p.flags & MK_ROUND_BF16) out = mk_bf16(out);
+        out_row[i] = out;
+    }
+}

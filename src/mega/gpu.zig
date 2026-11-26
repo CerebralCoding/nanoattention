@@ -93,6 +93,58 @@ pub const ParamsX = extern struct {
     act_b: u32 = 0,
     kind: u32 = 0,
 };
+/// Mirror of MKLSA in src/mega/inkling_lsa.metal (240 bytes).
+pub const LSAParams = extern struct {
+    off_head_scores: u64 = 0,
+    off_tg_stats: u64 = 0,
+    off_head_lse: u64 = 0,
+    off_scores: u64 = 0,
+    off_hist: u64 = 0,
+    off_cand_count: u64 = 0,
+    off_cand_m: u64 = 0,
+    off_cand_u: u64 = 0,
+    off_fine_cand: u64 = 0,
+    off_fine_count: u64 = 0,
+    rel_w_off: u64 = 0,
+    units: u32 = 0,
+    rows: u32 = 0,
+    row0: u32 = 0,
+    pos0: u32 = 0,
+    row_step: u32 = 1,
+    unit_offset: u32 = 0,
+    dim: u32 = 0,
+    heads: u32 = 0,
+    kv_heads: u32 = 0,
+    capacity: u32 = 0,
+    q_off: u32 = 0,
+    q_stride: u32 = 0,
+    sink_off: u32 = 0,
+    sink_stride: u32 = 0,
+    bias_off: u32 = 0,
+    bias_stride: u32 = 0,
+    out_off: u32 = 0,
+    out_stride: u32 = 0,
+    m: u32 = 0,
+    budget_blocks: u32 = 0,
+    window_blocks: u32 = 0,
+    coarse_cap: u32 = 0,
+    pooled_meta_bytes: u32 = 0,
+    pooled_row_bytes: u32 = 0,
+    start_blk: u32 = 0,
+    num_blks: u32 = 0,
+    list_stride: u32 = 0,
+    score_stride: u32 = 0,
+    head_score_stride: u32 = 0,
+    cand_cap: u32 = 0,
+    score_tiles_x: u32 = 0,
+    stage_mode: u32 = 0,
+    bq_tile: u32 = 1,
+    taps: u32 = 0,
+    flags: u32 = 0,
+    has_sink: u32 = 0,
+    scale: f32 = 0,
+    tile_items: u32 = 0,
+};
 pub const flag_round_bf16: u32 = 1;
 pub const flag_has_weight: u32 = 2;
 pub const flag_fast_trig: u32 = 4;
@@ -106,9 +158,10 @@ comptime {
     if (@sizeOf(ExpertParams) != 96) @compileError("ExpertParams must match MKExpert in inkling_ops.metal");
     if (@sizeOf(Params) != 160) @compileError("Params must match MK in kernels.metal");
     if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 6 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
+    if (@sizeOf(LSAParams) != 240) @compileError("LSAParams must match MKLSA in inkling_lsa.metal");
 }
 
-pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_plan.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("inkling_fast.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_plan.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("inkling_long.metal") ++ "\n" ++ @embedFile("inkling_lsa.metal") ++ "\n" ++ @embedFile("inkling_tiles.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("inkling_fast.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
     // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
     // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
     "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
@@ -123,7 +176,7 @@ pub fn open() !metal.Context {
 
 pub fn dispatch(ctx: metal.Context, kernel: [:0]const u8, buffers: []const metal.Buffer, p: anytype, threads: usize, group: usize) !void {
     const T = @typeInfo(@TypeOf(p)).pointer.child;
-    comptime if (T != Params and T != ParamsX and T != ExpertParams) @compileError("unknown parameter block");
+    comptime if (T != Params and T != ParamsX and T != ExpertParams and T != LSAParams) @compileError("unknown parameter block");
     if (buffers.len > 8 or threads == 0 or group == 0) return error.InvalidDispatch;
     var handles: [8]*anyopaque = undefined;
     for (buffers, 0..) |buf, i| handles[i] = buf.handle;

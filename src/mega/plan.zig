@@ -50,6 +50,7 @@ pub const Step = union(enum) {
     controller_merge: u32,
     bf16_projections: struct { first: u32, count: u32, ops_len: u32, round_mask: u32 },
     head_softcap: u32,
+    head_softcap_loopcd: u32,
     controller_depth_norms: u32,
     depth_norm: struct { first: u32, ops_len: u32, round_out: bool },
     inkling_conv: u32,
@@ -60,7 +61,7 @@ pub const Step = union(enum) {
 
     pub fn first(self: Step) u32 {
         return switch (self) {
-            .op, .glu, .norms, .conv, .gate, .attn_prep, .bf16_cast, .controller_merge, .head_softcap, .controller_depth_norms, .inkling_conv, .relative_gate, .qkvr_sconv_prep, .qkvr_dyn_prep => |i| i,
+            .op, .glu, .norms, .conv, .gate, .attn_prep, .bf16_cast, .controller_merge, .head_softcap, .head_softcap_loopcd, .controller_depth_norms, .inkling_conv, .relative_gate, .qkvr_sconv_prep, .qkvr_dyn_prep => |i| i,
             .add_norm => |m| m.first,
             .projections => |m| m.first,
             .bf16_projections => |m| m.first,
@@ -73,6 +74,7 @@ pub const Step = union(enum) {
             .op => 1,
             .projections => |m| m.count,
             .glu, .norms, .controller_merge, .head_softcap => 3,
+            .head_softcap_loopcd => 7,
             .conv, .relative_gate => 4,
             .gate, .bf16_cast, .inkling_conv => 2,
             .attn_prep => 6,
@@ -207,6 +209,11 @@ pub fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
             reads[0] = m.x;
             writes.* = m.out;
         },
+        .loopcd_contrast => |m| {
+            reads[0] = m.strong;
+            reads[1] = m.weak;
+            writes.* = m.out;
+        },
     }
 }
 
@@ -237,7 +244,7 @@ fn launchAccess(step: Step, p: *const ir.Program, info: []const WeightInfo) ?Lau
             switch (op) {
                 .linear => |l| if (!info[l.w].dense) return null,
                 .embed, .rmsnorm, .binary, .row_transform, .grouped_project, .concat, .activate,
-                .softcapped_swiglu, .depth_attention, .inkling_message_merge, .l2_clip, .route_topk,
+                .softcapped_swiglu, .depth_attention, .inkling_message_merge, .loopcd_contrast, .l2_clip, .route_topk,
                 .store, .conv, .inkling_short_conv, .inkling_dynamic_conv => {},
                 else => return null,
             }
@@ -723,6 +730,26 @@ fn matchHeadSoftcap(p: *const ir.Program, info: []const WeightInfo, i: u32) bool
     return deadAfter(p, l.out, i + 2);
 }
 
+fn matchHeadSoftcapLoopCd(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
+    if (!sameSide(p, i, 7) or hasTraceBetween(p, i, i + 6)) return false;
+    if (!matchHeadSoftcap(p, info, i) or !matchHeadSoftcap(p, info, i + 3)) return false;
+    const l0 = p.ops[i].linear;
+    const cap0 = p.ops[i + 2].row_transform;
+    const l1 = p.ops[i + 3].linear;
+    const cap1 = p.ops[i + 5].row_transform;
+    const cd = switch (p.ops[i + 6]) {
+        .loopcd_contrast => |v| v,
+        else => return false,
+    };
+    if (l0.w != l1.w or l0.x.width != l1.x.width) return false;
+    if (cap0.transform.softcap != cap1.transform.softcap or cap0.out.width != cap1.out.width) return false;
+    if (overlaps(cap0.out, cap1.out) or overlaps(cap0.out, l0.x) or overlaps(cap0.out, l1.x) or
+        overlaps(cap1.out, l0.x) or overlaps(cap1.out, l1.x)) return false;
+    if (!sameView(cd.strong, cap0.out) or !sameView(cd.weak, cap1.out) or !sameView(cd.out, cap0.out)) return false;
+    if (cd.round != .none) return false;
+    return deadAfter(p, cap1.out, i + 6);
+}
+
 fn matchControllerDepthNorms(p: *const ir.Program, i: u32) bool {
     if (!sameSide(p, i, 5) or hasTraceBetween(p, i, i + 4)) return false;
     const d = switch (p.ops[i]) {
@@ -959,7 +986,10 @@ pub fn build(a: std.mem.Allocator, p: *const ir.Program, fusion: Fusion, info: [
             }
             if (fusion.merge_norm) if (matchControllerMergeNorm(p, info, i)) |m| break :blk .{ .controller_merge_norm = m };
             if (fusion.controller_merge and matchControllerMerge(p, info, i)) break :blk .{ .controller_merge = i };
-            if (fusion.head_softcap and matchHeadSoftcap(p, info, i)) break :blk .{ .head_softcap = i };
+            if (fusion.head_softcap) {
+                if (matchHeadSoftcapLoopCd(p, info, i)) break :blk .{ .head_softcap_loopcd = i };
+                if (matchHeadSoftcap(p, info, i)) break :blk .{ .head_softcap = i };
+            }
             if (fusion.bf16_projections) if (matchBf16Projections(p, info, i)) |m| break :blk .{ .bf16_projections = m };
             if (fusion.add_norm) if (matchAddNorm(p, i)) |m| break :blk .{ .add_norm = m };
             if (fusion.qkvr_prep) {

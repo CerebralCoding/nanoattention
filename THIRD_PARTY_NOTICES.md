@@ -78,8 +78,25 @@ Six Inkling 2 Mini megakernel optimization designs in `src/mega/inkling_fast.met
 - `Sources/QWMetal/inkling2/qw_ink2_sconv_qkvr.metal` — fused sliding short-conv / global QKV + relative prep (`fuse_qkvr_prep`)
 - `Sources/QWMetal/inkling2/qw_ink2_attn.metal` — inline single-row relative bias projection inside striped relative attention (`relative_inline_bias`)
 - `Sources/QWMetal/inkling2/qw_ink2_ctrl_batch.metal` and `Sources/QWMetal/inkling2/qw_ink2_ctrl_fast.metal` — fused controller message merge + RMSNorm/BF16 cast (`fuse_merge_norm`)
+- `Sources/QWMetal/qwlsa_mh_common.metalh`, `Sources/QWMetal/qwlsa_mh.metal`, `Sources/QWMetal/qwlsa_mh_select.metal`, and `Sources/QWCore/QWLSAOperator+Encode.swift` — Full-Slice Multi-Head Q4 Latent Sparse Attention (`lsa`, `lsa_budget`, `lsa_window`, `lsa_coarse_threshold` in `src/mega/inkling_lsa.metal`)
 
 `nano`'s implementations are written natively for `nano`'s Zig/Metal IR, arena word
 layout, and Lean-checked integer helpers rather than being direct ports of Qwegn's
 Swift/Metal 4 implementation, while preserving full upstream author attribution and
 Apache-2.0 notice.
+
+## LoopCD (Loop Contrastive Decoding, Inkling 2 Mini)
+
+The opt-in `--loop-passes` and `--loopcd` (`hidden`, `logits`, `logits-adaptive`)
+contrastive loop decoding paths for Inkling 2 Mini in `src/mega/ir.zig`,
+`src/mega/inkling2_loop.zig`, `src/mega/inkling_ops.metal`, `src/mega/exec.zig`,
+`src/mega/frontend.zig`, `src/mega/main.zig`, and `src/mega/cli.zig` implement the
+training-free Loop Contrastive Decoding methods from:
+
+- **Apple LoopCD** (`arXiv:2610.02185`; reference implementation [`tchayintr/apple-loopcd-off-the-shelf`](https://github.com/tchayintr/apple-loopcd-off-the-shelf)):
+  LoopCD-Hidden (`h_out = h_strong + w * (h_strong - h_weak)` prior to the decoder coda),
+  LoopCD-Logits (`z_out = z_strong + w * (z_strong - z_weak)`), and adaptive confidence-gated
+  LoopCD-Logits (`w = omega * (1 - (p_1 - p_2))`).
+
+All LoopCD IR lowering and Metal kernels here are original implementations written for
+`nano`.

@@ -181,6 +181,110 @@ pub const Engine = struct {
     stripe_parts: ?metal.Buffer = null,
     /// Stripe records of the batched striped attention: batch x heads x max_prefill_stripes.
     prefill_parts: ?metal.Buffer = null,
+    /// knobs.lsa: per global key cache state, 4-token / 16-token Q4 pooled blocks and shared scratch.
+    lsa_layers: ?[]?LsaLayer = null,
+    lsa_scratch: ?metal.Buffer = null,
+    lsa_block_list: ?metal.Buffer = null,
+    lsa_block_count: ?metal.Buffer = null,
+    lsa_layout: LsaScratchLayout = .{},
+    const LsaScratchLayout = struct {
+        select_units: u32 = 0,
+        list_stride: u32 = 0,
+        score_stride: u32 = 0,
+        head_score_stride: u32 = 0,
+        cand_cap: u32 = 0,
+        score_tiles_x: u32 = 0,
+        coarse_cap: u32 = 0,
+        off_head_scores: u64 = 0,
+        off_tg_stats: u64 = 0,
+        off_head_lse: u64 = 0,
+        off_scores: u64 = 0,
+        off_hist: u64 = 0,
+        off_cand_count: u64 = 0,
+        off_cand_m: u64 = 0,
+        off_cand_u: u64 = 0,
+        off_fine_cand: u64 = 0,
+        off_fine_count: u64 = 0,
+        total_bytes: usize = 0,
+
+        fn align256(v: u64) u64 {
+            return (v + 255) & ~@as(u64, 255);
+        }
+
+        fn init(units: u32, heads: u32, max_visible: u32, budget_blocks: u32, window_blocks: u32, coarse_thresh_blocks: u32) LsaScratchLayout {
+            const max_blocks = @max(max_visible / 4, 1);
+            const max_mid = if (max_blocks > 1 + window_blocks) max_blocks - 1 - window_blocks else 1;
+            const can_ever_coarse = coarse_thresh_blocks > 0 and window_blocks >= 4;
+            const coarse_cap: u32 = if (can_ever_coarse) @min(@max(((budget_blocks + 3) / 4) * 4, 64), 1024) else 0;
+            const max_score_items: u32 = @max(if (!can_ever_coarse)
+                max_mid
+            else
+                @max(coarse_thresh_blocks, @max((coarse_cap + 1) * 4, max_visible / 16 + 4)), 1);
+            const max_tiles_items: u32 = @max(if (!can_ever_coarse)
+                max_blocks
+            else
+                @max(@max(coarse_thresh_blocks + 1 + window_blocks, (coarse_cap + 1) * 4 + 1 + window_blocks), max_blocks / 4 + 1), 1);
+            const score_stride: u32 = ((max_score_items + 3) / 4) * 4;
+            const head_score_stride: u32 = score_stride;
+            const score_tiles_x: u32 = @max((max_tiles_items + 255) / 256, 1);
+            const cand_cap: u32 = 4096;
+            const fine_stride: u32 = @max(coarse_cap * 4, 1);
+
+            var cur: u64 = 0;
+            const off_head_scores = cur;
+            cur = align256(cur + @as(u64, units) * head_score_stride * heads * 2);
+            const off_tg_stats = cur;
+            const decode_tiles_x: u32 = @max(score_tiles_x, 256);
+            const tg_stats_bytes = @max(@as(u64, units) * heads * score_tiles_x * 8, @as(u64, heads) * decode_tiles_x * 8);
+            cur = align256(cur + tg_stats_bytes);
+            const off_head_lse = cur;
+            cur = align256(cur + @as(u64, units) * heads * 4);
+            const off_scores = cur;
+            cur = align256(cur + @as(u64, units) * score_stride * 4);
+            const off_hist = cur;
+            cur = align256(cur + @as(u64, units) * 512 * 4);
+            const off_cand_count = cur;
+            cur = align256(cur + @as(u64, units) * 4);
+            const off_cand_m = cur;
+            cur = align256(cur + @as(u64, units) * cand_cap * 4);
+            const off_cand_u = cur;
+            cur = align256(cur + @as(u64, units) * cand_cap * 4);
+            const off_fine_cand = cur;
+            cur = align256(cur + @as(u64, units) * fine_stride * 4);
+            const off_fine_count = cur;
+            cur = align256(cur + @as(u64, units) * 4);
+
+            return .{
+                .select_units = units,
+                .list_stride = 1 + budget_blocks + window_blocks,
+                .score_stride = score_stride,
+                .head_score_stride = head_score_stride,
+                .cand_cap = cand_cap,
+                .score_tiles_x = score_tiles_x,
+                .coarse_cap = coarse_cap,
+                .off_head_scores = off_head_scores,
+                .off_tg_stats = off_tg_stats,
+                .off_head_lse = off_head_lse,
+                .off_scores = off_scores,
+                .off_hist = off_hist,
+                .off_cand_count = off_cand_count,
+                .off_cand_m = off_cand_m,
+                .off_cand_u = off_cand_u,
+                .off_fine_cand = off_fine_cand,
+                .off_fine_count = off_fine_count,
+                .total_bytes = @intCast(cur),
+            };
+        }
+    };
+    const LsaLayer = struct {
+        dim: u32,
+        kv_heads: u32,
+        capacity: u32,
+        pooled_meta_bytes: u32,
+        pooled_row_bytes: u32,
+        fine: metal.Buffer,
+        coarse: ?metal.Buffer,
+    };
     const max_prefill_stripes: u32 = 4;
     const list_segments: u32 = 32; // MK_LIST_SEGS
     /// Rows from which a chunk runs mk_relative_prefill_tiles instead of stripes.
@@ -478,7 +582,9 @@ pub const Engine = struct {
             for (program.traces) |t| users[t.view.state] += 1;
             for (program.ops) |op| switch (op) {
                 .relative_attention => |a| if (a.dim == 128 and hs[a.keys] != null and hs[a.values] != null and users[a.bias.state] == 2) {
-                    if (bias16_ok) |ok| ok[a.bias.state] = true;
+                    if (bias16_ok) |ok| if (!(knobs.lsa and a.window == 0)) {
+                        ok[a.bias.state] = true;
+                    };
                     if (inline_bias_ok) |ok| {
                         const visible = if (a.window == 0) context else @min(context, a.window);
                         if (a.heads == 3 * a.kv_heads and maxStripeParts(visible, true) <= max_stripe_parts) {
@@ -507,6 +613,82 @@ pub const Engine = struct {
                 else => {},
             };
         };
+        var lsa_layers: ?[]?LsaLayer = null;
+        var lsa_scratch: ?metal.Buffer = null;
+        var lsa_block_list: ?metal.Buffer = null;
+        var lsa_block_count: ?metal.Buffer = null;
+        var lsa_layout: LsaScratchLayout = .{};
+        errdefer {
+            if (lsa_block_count) |b| b.deinit();
+            if (lsa_block_list) |b| b.deinit();
+            if (lsa_scratch) |b| b.deinit();
+            if (lsa_layers) |ls| {
+                for (ls) |entry| if (entry) |l| {
+                    l.fine.deinit();
+                    if (l.coarse) |c| c.deinit();
+                };
+                gpa.free(ls);
+            }
+        }
+        if (knobs.lsa) {
+            const budget_blocks = knobs.lsa_budget / 4;
+            const window_blocks = knobs.lsa_window / 4;
+            const coarse_thresh_blocks = knobs.lsa_coarse_threshold / 4;
+            const can_ever_coarse = coarse_thresh_blocks > 0 and window_blocks >= 4;
+            var max_heads: u32 = 0;
+            var max_cap: u32 = 0;
+            for (program.ops) |op| switch (op) {
+                .relative_attention => |a| if (a.window == 0 and a.dim >= 4 and a.dim <= 256 and a.dim % 4 == 0 and a.heads <= 64) {
+                    max_heads = @max(max_heads, a.heads);
+                    max_cap = @max(max_cap, program.states[a.keys].capacity(batch, context));
+                },
+                else => {},
+            };
+            if (max_heads > 0 and max_cap > 0) {
+                const layers = try gpa.alloc(?LsaLayer, n);
+                @memset(layers, null);
+                lsa_layers = layers;
+                for (program.ops) |op| switch (op) {
+                    .relative_attention => |a| if (a.window == 0 and a.dim >= 4 and a.dim <= 256 and a.dim % 4 == 0 and a.heads <= 64 and layers[a.keys] == null) {
+                        const cap = program.states[a.keys].capacity(batch, context);
+                        const meta_bytes = a.kv_heads * 4;
+                        const row_bytes = ((meta_bytes + a.kv_heads * (a.dim / 2)) + 3) & ~@as(u32, 3);
+                        const n_fine = @max(cap / 4, 1);
+                        const fine_buf = try ctx.alloc((@as(usize, n_fine) * row_bytes + 3) / 4);
+                        errdefer fine_buf.deinit();
+                        @memset(std.mem.sliceAsBytes(fine_buf.floats()), 0);
+                        var coarse_buf: ?metal.Buffer = null;
+                        if (can_ever_coarse and cap >= 16) {
+                            const n_coarse = cap / 16;
+                            const cb = try ctx.alloc((@as(usize, n_coarse) * row_bytes + 3) / 4);
+                            @memset(std.mem.sliceAsBytes(cb.floats()), 0);
+                            coarse_buf = cb;
+                        }
+                        layers[a.keys] = .{
+                            .dim = a.dim,
+                            .kv_heads = a.kv_heads,
+                            .capacity = cap,
+                            .pooled_meta_bytes = meta_bytes,
+                            .pooled_row_bytes = row_bytes,
+                            .fine = fine_buf,
+                            .coarse = coarse_buf,
+                        };
+                    },
+                    else => {},
+                };
+                const select_units = @max(@as(u32, 1), @max(@min(batch, 16), @min((batch + 31) / 32, 128)));
+                lsa_layout = LsaScratchLayout.init(select_units, max_heads, max_cap, budget_blocks, window_blocks, coarse_thresh_blocks);
+                const scratch_buf = try ctx.alloc((lsa_layout.total_bytes + 3) / 4);
+                @memset(std.mem.sliceAsBytes(scratch_buf.floats()), 0);
+                lsa_scratch = scratch_buf;
+                const list_buf = try ctx.alloc(@as(usize, batch) * lsa_layout.list_stride);
+                @memset(list_buf.floats(), 0);
+                lsa_block_list = list_buf;
+                const count_buf = try ctx.alloc(batch);
+                @memset(count_buf.floats(), 0);
+                lsa_block_count = count_buf;
+            }
+        }
         return .{
             .gpa = gpa,
             .program = program,
@@ -544,6 +726,11 @@ pub const Engine = struct {
             .relative_half = relative_half,
             .stripe_parts = stripe_parts,
             .prefill_parts = prefill_parts,
+            .lsa_layers = lsa_layers,
+            .lsa_scratch = lsa_scratch,
+            .lsa_block_list = lsa_block_list,
+            .lsa_block_count = lsa_block_count,
+            .lsa_layout = lsa_layout,
         };
     }
 
@@ -591,6 +778,16 @@ pub const Engine = struct {
         }
         if (self.stripe_parts) |b| b.deinit();
         if (self.prefill_parts) |b| b.deinit();
+        if (self.lsa_block_count) |b| b.deinit();
+        if (self.lsa_block_list) |b| b.deinit();
+        if (self.lsa_scratch) |b| b.deinit();
+        if (self.lsa_layers) |ls| {
+            for (ls) |entry| if (entry) |l| {
+                l.fine.deinit();
+                if (l.coarse) |c| c.deinit();
+            };
+            self.gpa.free(ls);
+        }
     }
 
     /// Logical reset: positions >= 0 are rewritten before any read, and conv
@@ -604,6 +801,7 @@ pub const Engine = struct {
         self.failed = false;
         self.out_first = 0;
         self.out_end = 0;
+        if (self.lsa_scratch) |b| @memset(std.mem.sliceAsBytes(b.floats()), 0);
     }
 
     /// decode climb 2 (knob d2_gate): open a gate still waiting (its forward runs on
@@ -1454,13 +1652,16 @@ pub const Engine = struct {
                 if (self.relative_half) |hs| if (hs[s.dst]) |half| {
                     if (self.knobs.store_pack_bf16) {
                         try gpu.dispatch(self.ctx, "mk_store_pack_bf16", &.{ self.arena, self.caches[s.dst].?, half }, &p, @as(usize, rows) * p.n, 256);
+                        try self.encodeLsaPool(s.dst, row0, rows);
                         return;
                     }
                     try gpu.dispatch(self.ctx, "mk_store", &.{ self.arena, self.caches[s.dst].? }, &p, @as(usize, rows) * p.n, 256);
                     try gpu.dispatch(self.ctx, "mk_pack_bf16", &.{ self.arena, half }, &p, @as(usize, rows) * p.n, 256);
+                    try self.encodeLsaPool(s.dst, row0, rows);
                     return;
                 };
                 try gpu.dispatch(self.ctx, "mk_store", &.{ self.arena, self.caches[s.dst].? }, &p, @as(usize, rows) * p.n, 256);
+                try self.encodeLsaPool(s.dst, row0, rows);
             },
             .conv => |c| {
                 const w = self.bound[c.weight];
@@ -1587,6 +1788,7 @@ pub const Engine = struct {
                 p.capacity = k.capacity(self.batch, self.context);
                 const end = self.position + row0 + rows;
                 const visible = if (p.window == 0) end else @min(end, p.window);
+                if (try self.encodeRelativeLsa(a, a.out, null, &p, row0, rows, visible)) return;
                 // knobs.relative_bias16: a bias written 16-bit is read by the staged tiles
                 // over the rows it was written for, or the forward fails.
                 if (self.bias16) |b| if (b.state == a.bias.state) {
@@ -1715,7 +1917,349 @@ pub const Engine = struct {
                 }
                 try gpu.dispatch(self.ctx, "mk_argmax", &.{self.arena}, &p, @as(usize, rows) * 1024, 1024);
             },
+            .loopcd_contrast => |l| try self.encodeLoopCdContrast(l, row0, rows),
         }
+    }
+
+    fn encodeLoopCdContrast(self: *Engine, l: @FieldType(ir.Op, "loopcd_contrast"), row0: u32, rows: u32) !void {
+        var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
+        const strong = self.words(l.strong);
+        const weak = self.words(l.weak);
+        const out = self.words(l.out);
+        p.x = strong.off;
+        p.xs = strong.stride;
+        p.y = weak.off;
+        p.ys = weak.stride;
+        p.z = out.off;
+        p.zs = out.stride;
+        p.n = l.strong.width;
+        p.scale = l.omega;
+        p.flags = @backingInt(l.round);
+        if (l.adaptive) {
+            if (p.n >= 4096) if (self.partials) |part| {
+                p.every = argmax_groups;
+                p.m = inkling_plan.argmaxSpan(p.n);
+                try gpu.dispatch(self.ctx, "mk_loopcd_adaptive_part", &.{ self.arena, part }, &p, @as(usize, rows) * argmax_groups * 256, 256);
+                try gpu.dispatch(self.ctx, "mk_loopcd_adaptive_apply", &.{ self.arena, part }, &p, @as(usize, rows) * argmax_groups * 256, 256);
+                return;
+            };
+            try gpu.dispatch(self.ctx, "mk_loopcd_contrast_adaptive", &.{self.arena}, &p, @as(usize, rows) * 256, 256);
+        } else {
+            try gpu.dispatch(self.ctx, "mk_loopcd_contrast_fixed", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+        }
+    }
+
+    fn lsaBaseParams(self: *const Engine, layer: LsaLayer, a: @FieldType(ir.Op, "relative_attention"), out_view: ir.View, row0: u32, rows: u32, row_step: u32) gpu.LSAParams {
+        const lay = self.lsa_layout;
+        const q = self.words(a.q);
+        const sink = self.words(a.sink);
+        const bias = self.words(a.bias);
+        const o = self.words(out_view);
+        return .{
+            .off_head_scores = lay.off_head_scores,
+            .off_tg_stats = lay.off_tg_stats,
+            .off_head_lse = lay.off_head_lse,
+            .off_scores = lay.off_scores,
+            .off_hist = lay.off_hist,
+            .off_cand_count = lay.off_cand_count,
+            .off_cand_m = lay.off_cand_m,
+            .off_cand_u = lay.off_cand_u,
+            .off_fine_cand = lay.off_fine_cand,
+            .off_fine_count = lay.off_fine_count,
+            .rows = rows,
+            .row0 = row0,
+            .pos0 = self.position + row0,
+            .row_step = row_step,
+            .dim = a.dim,
+            .heads = a.heads,
+            .kv_heads = a.kv_heads,
+            .capacity = layer.capacity,
+            .q_off = q.off,
+            .q_stride = q.stride,
+            .sink_off = sink.off,
+            .sink_stride = sink.stride,
+            .bias_off = bias.off,
+            .bias_stride = bias.stride,
+            .out_off = o.off,
+            .out_stride = o.stride,
+            .m = a.relative_extent,
+            .budget_blocks = self.knobs.lsa_budget / 4,
+            .window_blocks = self.knobs.lsa_window / 4,
+            .coarse_cap = lay.coarse_cap,
+            .pooled_meta_bytes = layer.pooled_meta_bytes,
+            .pooled_row_bytes = layer.pooled_row_bytes,
+            .list_stride = lay.list_stride,
+            .score_stride = lay.score_stride,
+            .head_score_stride = lay.head_score_stride,
+            .cand_cap = lay.cand_cap,
+            .score_tiles_x = lay.score_tiles_x,
+            .has_sink = 1,
+            .scale = a.scale,
+        };
+    }
+
+    /// Pool newly completed 4-token fine and 16-token coarse Q4 key blocks for global LSA caches.
+    fn encodeLsaPool(self: *Engine, state_id: ir.StateId, row0: u32, rows: u32) !void {
+        const ls = self.lsa_layers orelse return;
+        const layer = ls[state_id] orelse return;
+        const p_start = self.position + row0;
+        const p_end = p_start + rows;
+        const start_fine = p_start / 4;
+        const end_fine = @min(layer.capacity / 4, p_end / 4);
+        if (end_fine <= start_fine) return;
+
+        self.ctx.nano_dispatch_flags = null;
+        self.force_barrier = true;
+
+        var lp: gpu.LSAParams = .{
+            .dim = layer.dim,
+            .kv_heads = layer.kv_heads,
+            .capacity = layer.capacity,
+            .pooled_meta_bytes = layer.pooled_meta_bytes,
+            .pooled_row_bytes = layer.pooled_row_bytes,
+            .start_blk = start_fine,
+            .num_blks = end_fine - start_fine,
+        };
+        const half_k = if (self.relative_half) |hs| hs[state_id] else null;
+        if (half_k) |hk| {
+            try gpu.dispatch(self.ctx, "mk_lsa_pool_fine_bf16", &.{ hk, layer.fine }, &lp, @as(usize, lp.num_blks) * 128, 128);
+        } else {
+            try gpu.dispatch(self.ctx, "mk_lsa_pool_fine_f32", &.{ self.caches[state_id].?, layer.fine }, &lp, @as(usize, lp.num_blks) * 128, 128);
+        }
+        if (layer.coarse) |coarse| {
+            const start_coarse = p_start / 16;
+            const end_coarse = @min(layer.capacity / 16, p_end / 16);
+            if (end_coarse > start_coarse) {
+                lp.start_blk = start_coarse;
+                lp.num_blks = end_coarse - start_coarse;
+                try gpu.dispatch(self.ctx, "mk_lsa_pool_coarse", &.{ layer.fine, coarse }, &lp, @as(usize, lp.num_blks) * 128, 128);
+            }
+        }
+    }
+
+    pub fn lsaDecodeScoreTile(item_lim: u32) u32 {
+        if (item_lim <= 2048) return 8;
+        if (item_lim <= 4096) return 16;
+        if (item_lim <= 8192) return 32;
+        if (item_lim <= 16384) return 64;
+        return 256;
+    }
+
+    pub fn lsaDecodeAggTile(n_items: u32) u32 {
+        if (n_items <= 512) return 16;
+        if (n_items <= 2048) return 32;
+        if (n_items <= 4096) return 64;
+        return 128;
+    }
+
+    fn encodeLsaSelect(self: *Engine, layer: LsaLayer, a: @FieldType(ir.Op, "relative_attention"), row0: u32, rows: u32, row_step: u32) !void {
+        const scratch = self.lsa_scratch.?;
+        const block_list = self.lsa_block_list.?;
+        const block_count = self.lsa_block_count.?;
+        const lay = self.lsa_layout;
+        var lp = self.lsaBaseParams(layer, a, a.out, row0, rows, row_step);
+
+        const budget_blocks = lp.budget_blocks;
+        const window_blocks = lp.window_blocks;
+        const coarse_thresh_blocks = self.knobs.lsa_coarse_threshold / 4;
+        const max_total_blocks = (self.position + row0 + rows) / 4;
+        const max_mid = if (max_total_blocks > 1 + window_blocks) max_total_blocks - 1 - window_blocks else 0;
+        const two_stage = (layer.coarse != null) and coarse_thresh_blocks > 0 and max_mid > coarse_thresh_blocks and
+            window_blocks >= 4 and (max_total_blocks / 4) > lay.coarse_cap;
+
+        const total_units: u32 = if (row_step > 1) (rows + row_step - 1) / row_step else rows;
+        var unit0: u32 = 0;
+        while (unit0 < total_units) {
+            const u_cnt = @min(lay.select_units, total_units - unit0);
+            const batch_max_r = @min((unit0 + u_cnt) * row_step - 1, rows - 1);
+            const batch_total_blocks = (self.position + row0 + batch_max_r + 1) / 4;
+            const batch_mid_end = if (batch_total_blocks > 1 + budget_blocks + window_blocks) batch_total_blocks - window_blocks else 0;
+            const batch_num_mid = if (batch_mid_end > 1) batch_mid_end - 1 else 0;
+            const fast_dec = (u_cnt == 1 and a.dim == 128 and a.heads <= 32);
+
+            lp.unit_offset = unit0;
+            lp.units = u_cnt;
+            if (!two_stage) {
+                lp.stage_mode = 0;
+                if (fast_dec) {
+                    const dtile = Engine.lsaDecodeScoreTile(batch_total_blocks);
+                    lp.tile_items = dtile;
+                    lp.score_tiles_x = @max((batch_total_blocks + dtile - 1) / dtile, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    const agg0 = Engine.lsaDecodeAggTile(batch_num_mid);
+                    lp.bq_tile = agg0;
+                    const agg0_tiles = @max((batch_num_mid + agg0 - 1) / agg0, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist_dec", &.{ self.arena, scratch }, &lp, @as(usize, agg0_tiles) * 256, 256);
+                    if (batch_num_mid <= 1024) {
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize_dec", &.{ scratch, block_list, block_count }, &lp, 256, 256);
+                    } else {
+                        lp.tile_items = 256;
+                        lp.score_tiles_x = @max((batch_num_mid + 255) / 256, 1);
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize", &.{ scratch, block_list, block_count }, &lp, 256, 256);
+                    }
+                } else {
+                    lp.tile_items = 256;
+                    lp.bq_tile = @min(u_cnt, 4);
+                    lp.score_tiles_x = @max((batch_total_blocks + 255) / 256, 1);
+                    const y_groups = (u_cnt + lp.bq_tile - 1) / lp.bq_tile;
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, y_groups) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_reduce_lse", &.{ self.arena, scratch }, &lp, @as(usize, u_cnt) * a.heads * 32, 32);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize", &.{ scratch, block_list, block_count }, &lp, @as(usize, u_cnt) * 256, 256);
+                }
+            } else {
+                const batch_coarse = @max(batch_total_blocks / 4, 1);
+                lp.stage_mode = 1;
+                if (fast_dec) {
+                    const dtile1 = Engine.lsaDecodeScoreTile(batch_coarse);
+                    lp.tile_items = dtile1;
+                    lp.score_tiles_x = @max((batch_coarse + dtile1 - 1) / dtile1, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, layer.coarse.?, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    const agg1 = Engine.lsaDecodeAggTile(batch_coarse);
+                    lp.bq_tile = agg1;
+                    const agg1_tiles = @max((batch_coarse + agg1 - 1) / agg1, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist_dec", &.{ self.arena, scratch }, &lp, @as(usize, agg1_tiles) * 256, 256);
+                    if (batch_coarse <= 1024) {
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize_dec", &.{ scratch, block_list, block_count }, &lp, 256, 256);
+                    } else {
+                        lp.tile_items = 256;
+                        lp.score_tiles_x = @max((batch_coarse + 255) / 256, 1);
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_coarse_expand", &.{scratch}, &lp, 256, 256);
+                    }
+                } else {
+                    lp.tile_items = 256;
+                    lp.bq_tile = @min(u_cnt, 4);
+                    lp.score_tiles_x = @max((batch_coarse + 255) / 256, 1);
+                    const y_groups = (u_cnt + lp.bq_tile - 1) / lp.bq_tile;
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, layer.coarse.?, scratch }, &lp, @as(usize, y_groups) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_reduce_lse", &.{ self.arena, scratch }, &lp, @as(usize, u_cnt) * a.heads * 32, 32);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_coarse_expand", &.{scratch}, &lp, @as(usize, u_cnt) * 256, 256);
+                }
+
+                const s2_fine_max = @min(batch_num_mid, lay.coarse_cap * 4);
+                const s2_max_items = s2_fine_max + 1 + window_blocks;
+                lp.stage_mode = 2;
+                lp.bq_tile = 1;
+                if (fast_dec) {
+                    const dtile2 = Engine.lsaDecodeScoreTile(s2_max_items);
+                    lp.tile_items = dtile2;
+                    lp.score_tiles_x = @max((s2_max_items + dtile2 - 1) / dtile2, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    const agg2 = Engine.lsaDecodeAggTile(s2_fine_max);
+                    lp.bq_tile = agg2;
+                    const agg2_tiles = @max((s2_fine_max + agg2 - 1) / agg2, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist_dec", &.{ self.arena, scratch }, &lp, @as(usize, agg2_tiles) * 256, 256);
+                    if (s2_fine_max <= 1024) {
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize_dec", &.{ scratch, block_list, block_count }, &lp, 256, 256);
+                    } else {
+                        lp.tile_items = 256;
+                        lp.score_tiles_x = @max((s2_fine_max + 255) / 256, 1);
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                        try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize", &.{ scratch, block_list, block_count }, &lp, 256, 256);
+                    }
+                } else {
+                    lp.tile_items = 256;
+                    lp.score_tiles_x = @max((s2_max_items + 255) / 256, 1);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_reduce_lse", &.{ self.arena, scratch }, &lp, @as(usize, u_cnt) * a.heads * 32, 32);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_finalize", &.{ scratch, block_list, block_count }, &lp, @as(usize, u_cnt) * 256, 256);
+                }
+            }
+            unit0 += u_cnt;
+        }
+    }
+
+    /// Dispatch Multi-Head Q4 LSA selection and sparse attention when past the dense bypass threshold.
+    fn encodeRelativeLsa(self: *Engine, a: @FieldType(ir.Op, "relative_attention"), out_view: ir.View, gate_view: ?ir.View, p: *gpu.Params, row0: u32, rows: u32, visible: u32) !bool {
+        _ = visible;
+        if (self.tap != null or a.window != 0) return false;
+        const ls = self.lsa_layers orelse return false;
+        const layer = ls[a.keys] orelse return false;
+        const block_list = self.lsa_block_list orelse return false;
+        const block_count = self.lsa_block_count orelse return false;
+
+        const max_total_blocks = (self.position + row0 + rows) / 4;
+        const dense_thresh = 1 + (self.knobs.lsa_budget / 4) + (self.knobs.lsa_window / 4);
+        if (max_total_blocks <= dense_thresh) return false;
+
+        self.ctx.nano_dispatch_flags = null;
+        self.force_barrier = true;
+
+        // Fast BF16 striped sparse decode (supports inline relative bias + fused gate merge).
+        if (rows == 1 and self.knobs.relative_long_fast and a.dim == 128 and a.heads == a.kv_heads * 3) {
+            if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| if (self.stripe_parts) |parts| {
+                try self.encodeLsaSelect(layer, a, row0, rows, 1);
+                const inline_bias: @FieldType(Engine, "inline_bias") = if (self.inline_bias) |ib| blk: {
+                    if (ib.state == a.bias.state and ib.row0 == p.row0) {
+                        self.inline_bias = null;
+                        break :blk ib;
+                    }
+                    break :blk null;
+                } else null;
+                var lp = self.lsaBaseParams(layer, a, out_view, row0, rows, 1);
+                const max_sparse_keys = @min((self.position + row0 + 1), dense_thresh * 4 + 3);
+                const cap_parts = @as(u32, @intCast(parts.floats().len / (@as(usize, a.heads) * 130)));
+                lp.taps = @min(@min(Engine.max_stripe_parts, cap_parts), @max(@as(u32, 1), Engine.stripeParts(max_sparse_keys, true)));
+                p.taps = lp.taps;
+                if (inline_bias) |ib| {
+                    lp.bias_off = ib.r_off;
+                    lp.bias_stride = ib.r_stride;
+                    lp.rel_w_off = ib.w_off;
+                    try gpu.dispatch(self.ctx, "mk_relative_lsa_decode_keys_inline_fast", &.{
+                        self.arena, half_keys, hs[a.values].?, parts, block_list, block_count, ib.w_buf,
+                    }, &lp, @as(usize, a.kv_heads) * lp.taps * 256, 256);
+                } else {
+                    try gpu.dispatch(self.ctx, "mk_relative_lsa_decode_keys_fast", &.{
+                        self.arena, half_keys, hs[a.values].?, parts, block_list, block_count,
+                    }, &lp, @as(usize, a.kv_heads) * lp.taps * 256, 256);
+                }
+                const o = self.words(out_view);
+                p.y = o.off;
+                p.ys = o.stride;
+                if (gate_view) |gv| {
+                    const g = self.words(gv);
+                    p.z = g.off;
+                    p.zs = g.stride;
+                    p.flags |= gpu.flag_round_bf16 | gpu.flag_round_out;
+                    try gpu.dispatch(self.ctx, "mk_relative_long_merge_gated", &.{ self.arena, parts }, p, @as(usize, a.heads) * 128, 128);
+                } else {
+                    try gpu.dispatch(self.ctx, "mk_relative_long_merge_fast", &.{ self.arena, parts }, p, @as(usize, a.heads) * 128, 128);
+                }
+                return true;
+            };
+        }
+
+        if (gate_view != null) return false;
+
+        // If a single-row grouped_project deferred inline_bias without fast decode path, execute it now.
+        if (rows == 1) if (self.inline_bias) |ib| if (ib.state == a.bias.state and ib.row0 == p.row0) return false;
+
+        // Fast tiled BF16 MMA sparse prefill when mirrors exist.
+        if (rows >= 8 and self.knobs.relative_tile_prefill and a.dim == 128) {
+            if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| {
+                try self.encodeLsaSelect(layer, a, row0, rows, 32);
+                const lp = self.lsaBaseParams(layer, a, out_view, row0, rows, 32);
+                try gpu.dispatch(self.ctx, "mk_relative_lsa_prefill", &.{
+                    self.arena, half_keys, hs[a.values].?, block_list, block_count,
+                }, &lp, @as(usize, (rows + 31) / 32) * a.heads * 128, 128);
+                return true;
+            };
+        }
+
+        // General FP32 sparse reference attention.
+        try self.encodeLsaSelect(layer, a, row0, rows, 1);
+        const lp = self.lsaBaseParams(layer, a, out_view, row0, rows, 1);
+        try gpu.dispatch(self.ctx, "mk_relative_lsa_ref", &.{
+            self.arena, self.caches[a.keys].?, self.caches[a.values].?, block_list, block_count,
+        }, &lp, @as(usize, rows) * a.heads * 32, 32);
+        return true;
     }
 };
 
@@ -2109,6 +2653,48 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 for (0..3) |k| try self.encode(ops[i + k], row0, rows);
             }
         },
+        .head_softcap_loopcd => |i| {
+            const l0 = ops[i].linear;
+            const cap0 = ops[i + 2].row_transform;
+            const l1 = ops[i + 3].linear;
+            const cap1 = ops[i + 5].row_transform;
+            const cd = ops[i + 6].loopcd_contrast;
+            const w = self.bound[l0.w];
+            const xs = self.words(l0.x);
+            const xw = self.words(l1.x);
+            const out = self.words(cap0.out);
+            const weak_out = self.words(cap1.out);
+            const vector = l0.x.width % 128 == 0 and xs.off % 4 == 0 and xs.stride % 4 == 0 and
+                xw.off % 4 == 0 and xw.stride % 4 == 0 and w.tensor.offset % 8 == 0;
+            if (rows == 1 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
+                p.w = w.tensor.offset;
+                p.x = xs.off;
+                p.xs = xs.stride;
+                p.z = xw.off;
+                p.zs = xw.stride;
+                p.y = out.off;
+                p.ys = out.stride;
+                p.every = weak_out.off;
+                p.pad_k = weak_out.stride;
+                p.n = l0.x.width;
+                p.m = cap0.out.width;
+                p.scale = cap0.transform.softcap;
+                p.eps = cd.omega;
+                const wide8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
+                const kname: [:0]const u8 = if (!cd.adaptive)
+                    (if (wide8) "mk_bf16_linear_4x2_softcap_loopcd_vec8" else "mk_bf16_linear_4x2_softcap_loopcd")
+                else
+                    (if (wide8) "mk_bf16_linear_4x2_softcap_dual_vec8" else "mk_bf16_linear_4x2_softcap_dual");
+                try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 3) / 4) * 32, self.knobs.linear_group);
+                if (cd.adaptive) {
+                    self.ctx.nano_dispatch_flags = null;
+                    try self.encodeLoopCdContrast(cd, row0, rows);
+                }
+            } else {
+                self.ctx.nano_dispatch_flags = null;
+                for (0..7) |k| try self.encode(ops[i + k], row0, rows);
+            }
+        },
         .controller_depth_norms => |i| {
             const d = ops[i].depth_attention;
             const n1 = ops[i + 1].rmsnorm;
@@ -2248,6 +2834,7 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 p.window = a.window;
                 p.scale = a.scale;
                 p.capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+                if (try self.encodeRelativeLsa(a, b.out, b.b, &p, row0, rows, visible)) return;
                 if (try encodeRelativeStriped(self, a, b.out, b.b, &p, visible)) return;
             }
             self.ctx.nano_dispatch_flags = null;
@@ -2364,6 +2951,7 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
         }
     }
     if (can_fuse) {
+        if (!sconv) try self.encodeLsaPool(st_k.dst, row0, rows);
         self.ctx.nano_dispatch_flags = null;
         const gp_row0 = if (!self.cur_traced and self.tap == null) if (self.op_needs) |needs| @min(row0 + rows, needs[gp_idx].firstRow(self.cur_T, self.cur_out_first, self.knobs.tail_trim)) else row0 else row0;
         if (gp_row0 < row0 + rows) try self.encode(ops[gp_idx], gp_row0, row0 + rows - gp_row0);
@@ -2903,7 +3491,7 @@ pub fn rowNeeds(gpa: std.mem.Allocator, p: *const ir.Program) ![]RowNeed {
         var write: ?ir.View = null;
         plan.access(op, &reads, &write);
         const row_wise = switch (op) {
-            .embed, .rmsnorm, .linear, .binary, .concat, .activate, .row_transform, .grouped_project, .softcapped_swiglu, .l2_clip, .depth_attention, .inkling_message_merge, .rope, .route_topk, .expert_gate_up, .expert_down, .argmax => true,
+            .embed, .rmsnorm, .linear, .binary, .concat, .activate, .row_transform, .grouped_project, .softcapped_swiglu, .l2_clip, .depth_attention, .inkling_message_merge, .loopcd_contrast, .rope, .route_topk, .expert_gate_up, .expert_down, .argmax => true,
             else => false,
         };
         var need: RowNeed = if (write) |w| demand[w.state] else .{};

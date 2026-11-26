@@ -261,6 +261,14 @@ pub const Knobs = struct {
     relative_inline_bias: bool = false,
     /// Fuse controller message merge + following RMSNorm(+BF16 cast) on batched forwards.
     fuse_merge_norm: bool = false,
+    /// Enable full-slice Multi-Head Q4 Latent Sparse Attention on Inkling global layers (qwegnai/qwegn).
+    lsa: bool = false,
+    /// Selected middle-context token budget in LSA sparse mode (multiple of 4).
+    lsa_budget: u32 = 256,
+    /// Trailing local sliding window kept dense alongside selected middle blocks (multiple of 4).
+    lsa_window: u32 = 1024,
+    /// Middle-context token threshold above which 2-stage coarse->fine selection activates (0 = always 1-stage).
+    lsa_coarse_threshold: u32 = 8192,
 
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};
@@ -300,6 +308,9 @@ pub const Knobs = struct {
         if (self.mm_group == 0 or self.mm_group % 32 != 0 or self.mm_group > 1024) return error.InvalidMmGroup;
         if (self.decode_attention != 0 and self.decode_attention != 2 and self.decode_attention != 3) return error.InvalidDecodeAttention;
         if (self.decode_argmax > 1) return error.InvalidDecodeArgmax;
+        if (self.lsa_budget < 4 or self.lsa_budget > 16384 or self.lsa_budget % 4 != 0) return error.InvalidLsaBudget;
+        if (self.lsa_window > 65536 or self.lsa_window % 4 != 0) return error.InvalidLsaWindow;
+        if (self.lsa_coarse_threshold != 0 and (self.lsa_coarse_threshold < 16 or self.lsa_coarse_threshold % 16 != 0)) return error.InvalidLsaCoarseThreshold;
     }
 
     /// Apply `name=value` (flag form) to the knob of that name.

@@ -12,6 +12,7 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const io = @import("io.zig");
+const exec = @import("exec.zig");
 
 const heads = 24;
 const kv_heads = 8;
@@ -119,6 +120,183 @@ pub fn run(a: std.mem.Allocator, args: []const []const u8) !void {
             const name = try std.fmt.allocPrint(a, "stripes of {d}, {d} simd (keys {d:.0})", .{ stripe, simds, us[0] });
             try Timer.report(a, name, us[1], reference, out);
         };
+        if (window == 0 and keys > 4 + 256 + 1024) {
+            const budget_blocks: u32 = 64;
+            const window_blocks: u32 = 256;
+            const coarse_thresh_blocks: u32 = 2048;
+            const list_stride: u32 = 1 + budget_blocks + window_blocks;
+            const coarse_cap: u32 = 64;
+            const max_mid: u32 = keys / 4 - 1 - window_blocks;
+            const two_stage = max_mid > coarse_thresh_blocks and (keys / 16) > coarse_cap;
+            const meta_bytes: u32 = kv_heads * 4;
+            const row_bytes: u32 = ((meta_bytes + kv_heads * (dim / 2)) + 3) & ~@as(u32, 3);
+            const fine_buf = try ctx.alloc((@as(usize, keys / 4) * row_bytes + 3) / 4);
+            defer fine_buf.deinit();
+            const coarse_buf = try ctx.alloc((@as(usize, @max(keys / 16, 1)) * row_bytes + 3) / 4);
+            defer coarse_buf.deinit();
+            const score_items: u32 = @max(if (two_stage) @max(coarse_thresh_blocks, @max((coarse_cap + 1) * 4, keys / 16 + 4)) else max_mid, 1);
+            const tile_items: u32 = @max(if (two_stage) @max(@max(coarse_thresh_blocks + 1 + window_blocks, (coarse_cap + 1) * 4 + 1 + window_blocks), keys / 16 + 1) else keys / 4, 1);
+            const tiles_x: u32 = @max((tile_items + 255) / 256, 1);
+            const align256 = struct {
+                fn alignUp(v: u64) u64 {
+                    return (v + 255) & ~@as(u64, 255);
+                }
+            }.alignUp;
+            var cur: u64 = 0;
+            const off_hs = cur;
+            cur = align256(cur + @as(u64, score_items) * heads * 2);
+            const off_ts = cur;
+            cur = align256(cur + @as(u64, heads) * @max(tiles_x, 256) * 8);
+            const off_hl = cur;
+            cur = align256(cur + @as(u64, heads) * 4);
+            const off_sc = cur;
+            cur = align256(cur + @as(u64, score_items) * 4);
+            const off_hi = cur;
+            cur = align256(cur + 512 * 4);
+            const off_cc = cur;
+            cur = align256(cur + 4);
+            const off_cm = cur;
+            cur = align256(cur + 4096 * 4);
+            const off_cu = cur;
+            cur = align256(cur + 4096 * 4);
+            const off_fc = cur;
+            cur = align256(cur + @as(u64, coarse_cap) * 4 * 4);
+            const off_fn = cur;
+            cur = align256(cur + 4);
+            const lsa_scratch = try ctx.alloc(@intCast((cur + 3) / 4));
+            defer lsa_scratch.deinit();
+            @memset(std.mem.sliceAsBytes(lsa_scratch.floats()), 0);
+            const block_list = try ctx.alloc(list_stride);
+            defer block_list.deinit();
+            const block_count = try ctx.alloc(1);
+            defer block_count.deinit();
+
+            var lp: gpu.LSAParams = .{
+                .off_head_scores = off_hs,
+                .off_tg_stats = off_ts,
+                .off_head_lse = off_hl,
+                .off_scores = off_sc,
+                .off_hist = off_hi,
+                .off_cand_count = off_cc,
+                .off_cand_m = off_cm,
+                .off_cand_u = off_cu,
+                .off_fine_cand = off_fc,
+                .off_fine_count = off_fn,
+                .units = 1,
+                .rows = 1,
+                .pos0 = keys - 1,
+                .dim = dim,
+                .heads = heads,
+                .kv_heads = kv_heads,
+                .capacity = capacity,
+                .q_off = q_off,
+                .q_stride = heads * dim,
+                .sink_off = sink_off,
+                .sink_stride = heads,
+                .bias_off = bias_off,
+                .bias_stride = heads * extent,
+                .out_off = out_off + batch * heads * dim,
+                .out_stride = heads * dim,
+                .m = extent,
+                .budget_blocks = budget_blocks,
+                .window_blocks = window_blocks,
+                .coarse_cap = coarse_cap,
+                .pooled_meta_bytes = meta_bytes,
+                .pooled_row_bytes = row_bytes,
+                .start_blk = 0,
+                .num_blks = keys / 4,
+                .list_stride = list_stride,
+                .score_stride = score_items,
+                .head_score_stride = score_items,
+                .cand_cap = 4096,
+                .score_tiles_x = tiles_x,
+                .has_sink = 1,
+                .scale = 1 / @sqrt(@as(f32, dim)),
+            };
+            try gpu.dispatch(ctx, "mk_lsa_pool_fine_bf16", &.{ k16, fine_buf }, &lp, @as(usize, lp.num_blks) * 128, 128);
+            if (two_stage) {
+                lp.num_blks = keys / 16;
+                try gpu.dispatch(ctx, "mk_lsa_pool_coarse", &.{ fine_buf, coarse_buf }, &lp, @as(usize, lp.num_blks) * 128, 128);
+            }
+            try ctx.finish();
+
+            const sparse_keys: u32 = list_stride * 4 + 3;
+            const fast_stripe: u32 = if (sparse_keys <= 2048) 64 else 256;
+            lp.taps = (sparse_keys + fast_stripe - 1) / fast_stripe;
+            var p_lsa_merge = p;
+            p_lsa_merge.taps = lp.taps;
+            @memset(out, 0);
+            const before = ctx.stats();
+            for (0..repeats) |_| {
+                if (!two_stage) {
+                    const items = keys / 4;
+                    const dtile = exec.Engine.lsaDecodeScoreTile(items);
+                    lp.stage_mode = 0;
+                    lp.bq_tile = 1;
+                    lp.tile_items = dtile;
+                    lp.score_tiles_x = @max((items + dtile - 1) / dtile, 1);
+                    try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_buf, lsa_scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    const agg0 = exec.Engine.lsaDecodeAggTile(max_mid);
+                    lp.bq_tile = agg0;
+                    const agg0_tiles = @max((max_mid + agg0 - 1) / agg0, 1);
+                    try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp, @as(usize, agg0_tiles) * 256, 256);
+                    if (max_mid <= 1024) {
+                        try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+                    } else {
+                        lp.tile_items = 256;
+                        lp.score_tiles_x = @max((max_mid + 255) / 256, 1);
+                        try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                        try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+                    }
+                } else {
+                    const c_items = keys / 16;
+                    const dtile1 = exec.Engine.lsaDecodeScoreTile(c_items);
+                    lp.stage_mode = 1;
+                    lp.bq_tile = 1;
+                    lp.tile_items = dtile1;
+                    lp.score_tiles_x = @max((c_items + dtile1 - 1) / dtile1, 1);
+                    try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, coarse_buf, lsa_scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    const agg1 = exec.Engine.lsaDecodeAggTile(c_items);
+                    lp.bq_tile = agg1;
+                    const agg1_tiles = @max((c_items + agg1 - 1) / agg1, 1);
+                    try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp, @as(usize, agg1_tiles) * 256, 256);
+                    if (c_items <= 1024) {
+                        try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+                    } else {
+                        lp.tile_items = 256;
+                        lp.score_tiles_x = @max((c_items + 255) / 256, 1);
+                        try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                        try gpu.dispatch(ctx, "mk_lsa_mh_coarse_expand", &.{lsa_scratch}, &lp, 256, 256);
+                    }
+
+                    const s2_fine_max = @min(max_mid, coarse_cap * 4);
+                    const s2_items = s2_fine_max + 1 + window_blocks;
+                    const dtile2 = exec.Engine.lsaDecodeScoreTile(s2_items);
+                    lp.stage_mode = 2;
+                    lp.tile_items = dtile2;
+                    lp.score_tiles_x = @max((s2_items + dtile2 - 1) / dtile2, 1);
+                    try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_buf, lsa_scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    const agg2 = exec.Engine.lsaDecodeAggTile(s2_fine_max);
+                    lp.bq_tile = agg2;
+                    const agg2_tiles = @max((s2_fine_max + agg2 - 1) / agg2, 1);
+                    try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp, @as(usize, agg2_tiles) * 256, 256);
+                    if (s2_fine_max <= 1024) {
+                        try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+                    } else {
+                        lp.tile_items = 256;
+                        lp.score_tiles_x = @max((s2_fine_max + 255) / 256, 1);
+                        try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                        try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+                    }
+                }
+                try gpu.dispatch(ctx, "mk_relative_lsa_decode_keys_fast", &.{ arena, k16, v16, parts, block_list, block_count }, &lp, @as(usize, kv_heads) * lp.taps * 256, 256);
+                try gpu.dispatch(ctx, "mk_relative_long_merge_fast", &.{ arena, parts }, &p_lsa_merge, heads * 128, 128);
+            }
+            try ctx.finish();
+            const us = (ctx.stats().gpu_seconds - before.gpu_seconds) / @as(f64, @floatFromInt(repeats)) * 1e6;
+            const name = try std.fmt.allocPrint(a, "LSA Q4 MH sparse ({s}, {d} tok)", .{ if (two_stage) "2-stage" else "1-stage", sparse_keys });
+            try Timer.report(a, name, us, reference, out);
+        }
         // A prefill chunk: the last `batch` positions.
         if (p.pos + 1 >= batch) {
             p.rows = batch;

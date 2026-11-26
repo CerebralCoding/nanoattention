@@ -2225,3 +2225,909 @@ test "Inkling split expert tiles cover full blocks and tails without writing unu
         };
     }
 }
+
+test "LoopCD fixed and adaptive contrast kernels match FP64 CPU oracle" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var prng = rng(42);
+    const r = prng.random();
+
+    const rows: u32 = 4;
+    const row0: u32 = 1;
+    const total_rows: u32 = row0 + rows + 1;
+    const n: u32 = 600;
+    const xs: u32 = n + 7;
+    const ys: u32 = n + 11;
+    const zs: u32 = n + 15;
+    const strong_off: u32 = 0;
+    const weak_off: u32 = total_rows * xs;
+    const out_off: u32 = weak_off + total_rows * ys;
+    const arena = try ctx.alloc(out_off + total_rows * zs);
+    defer arena.deinit();
+    const af = arena.floats();
+
+    for (0..total_rows) |row_i| {
+        for (0..n) |c| {
+            af[strong_off + row_i * xs + c] = fromBf16(bf16(0.5 * r.floatNorm(f32)));
+            af[weak_off + row_i * ys + c] = fromBf16(bf16(0.5 * r.floatNorm(f32)));
+        }
+    }
+    // Row 1 (row0+0): tied top-1 max -> p1 == p2 -> w = omega.
+    af[strong_off + (row0 + 0) * xs + 3] = 4.5;
+    af[strong_off + (row0 + 0) * xs + 411] = 4.5;
+    // Row 2 (row0+1): peaked confident distribution -> w ~ 0.
+    for (0..n) |c| af[strong_off + (row0 + 1) * xs + c] = -12.0;
+    af[strong_off + (row0 + 1) * xs + 17] = 10.0;
+    af[strong_off + (row0 + 1) * xs + 299] = -10.0;
+    // Row 3 (row0+2): non-finite logit ignored cleanly by top-2/softmax.
+    af[strong_off + (row0 + 2) * xs + 5] = std.math.inf(f32);
+    af[strong_off + (row0 + 2) * xs + 7] = std.math.nan(f32);
+
+    // 1. Fixed omega=0 must be bit-exact (sentinel rows untouched).
+    @memset(af[out_off..][0 .. total_rows * zs], -9.0);
+    var p: gpu.Params = .{
+        .rows = rows,
+        .row0 = row0,
+        .x = strong_off,
+        .xs = xs,
+        .y = weak_off,
+        .ys = ys,
+        .z = out_off,
+        .zs = zs,
+        .n = n,
+        .scale = 0.0,
+        .flags = gpu.flag_round_bf16,
+    };
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_fixed", &.{arena}, &p, rows * n, 256);
+    try ctx.finish();
+    for (0..n) |c| {
+        try testing.expectEqual(@as(f32, -9.0), af[out_off + 0 * zs + c]);
+        try testing.expectEqual(@as(f32, -9.0), af[out_off + (row0 + rows) * zs + c]);
+        for (row0..row0 + rows) |row_i| {
+            try testing.expectEqual(@as(u32, @bitCast(af[strong_off + row_i * xs + c])), @as(u32, @bitCast(af[out_off + row_i * zs + c])));
+        }
+    }
+
+    // 2. Fixed omega=0.75 without and with BF16 rounding.
+    p.scale = 0.75;
+    p.flags = 0;
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_fixed", &.{arena}, &p, rows * n, 256);
+    try ctx.finish();
+    for (row0..row0 + rows) |row_i| for (0..n) |c| {
+        const s = af[strong_off + row_i * xs + c];
+        const w = af[weak_off + row_i * ys + c];
+        if (!std.math.isFinite(s)) continue;
+        const expected = @as(f64, s) + 0.75 * (@as(f64, s) - @as(f64, w));
+        try close(expected, af[out_off + row_i * zs + c], 1e-5);
+    };
+
+    // 3. Adaptive omega=1.2 vs FP64 CPU oracle across tied, peaked, non-finite, and random rows.
+    p.scale = 1.2;
+    p.flags = 0;
+    @memset(af[out_off..][0 .. total_rows * zs], -9.0);
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_adaptive", &.{arena}, &p, rows * 256, 256);
+    try ctx.finish();
+    for (row0..row0 + rows) |row_i| {
+        var m1: f32 = -std.math.inf(f32);
+        var m2: f32 = -std.math.inf(f32);
+        for (0..n) |c| {
+            const v = af[strong_off + row_i * xs + c];
+            if (!std.math.isFinite(v)) continue;
+            if (v >= m1) {
+                m2 = m1;
+                m1 = v;
+            } else if (v > m2) {
+                m2 = v;
+            }
+        }
+        var z: f64 = 0;
+        for (0..n) |c| {
+            const v = af[strong_off + row_i * xs + c];
+            if (std.math.isFinite(v)) z += @exp(@as(f64, v - m1));
+        }
+        const p1 = 1.0 / z;
+        const p2 = if (std.math.isFinite(m2)) @exp(@as(f64, m2 - m1)) / z else 0.0;
+        const gap = std.math.clamp(p1 - p2, 0.0, 1.0);
+        const weight = 1.2 * (1.0 - gap);
+        if (row_i == row0 + 0) try testing.expectApproxEqRel(@as(f64, 1.2), weight, 1e-6);
+        if (row_i == row0 + 1) try testing.expectApproxEqAbs(@as(f64, 0.0), weight, 1e-6);
+        for (0..n) |c| {
+            const s = af[strong_off + row_i * xs + c];
+            const wk = af[weak_off + row_i * ys + c];
+            if (!std.math.isFinite(s)) continue;
+            const expected = @as(f64, s) + weight * (@as(f64, s) - @as(f64, wk));
+            try close(expected, af[out_off + row_i * zs + c], 2e-5);
+        }
+    }
+
+    // 4. n=1 adaptive edge case (gap == 1 => w == 0).
+    var p1_cfg = p;
+    p1_cfg.rows = 1;
+    p1_cfg.row0 = 0;
+    p1_cfg.n = 1;
+    af[strong_off + 0] = 3.25;
+    af[weak_off + 0] = -1.5;
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_adaptive", &.{arena}, &p1_cfg, 256, 256);
+    try ctx.finish();
+    try testing.expectEqual(@as(f32, 3.25), af[out_off + 0]);
+
+    // 5. In-place out == strong matches out-of-place bit-for-bit (fixed and adaptive).
+    var p_inp = p;
+    p_inp.scale = 0.85;
+    p_inp.flags = 0;
+    p_inp.z = out_off;
+    p_inp.zs = zs;
+    const ref_fixed = try testing.allocator.alloc(f32, rows * n);
+    defer testing.allocator.free(ref_fixed);
+    const ref_adapt = try testing.allocator.alloc(f32, rows * n);
+    defer testing.allocator.free(ref_adapt);
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_fixed", &.{arena}, &p_inp, rows * n, 256);
+    try ctx.finish();
+    for (0..rows) |r_i| @memcpy(ref_fixed[r_i * n ..][0..n], af[out_off + (row0 + r_i) * zs ..][0..n]);
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_adaptive", &.{arena}, &p_inp, rows * 256, 256);
+    try ctx.finish();
+    for (0..rows) |r_i| @memcpy(ref_adapt[r_i * n ..][0..n], af[out_off + (row0 + r_i) * zs ..][0..n]);
+
+    const strong_saved = try testing.allocator.alloc(f32, rows * n);
+    defer testing.allocator.free(strong_saved);
+    for (0..rows) |r_i| @memcpy(strong_saved[r_i * n ..][0..n], af[strong_off + (row0 + r_i) * xs ..][0..n]);
+
+    p_inp.z = strong_off;
+    p_inp.zs = xs;
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_fixed", &.{arena}, &p_inp, rows * n, 256);
+    try ctx.finish();
+    for (0..rows) |r_i| for (0..n) |c| {
+        try testing.expectEqual(@as(u32, @bitCast(ref_fixed[r_i * n + c])), @as(u32, @bitCast(af[strong_off + (row0 + r_i) * xs + c])));
+        af[strong_off + (row0 + r_i) * xs + c] = strong_saved[r_i * n + c];
+    };
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_adaptive", &.{arena}, &p_inp, rows * 256, 256);
+    try ctx.finish();
+    for (0..rows) |r_i| for (0..n) |c| {
+        try testing.expectEqual(@as(u32, @bitCast(ref_adapt[r_i * n + c])), @as(u32, @bitCast(af[strong_off + (row0 + r_i) * xs + c])));
+    };
+}
+
+test "Fused 4x2 head softcap LoopCD (fixed & dual) and parallel 2-pass adaptive contrast" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    const inkling_plan = @import("inkling_plan.zig");
+
+    var prng = rng(44);
+    const r = prng.random();
+    const n: u32 = 256;
+    const m: u32 = 4099; // non-multiple of 4 and large enough to span 64 groups
+    const rows: u32 = 2;
+    const scale: f32 = 30.0;
+    const groups = inkling_plan.argmax_groups;
+    const span = (m + groups - 1) / groups;
+
+    const w_buf = try ctx.alloc((@as(usize, m) * n + 1) / 2);
+    defer w_buf.deinit();
+    const wu = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats()));
+    for (wu[0 .. @as(usize, m) * n]) |*elem| elem.* = bf16(0.15 * r.floatNorm(f32));
+
+    const xs_off: u32 = 0;
+    const xw_off: u32 = xs_off + rows * n;
+    const y_off: u32 = xw_off + rows * n;
+    const wlogits_off: u32 = y_off + rows * m;
+    const ref_s_off: u32 = wlogits_off + rows * m;
+    const ref_w_off: u32 = ref_s_off + rows * m;
+    const ref_out_off: u32 = ref_w_off + rows * m;
+    const arena = try ctx.alloc(ref_out_off + rows * m);
+    defer arena.deinit();
+    const af = arena.floats();
+    const partials = try ctx.alloc(@as(usize, rows) * groups * 3);
+    defer partials.deinit();
+
+    for (af[xs_off .. xs_off + rows * n]) |*v| v.* = fromBf16(bf16(0.5 * r.floatNorm(f32)));
+    for (af[xw_off .. xw_off + rows * n]) |*v| v.* = fromBf16(bf16(0.5 * r.floatNorm(f32)));
+
+    var ps_ref: gpu.Params = .{ .rows = 1, .row0 = 0, .x = xs_off, .xs = n, .y = ref_s_off, .ys = m, .n = n, .m = m, .scale = scale };
+    var pw_ref: gpu.Params = .{ .rows = 1, .row0 = 0, .x = xw_off, .xs = n, .y = ref_w_off, .ys = m, .n = n, .m = m, .scale = scale };
+    var p_dual: gpu.Params = .{
+        .rows = 1,
+        .row0 = 0,
+        .x = xs_off,
+        .xs = n,
+        .z = xw_off,
+        .zs = n,
+        .y = y_off,
+        .ys = m,
+        .every = wlogits_off,
+        .pad_k = m,
+        .n = n,
+        .m = m,
+        .scale = scale,
+        .eps = 0.75,
+    };
+    const Variant = struct { ref_k: [:0]const u8, dual_k: [:0]const u8, fix_k: [:0]const u8 };
+    for ([_]Variant{
+        .{ .ref_k = "mk_bf16_linear_4x1_softcap", .dual_k = "mk_bf16_linear_4x2_softcap_dual", .fix_k = "mk_bf16_linear_4x2_softcap_loopcd" },
+        .{ .ref_k = "mk_bf16_linear_4x1_softcap_vec8", .dual_k = "mk_bf16_linear_4x2_softcap_dual_vec8", .fix_k = "mk_bf16_linear_4x2_softcap_loopcd_vec8" },
+    }) |vk| {
+        try gpu.dispatch(ctx, vk.ref_k, &.{ w_buf, arena }, &ps_ref, ((@as(usize, m) + 3) / 4) * 32, 128);
+        try gpu.dispatch(ctx, vk.ref_k, &.{ w_buf, arena }, &pw_ref, ((@as(usize, m) + 3) / 4) * 32, 128);
+
+        // 1. Dual 4x2 must be bit-identical to separate 4x1 softcap projections of the same vector width.
+        @memset(af[y_off .. y_off + m], -1.0);
+        @memset(af[wlogits_off .. wlogits_off + m], -1.0);
+        try gpu.dispatch(ctx, vk.dual_k, &.{ w_buf, arena }, &p_dual, ((@as(usize, m) + 3) / 4) * 32, 128);
+        try ctx.finish();
+        for (0..m) |c| {
+            try testing.expectEqual(@as(u32, @bitCast(af[ref_s_off + c])), @as(u32, @bitCast(af[y_off + c])));
+            try testing.expectEqual(@as(u32, @bitCast(af[ref_w_off + c])), @as(u32, @bitCast(af[wlogits_off + c])));
+        }
+
+        // 2. Fixed 4x2 (omega=0 bit-exact, omega=0.75 bit-identical to reference 4x1 + fixed contrast).
+        var p_fix_ref: gpu.Params = .{ .rows = 1, .row0 = 0, .x = ref_s_off, .xs = m, .y = ref_w_off, .ys = m, .z = ref_out_off, .zs = m, .n = m, .scale = 0.75 };
+        try gpu.dispatch(ctx, "mk_loopcd_contrast_fixed", &.{arena}, &p_fix_ref, m, 256);
+
+        p_dual.eps = 0.0;
+        try gpu.dispatch(ctx, vk.fix_k, &.{ w_buf, arena }, &p_dual, ((@as(usize, m) + 3) / 4) * 32, 128);
+        try ctx.finish();
+        for (0..m) |c| try testing.expectEqual(@as(u32, @bitCast(af[ref_s_off + c])), @as(u32, @bitCast(af[y_off + c])));
+
+        p_dual.eps = 0.75;
+        try gpu.dispatch(ctx, vk.fix_k, &.{ w_buf, arena }, &p_dual, ((@as(usize, m) + 3) / 4) * 32, 128);
+        try ctx.finish();
+        for (0..m) |c| try testing.expectEqual(@as(u32, @bitCast(af[ref_out_off + c])), @as(u32, @bitCast(af[y_off + c])));
+    }
+
+    // 3. Parallel 2-pass adaptive contrast across rows=2 (ties in row 0, peaked in row 1, in-place out == strong).
+    for (0..rows) |r_i| for (0..m) |c| {
+        af[ref_s_off + r_i * m + c] = 0.25 * r.floatNorm(f32);
+        af[ref_w_off + r_i * m + c] = 0.25 * r.floatNorm(f32);
+    };
+    af[ref_s_off + 3] = 5.0;
+    af[ref_s_off + 2001] = 5.0;
+    af[ref_s_off + m + 99] = 12.0;
+    af[ref_s_off + m + 2500] = -10.0;
+    @memcpy(af[y_off .. y_off + rows * m], af[ref_s_off .. ref_s_off + rows * m]);
+
+    var p_ad_ref: gpu.Params = .{ .rows = rows, .row0 = 0, .x = ref_s_off, .xs = m, .y = ref_w_off, .ys = m, .z = ref_out_off, .zs = m, .n = m, .scale = 1.0 };
+    var p_ad_par: gpu.Params = .{ .rows = rows, .row0 = 0, .x = y_off, .xs = m, .y = ref_w_off, .ys = m, .z = y_off, .zs = m, .n = m, .m = span, .every = groups, .scale = 1.0 };
+    try gpu.dispatch(ctx, "mk_loopcd_contrast_adaptive", &.{arena}, &p_ad_ref, rows * 256, 256);
+    try gpu.dispatch(ctx, "mk_loopcd_adaptive_part", &.{ arena, partials }, &p_ad_par, rows * groups * 256, 256);
+    try gpu.dispatch(ctx, "mk_loopcd_adaptive_apply", &.{ arena, partials }, &p_ad_par, rows * groups * 256, 256);
+    try ctx.finish();
+    for (0..rows) |r_i| for (0..m) |c| {
+        try close(af[ref_out_off + r_i * m + c], af[y_off + r_i * m + c], 2e-5);
+    };
+}
+
+fn lsaAlign256(v: u64) u64 {
+    return (v + 255) & ~@as(u64, 255);
+}
+
+test "LSA MH Q4 pooling and 1-stage / 2-stage needle recovery with learned sink" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+
+    const heads: u32 = 6;
+    const kv_heads: u32 = 2;
+    const dim: u32 = 128;
+    const budget_blocks: u32 = 8;
+    const window_blocks: u32 = 8;
+    const coarse_cap: u32 = 16;
+    const list_stride: u32 = 1 + budget_blocks + window_blocks;
+    const meta_bytes: u32 = kv_heads * 4;
+    const row_bytes: u32 = ((meta_bytes + kv_heads * (dim / 2)) + 3) & ~@as(u32, 3);
+    const max_keys: u32 = 6144;
+    const max_blocks: u32 = max_keys / 4;
+    const score_items: u32 = max_blocks;
+    const tiles_x: u32 = (max_blocks + 255) / 256;
+
+    var cur: u64 = 0;
+    const off_hs = cur;
+    cur = lsaAlign256(cur + @as(u64, score_items) * heads * 2);
+    const off_ts = cur;
+    cur = lsaAlign256(cur + @as(u64, heads) * @max(tiles_x, 256) * 8);
+    const off_hl = cur;
+    cur = lsaAlign256(cur + @as(u64, heads) * 4);
+    const off_sc = cur;
+    cur = lsaAlign256(cur + @as(u64, score_items) * 4);
+    const off_hi = cur;
+    cur = lsaAlign256(cur + 512 * 4);
+    const off_cc = cur;
+    cur = lsaAlign256(cur + 4);
+    const off_cm = cur;
+    cur = lsaAlign256(cur + 4096 * 4);
+    const off_cu = cur;
+    cur = lsaAlign256(cur + 4096 * 4);
+    const off_fc = cur;
+    cur = lsaAlign256(cur + @as(u64, coarse_cap) * 4 * 4);
+    const off_fn = cur;
+    cur = lsaAlign256(cur + 4);
+
+    const q_off: u32 = 0;
+    const sink_off: u32 = heads * dim;
+    const arena = try ctx.alloc(sink_off + heads);
+    defer arena.deinit();
+    const k32 = try ctx.alloc(@as(usize, max_keys) * kv_heads * dim);
+    defer k32.deinit();
+    const k16 = try ctx.alloc(@as(usize, max_keys) * kv_heads * dim / 2);
+    defer k16.deinit();
+    const fine_f32 = try ctx.alloc((@as(usize, max_blocks) * row_bytes + 3) / 4);
+    defer fine_f32.deinit();
+    const fine_bf16 = try ctx.alloc((@as(usize, max_blocks) * row_bytes + 3) / 4);
+    defer fine_bf16.deinit();
+    const coarse_buf = try ctx.alloc((@as(usize, max_blocks / 4) * row_bytes + 3) / 4);
+    defer coarse_buf.deinit();
+    const lsa_scratch = try ctx.alloc(@intCast((cur + 3) / 4));
+    defer lsa_scratch.deinit();
+    @memset(std.mem.sliceAsBytes(lsa_scratch.floats()), 0);
+    const block_list = try ctx.alloc(list_stride);
+    defer block_list.deinit();
+    const block_count = try ctx.alloc(1);
+    defer block_count.deinit();
+
+    const af = arena.floats();
+    @memset(af, 0);
+    // 3 planted needle signatures mapped across heads (0,1)->band0, (2,3)->band1, (4,5)->band2.
+    for (0..heads) |qh| {
+        const band = qh / 2;
+        for (0..32) |j| af[q_off + qh * dim + band * 32 + j] = 2.0;
+    }
+    for (0..heads) |qh| af[sink_off + qh] = -5.0;
+
+    var prng = rng(99);
+    const r = prng.random();
+    const k32f = k32.floats();
+    const k16u = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(k16.floats()));
+    for (0..max_keys) |t| {
+        for (0..kv_heads) |kvh| {
+            for (0..dim) |d| {
+                const bg = if (d >= 96) fromBf16(bf16(0.05 * r.floatNorm(f32))) else 0.0;
+                const idx = (t * kv_heads + kvh) * dim + d;
+                k32f[idx] = bg;
+                k16u[idx] = bf16(bg);
+            }
+        }
+    }
+    // Pool F32 vs BF16 parity on needle-rich 1-stage and 2-stage configurations.
+    const Case = struct { keys: u32, needles: [3]u32, two_stage: bool };
+    for ([_]Case{
+        .{ .keys = 512, .needles = .{ 15, 53, 91 }, .two_stage = false },
+        .{ .keys = 4096, .needles = .{ 77, 412, 889 }, .two_stage = true },
+        .{ .keys = 5120, .needles = .{ 77, 512, 1180 }, .two_stage = false },
+    }) |tc| {
+        for (tc.needles, 0..) |nb, bi| {
+            for (0..4) |off| {
+                const t = nb * 4 + off;
+                for (0..kv_heads) |kvh| {
+                    for (0..32) |j| {
+                        const idx = (t * kv_heads + kvh) * dim + bi * 32 + j;
+                        k32f[idx] = 2.0;
+                        k16u[idx] = bf16(2.0);
+                    }
+                }
+            }
+        }
+        var lp: gpu.LSAParams = .{
+            .off_head_scores = off_hs,
+            .off_tg_stats = off_ts,
+            .off_head_lse = off_hl,
+            .off_scores = off_sc,
+            .off_hist = off_hi,
+            .off_cand_count = off_cc,
+            .off_cand_m = off_cm,
+            .off_cand_u = off_cu,
+            .off_fine_cand = off_fc,
+            .off_fine_count = off_fn,
+            .units = 1,
+            .rows = 1,
+            .pos0 = tc.keys - 1,
+            .dim = dim,
+            .heads = heads,
+            .kv_heads = kv_heads,
+            .capacity = max_keys,
+            .q_off = q_off,
+            .q_stride = heads * dim,
+            .sink_off = sink_off,
+            .sink_stride = heads,
+            .budget_blocks = budget_blocks,
+            .window_blocks = window_blocks,
+            .coarse_cap = coarse_cap,
+            .pooled_meta_bytes = meta_bytes,
+            .pooled_row_bytes = row_bytes,
+            .num_blks = tc.keys / 4,
+            .list_stride = list_stride,
+            .score_stride = score_items,
+            .head_score_stride = score_items,
+            .cand_cap = 4096,
+            .score_tiles_x = tiles_x,
+            .has_sink = 1,
+            .scale = 1.0 / @sqrt(@as(f32, dim)),
+        };
+        try gpu.dispatch(ctx, "mk_lsa_pool_fine_f32", &.{ k32, fine_f32 }, &lp, @as(usize, lp.num_blks) * 128, 128);
+        try gpu.dispatch(ctx, "mk_lsa_pool_fine_bf16", &.{ k16, fine_bf16 }, &lp, @as(usize, lp.num_blks) * 128, 128);
+        try ctx.finish();
+        const pool_bytes = @as(usize, lp.num_blks) * row_bytes;
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(fine_f32.floats())[0..pool_bytes], std.mem.sliceAsBytes(fine_bf16.floats())[0..pool_bytes]);
+
+        if (!tc.two_stage) {
+            lp.stage_mode = 0;
+            lp.bq_tile = 1;
+            lp.score_tiles_x = @max((tc.keys / 4 + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score", &.{ arena, fine_bf16, lsa_scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_reduce_lse", &.{ arena, lsa_scratch }, &lp, heads * 32, 32);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+        } else {
+            lp.num_blks = tc.keys / 16;
+            try gpu.dispatch(ctx, "mk_lsa_pool_coarse", &.{ fine_bf16, coarse_buf }, &lp, @as(usize, lp.num_blks) * 128, 128);
+            lp.stage_mode = 1;
+            lp.bq_tile = 1;
+            lp.score_tiles_x = @max((tc.keys / 16 + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score", &.{ arena, coarse_buf, lsa_scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_reduce_lse", &.{ arena, lsa_scratch }, &lp, heads * 32, 32);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_coarse_expand", &.{lsa_scratch}, &lp, 256, 256);
+            lp.stage_mode = 2;
+            lp.score_tiles_x = @max((coarse_cap * 4 + 1 + window_blocks + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score", &.{ arena, fine_bf16, lsa_scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_reduce_lse", &.{ arena, lsa_scratch }, &lp, heads * 32, 32);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, block_list, block_count }, &lp, 256, 256);
+        }
+        try ctx.finish();
+
+        const cnt = block_count.structs(u32)[0];
+        try testing.expectEqual(list_stride, cnt);
+        const list = block_list.structs(u32)[0..cnt];
+        try testing.expectEqual(@as(u32, 0), list[0]);
+        for (1..cnt) |i| try testing.expect(list[i - 1] < list[i]);
+        for (tc.needles) |nb| {
+            var found = false;
+            for (list[1 .. 1 + budget_blocks]) |b| if (b == nb) {
+                found = true;
+                break;
+            };
+            try testing.expect(found);
+        }
+        const total_blks = tc.keys / 4;
+        for (0..window_blocks) |w| {
+            try testing.expectEqual(total_blks - window_blocks + @as(u32, @intCast(w)), list[1 + budget_blocks + w]);
+        }
+        // Scratch counters must be zeroed after finalize.
+        const sbytes = std.mem.sliceAsBytes(lsa_scratch.floats());
+        for (std.mem.bytesAsSlice(u32, sbytes[@intCast(off_hi)..][0 .. 512 * 4])) |v| try testing.expectEqual(@as(u32, 0), v);
+        try testing.expectEqual(@as(u32, 0), std.mem.bytesAsSlice(u32, sbytes[@intCast(off_cc)..][0..4])[0]);
+
+        // Fast single-row decode selection (mk_lsa_mh_score_dec + dynamic tile_items) matches reference 256-item selection.
+        const dec_block_list = try ctx.alloc(list_stride);
+        defer dec_block_list.deinit();
+        const dec_block_count = try ctx.alloc(1);
+        defer dec_block_count.deinit();
+        const dec_scores_ref = try testing.allocator.alloc(u16, @as(usize, max_blocks) * heads);
+        defer testing.allocator.free(dec_scores_ref);
+        const dec_lse_ref = try testing.allocator.alloc(f32, heads);
+        defer testing.allocator.free(dec_lse_ref);
+        @memcpy(dec_scores_ref, std.mem.bytesAsSlice(u16, sbytes[@intCast(off_hs)..][0 .. @as(usize, max_blocks) * heads * 2]));
+        @memcpy(dec_lse_ref, std.mem.bytesAsSlice(f32, sbytes[@intCast(off_hl)..][0 .. @as(usize, heads) * 4]));
+        const ref_list_copy = try testing.allocator.dupe(u32, list);
+        defer testing.allocator.free(ref_list_copy);
+
+        const exec_mod = @import("exec.zig");
+        var lp_dec = lp;
+        lp_dec.tile_items = 8;
+        if (!tc.two_stage) {
+            const items = tc.keys / 4;
+            const dtile = exec_mod.Engine.lsaDecodeScoreTile(items);
+            lp_dec.stage_mode = 0;
+            lp_dec.bq_tile = 1;
+            lp_dec.tile_items = dtile;
+            lp_dec.score_tiles_x = @max((items + dtile - 1) / dtile, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_bf16, lsa_scratch }, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_reduce_lse", &.{ arena, lsa_scratch }, &lp_dec, heads * 32, 32);
+            lp_dec.tile_items = 32;
+            lp_dec.score_tiles_x = @max((items + 31) / 32, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist", &.{lsa_scratch}, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            lp_dec.tile_items = 256;
+            lp_dec.score_tiles_x = @max((items + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, dec_block_list, dec_block_count }, &lp_dec, 256, 256);
+        } else {
+            const c_items = tc.keys / 16;
+            const dtile1 = exec_mod.Engine.lsaDecodeScoreTile(c_items);
+            lp_dec.stage_mode = 1;
+            lp_dec.bq_tile = 1;
+            lp_dec.tile_items = dtile1;
+            lp_dec.score_tiles_x = @max((c_items + dtile1 - 1) / dtile1, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, coarse_buf, lsa_scratch }, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_reduce_lse", &.{ arena, lsa_scratch }, &lp_dec, heads * 32, 32);
+            lp_dec.tile_items = 32;
+            lp_dec.score_tiles_x = @max((c_items + 31) / 32, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist", &.{lsa_scratch}, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            lp_dec.tile_items = 256;
+            lp_dec.score_tiles_x = @max((c_items + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_coarse_expand", &.{lsa_scratch}, &lp_dec, 256, 256);
+
+            const s2_items = coarse_cap * 4 + 1 + window_blocks;
+            const dtile2 = exec_mod.Engine.lsaDecodeScoreTile(s2_items);
+            lp_dec.stage_mode = 2;
+            lp_dec.tile_items = dtile2;
+            lp_dec.score_tiles_x = @max((s2_items + dtile2 - 1) / dtile2, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_bf16, lsa_scratch }, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_reduce_lse", &.{ arena, lsa_scratch }, &lp_dec, heads * 32, 32);
+            lp_dec.tile_items = 32;
+            lp_dec.score_tiles_x = @max((s2_items + 31) / 32, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist", &.{lsa_scratch}, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            lp_dec.tile_items = 256;
+            lp_dec.score_tiles_x = @max((s2_items + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp_dec, @as(usize, lp_dec.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, dec_block_list, dec_block_count }, &lp_dec, 256, 256);
+        }
+        try ctx.finish();
+        const active_items = if (!tc.two_stage) (tc.keys / 4 - 1 - window_blocks) else (coarse_cap * 4);
+        const dec_scores_got = std.mem.bytesAsSlice(u16, sbytes[@intCast(off_hs)..][0 .. active_items * heads * 2]);
+        for (dec_scores_ref[0 .. active_items * heads], dec_scores_got) |rv, gv| {
+            try testing.expectApproxEqAbs(@as(f32, @floatCast(@as(f16, @bitCast(rv)))), @as(f32, @floatCast(@as(f16, @bitCast(gv)))), 1e-2);
+        }
+        const dec_lse_got = std.mem.bytesAsSlice(f32, sbytes[@intCast(off_hl)..][0 .. @as(usize, heads) * 4]);
+        for (dec_lse_ref, dec_lse_got) |rl, gl| try close(@as(f64, rl), gl, 1e-4);
+        try testing.expectEqual(list_stride, dec_block_count.structs(u32)[0]);
+        try testing.expectEqualSlices(u32, ref_list_copy, dec_block_list.structs(u32)[0..list_stride]);
+
+        // 3-dispatch decode selection (mk_lsa_mh_score_dec -> mk_lsa_mh_agg_hist_dec -> mk_lsa_mh_finalize_dec) matches reference bit-for-bit.
+        const fused_block_list = try ctx.alloc(list_stride);
+        defer fused_block_list.deinit();
+        const fused_block_count = try ctx.alloc(1);
+        defer fused_block_count.deinit();
+        var lp_fused = lp;
+        if (!tc.two_stage) {
+            const items = tc.keys / 4;
+            const n_mid = items - 1 - window_blocks;
+            const dtile = exec_mod.Engine.lsaDecodeScoreTile(items);
+            lp_fused.stage_mode = 0;
+            lp_fused.bq_tile = 1;
+            lp_fused.tile_items = dtile;
+            lp_fused.score_tiles_x = @max((items + dtile - 1) / dtile, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_bf16, lsa_scratch }, &lp_fused, @as(usize, lp_fused.score_tiles_x) * 256, 256);
+            const agg0 = exec_mod.Engine.lsaDecodeAggTile(n_mid);
+            lp_fused.bq_tile = agg0;
+            const agg0_tiles = @max((n_mid + agg0 - 1) / agg0, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp_fused, @as(usize, agg0_tiles) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, fused_block_list, fused_block_count }, &lp_fused, 256, 256);
+        } else {
+            const c_items = tc.keys / 16;
+            const dtile1 = exec_mod.Engine.lsaDecodeScoreTile(c_items);
+            lp_fused.stage_mode = 1;
+            lp_fused.bq_tile = 1;
+            lp_fused.tile_items = dtile1;
+            lp_fused.score_tiles_x = @max((c_items + dtile1 - 1) / dtile1, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, coarse_buf, lsa_scratch }, &lp_fused, @as(usize, lp_fused.score_tiles_x) * 256, 256);
+            const agg1 = exec_mod.Engine.lsaDecodeAggTile(c_items);
+            lp_fused.bq_tile = agg1;
+            const agg1_tiles = @max((c_items + agg1 - 1) / agg1, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp_fused, @as(usize, agg1_tiles) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, fused_block_list, fused_block_count }, &lp_fused, 256, 256);
+
+            const s2_fine = coarse_cap * 4;
+            const s2_items = s2_fine + 1 + window_blocks;
+            const dtile2 = exec_mod.Engine.lsaDecodeScoreTile(s2_items);
+            lp_fused.stage_mode = 2;
+            lp_fused.tile_items = dtile2;
+            lp_fused.score_tiles_x = @max((s2_items + dtile2 - 1) / dtile2, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_bf16, lsa_scratch }, &lp_fused, @as(usize, lp_fused.score_tiles_x) * 256, 256);
+            const agg2 = exec_mod.Engine.lsaDecodeAggTile(s2_fine);
+            lp_fused.bq_tile = agg2;
+            const agg2_tiles = @max((s2_fine + agg2 - 1) / agg2, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp_fused, @as(usize, agg2_tiles) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, fused_block_list, fused_block_count }, &lp_fused, 256, 256);
+        }
+        try ctx.finish();
+        try testing.expectEqual(list_stride, fused_block_count.structs(u32)[0]);
+        try testing.expectEqualSlices(u32, ref_list_copy, fused_block_list.structs(u32)[0..list_stride]);
+        const hist_cleared = std.mem.bytesAsSlice(u32, sbytes[@intCast(off_hi)..][0 .. 256 * 4]);
+        for (hist_cleared) |hv| try testing.expectEqual(@as(u32, 0), hv);
+
+        if (!tc.two_stage and (tc.keys / 4 - 1 - window_blocks) > 1024) {
+            const items = tc.keys / 4;
+            const n_mid = items - 1 - window_blocks;
+            const dtile = exec_mod.Engine.lsaDecodeScoreTile(items);
+            var lp_hyb = lp;
+            lp_hyb.stage_mode = 0;
+            lp_hyb.bq_tile = 1;
+            lp_hyb.tile_items = dtile;
+            lp_hyb.score_tiles_x = @max((items + dtile - 1) / dtile, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_score_dec", &.{ arena, fine_bf16, lsa_scratch }, &lp_hyb, @as(usize, lp_hyb.score_tiles_x) * 256, 256);
+            const agg0 = exec_mod.Engine.lsaDecodeAggTile(n_mid);
+            lp_hyb.bq_tile = agg0;
+            const agg0_tiles = @max((n_mid + agg0 - 1) / agg0, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_agg_hist_dec", &.{ arena, lsa_scratch }, &lp_hyb, @as(usize, agg0_tiles) * 256, 256);
+            lp_hyb.tile_items = 256;
+            lp_hyb.score_tiles_x = @max((n_mid + 255) / 256, 1);
+            try gpu.dispatch(ctx, "mk_lsa_mh_collect", &.{lsa_scratch}, &lp_hyb, @as(usize, lp_hyb.score_tiles_x) * 256, 256);
+            try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, fused_block_list, fused_block_count }, &lp_hyb, 256, 256);
+            try ctx.finish();
+            try testing.expectEqual(list_stride, fused_block_count.structs(u32)[0]);
+            try testing.expectEqualSlices(u32, ref_list_copy, fused_block_list.structs(u32)[0..list_stride]);
+            for (hist_cleared) |hv| try testing.expectEqual(@as(u32, 0), hv);
+        }
+
+        // Also test dense bypass (total_blocks <= 1 + budget + window) writes blockCount == 0.
+        var lp_dense = lp;
+        lp_dense.stage_mode = 0;
+        lp_dense.pos0 = 63; // 16 blocks <= 17
+        try gpu.dispatch(ctx, "mk_lsa_mh_finalize", &.{ lsa_scratch, block_list, block_count }, &lp_dense, 256, 256);
+        try gpu.dispatch(ctx, "mk_lsa_mh_finalize_dec", &.{ lsa_scratch, fused_block_list, fused_block_count }, &lp_dense, 256, 256);
+        try ctx.finish();
+        try testing.expectEqual(@as(u32, 0), block_count.structs(u32)[0]);
+        try testing.expectEqual(@as(u32, 0), fused_block_count.structs(u32)[0]);
+        for (hist_cleared) |hv| try testing.expectEqual(@as(u32, 0), hv);
+
+        // Restore background noise before next case so needles don't leak across cases.
+        for (tc.needles) |nb| {
+            for (0..4) |off| {
+                const t = nb * 4 + off;
+                for (0..kv_heads) |kvh| {
+                    for (0..32) |j| {
+                        const bi_off: usize = if (tc.needles[0] == nb) 0 else if (tc.needles[1] == nb) 32 else 64;
+                        const idx = (t * kv_heads + kvh) * dim + bi_off + j;
+                        k32f[idx] = 0.0;
+                        k16u[idx] = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "LSA sparse attention ref, fast decode, inline bias, and BF16 MMA prefill match FP64 oracle" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var prng = rng(123);
+    const r = prng.random();
+
+    const heads: u32 = 6;
+    const kv_heads: u32 = 2;
+    const dim: u32 = 128;
+    const m: u32 = 16;
+    const rel_dim: u32 = 16;
+    const capacity: u32 = 128;
+    const rows: u32 = 40;
+    const row0: u32 = 2;
+    const total_rows: u32 = row0 + rows;
+    const pos0: u32 = 46; // covers keys up to pos0 + rows - 1 = 85
+    const list_stride: u32 = 16;
+    const units: u32 = 2; // covers 40 rows under both row_step=32 (2 tiles) and ref test
+
+    const q_off: u32 = 0;
+    const bias_off: u32 = total_rows * heads * dim;
+    const r_off: u32 = bias_off + total_rows * heads * m;
+    const sink_off: u32 = r_off + total_rows * heads * rel_dim;
+    const gate_off: u32 = sink_off + total_rows * heads;
+    const out_off: u32 = gate_off + total_rows * heads * dim;
+    const arena = try ctx.alloc(out_off + total_rows * heads * dim);
+    defer arena.deinit();
+    const af = arena.floats();
+
+    const k32 = try ctx.alloc(@as(usize, capacity) * kv_heads * dim);
+    defer k32.deinit();
+    const v32 = try ctx.alloc(@as(usize, capacity) * kv_heads * dim);
+    defer v32.deinit();
+    const k16 = try ctx.alloc(@as(usize, capacity) * kv_heads * dim / 2);
+    defer k16.deinit();
+    const v16 = try ctx.alloc(@as(usize, capacity) * kv_heads * dim / 2);
+    defer v16.deinit();
+    const parts = try ctx.alloc(@as(usize, heads) * 64 * 130);
+    defer parts.deinit();
+    const rel_w_buf = try ctx.alloc((@as(usize, rel_dim) * m + 1) / 2);
+    defer rel_w_buf.deinit();
+    const block_list = try ctx.alloc(@as(usize, rows) * list_stride);
+    defer block_list.deinit();
+    const block_count = try ctx.alloc(rows);
+    defer block_count.deinit();
+
+    for (af[q_off..][0 .. total_rows * heads * dim]) |*v| v.* = fromBf16(bf16(0.4 * r.floatNorm(f32)));
+    for (af[bias_off..][0 .. total_rows * heads * m]) |*v| v.* = fromBf16(bf16(0.25 * r.floatNorm(f32)));
+    for (af[r_off..][0 .. total_rows * heads * rel_dim]) |*v| v.* = fromBf16(bf16(0.3 * r.floatNorm(f32)));
+    for (af[sink_off..][0 .. total_rows * heads]) |*v| v.* = fromBf16(bf16(0.5 * r.floatNorm(f32)));
+    for (af[gate_off..][0 .. total_rows * heads * dim]) |*v| v.* = fromBf16(bf16(r.floatNorm(f32)));
+
+    const rel_wu = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(rel_w_buf.floats()));
+    for (rel_wu[0 .. rel_dim * m]) |*w| w.* = bf16(0.25 * r.floatNorm(f32));
+
+    for ([_][2]metal.Buffer{ .{ k32, k16 }, .{ v32, v16 } }) |pair| {
+        const pf = pair[0].floats();
+        const pu = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(pair[1].floats()));
+        for (pf, pu) |*fv, *hv| {
+            fv.* = fromBf16(bf16(0.4 * r.floatNorm(f32)));
+            hv.* = bf16(fv.*);
+        }
+    }
+
+    const bcnt = block_count.structs(u32);
+    const blist = block_list.structs(u32);
+    // Unit 0: dense bypass (cnt = 0); Unit 1: sorted sparse blocks spanning prefix + middle + recent.
+    bcnt[0] = 0;
+    const u1_blks = [_]u32{ 0, 2, 5, 9, 13, 16, 17, 18, 19, 20 };
+    bcnt[1] = u1_blks.len;
+    @memcpy(blist[1 * list_stride ..][0..u1_blks.len], &u1_blks);
+    _ = units;
+
+    const scale = 1.0 / @sqrt(@as(f32, dim));
+    const expected_tile = try testing.allocator.alloc(f32, rows * heads * dim);
+    defer testing.allocator.free(expected_tile);
+    const k32f = k32.floats();
+    const v32f = v32.floats();
+
+    // FP64 oracle for row_step=32 across all 40 rows (mixed dense tile 0 + sparse tile 1).
+    for (0..rows) |r_i| {
+        const row = row0 + r_i;
+        const pos = pos0 + r_i;
+        const unit = r_i / 32;
+        const ref_r = @min(unit * 32 + 31, rows - 1);
+        const ref_pos = pos0 + @as(u32, @intCast(ref_r));
+        const cnt = bcnt[unit];
+        const tail0: u32 = if (cnt > 0) ((ref_pos + 1) & ~@as(u32, 3)) else 0;
+        const tail_end = pos + 1;
+        const tail_cnt = if (tail_end > tail0) tail_end - tail0 else 0;
+        const total_keys = cnt * 4 + tail_cnt;
+        for (0..heads) |h| {
+            const kvh = h / (heads / kv_heads);
+            var max_s: f64 = @floatCast(af[sink_off + row * heads + h]);
+            var denom: f64 = 1.0;
+            var acc: [dim]f64 = @splat(0);
+            for (0..total_keys) |idx| {
+                const t: u32 = if (cnt > 0 and idx < cnt * 4)
+                    (blist[unit * list_stride + idx / 4] << 2) | @as(u32, @intCast(idx & 3))
+                else
+                    @intCast(tail0 + (if (cnt > 0) idx - cnt * 4 else idx));
+                if (t > pos) continue;
+                var dot: f64 = 0;
+                for (0..dim) |d| {
+                    dot += @as(f64, af[q_off + row * heads * dim + h * dim + d]) * @as(f64, k32f[(t * kv_heads + kvh) * dim + d]);
+                }
+                const dist = pos - t;
+                const rel: f64 = if (dist < m) @floatCast(af[bias_off + row * heads * m + h * m + dist]) else 0;
+                const score = dot * scale + rel;
+                const next_m = @max(max_s, score);
+                const prev = @exp(max_s - next_m);
+                const w = @exp(score - next_m);
+                denom = denom * prev + w;
+                for (0..dim) |d| acc[d] = acc[d] * prev + w * @as(f64, v32f[(t * kv_heads + kvh) * dim + d]);
+                max_s = next_m;
+            }
+            for (0..dim) |d| expected_tile[(r_i * heads + h) * dim + d] = @floatCast(acc[d] / denom);
+        }
+    }
+
+    // 1. General FP32 sparse reference with row_step = 32.
+    var lp: gpu.LSAParams = .{
+        .rows = rows,
+        .row0 = row0,
+        .pos0 = pos0,
+        .row_step = 32,
+        .dim = dim,
+        .heads = heads,
+        .kv_heads = kv_heads,
+        .capacity = capacity,
+        .q_off = q_off,
+        .q_stride = heads * dim,
+        .sink_off = sink_off,
+        .sink_stride = heads,
+        .bias_off = bias_off,
+        .bias_stride = heads * m,
+        .out_off = out_off,
+        .out_stride = heads * dim,
+        .m = m,
+        .list_stride = list_stride,
+        .has_sink = 1,
+        .scale = scale,
+    };
+    @memset(af[out_off..], -7.0);
+    try gpu.dispatch(ctx, "mk_relative_lsa_ref", &.{ arena, k32, v32, block_list, block_count }, &lp, rows * heads * 32, 32);
+    try ctx.finish();
+    for (0..rows) |r_i| for (0..heads * dim) |c| {
+        try close(expected_tile[r_i * heads * dim + c], af[out_off + (row0 + r_i) * heads * dim + c], 2e-4);
+    };
+
+    // 2. Tiled BF16 MMA sparse prefill against FP64 oracle (and ref).
+    @memset(af[out_off..], -7.0);
+    try gpu.dispatch(ctx, "mk_relative_lsa_prefill", &.{ arena, k16, v16, block_list, block_count }, &lp, ((rows + 31) / 32) * heads * 128, 128);
+    try ctx.finish();
+    for (0..rows) |r_i| for (0..heads * dim) |c| {
+        try close(expected_tile[r_i * heads * dim + c], af[out_off + (row0 + r_i) * heads * dim + c], 2e-2);
+    };
+
+    // 3. Fast striped BF16 sparse decode + inline bias + gated merge on row 1 of unit 1 (pos = 85).
+    const dec_row: u32 = row0 + 39;
+    const dec_pos: u32 = pos0 + 39; // 85
+    const dec_cnt: u32 = 8;
+    const dec_blks = [_]u32{ 0, 2, 5, 9, 13, 17, 19, 20 };
+    bcnt[0] = dec_cnt;
+    @memcpy(blist[0..dec_cnt], &dec_blks);
+    const dec_tail0 = (dec_pos + 1) & ~@as(u32, 3);
+    const dec_keys_total = dec_cnt * 4 + (dec_pos + 1 - dec_tail0);
+
+    var lp_dec = lp;
+    lp_dec.rows = 1;
+    lp_dec.row0 = dec_row;
+    lp_dec.pos0 = dec_pos;
+    lp_dec.row_step = 1;
+    lp_dec.taps = 4;
+    var p_merge: gpu.Params = .{
+        .rows = 1,
+        .row0 = dec_row,
+        .y = out_off,
+        .ys = heads * dim,
+        .s = sink_off,
+        .every = heads,
+        .taps = 4,
+    };
+
+    try gpu.dispatch(ctx, "mk_relative_lsa_decode_keys_fast", &.{ arena, k16, v16, parts, block_list, block_count }, &lp_dec, @as(usize, kv_heads) * lp_dec.taps * 256, 256);
+    try gpu.dispatch(ctx, "mk_relative_long_merge_fast", &.{ arena, parts }, &p_merge, heads * 128, 128);
+    try ctx.finish();
+
+    for (0..heads) |h| {
+        const kvh = h / (heads / kv_heads);
+        var max_s: f64 = @floatCast(af[sink_off + dec_row * heads + h]);
+        var denom: f64 = 1.0;
+        var acc: [dim]f64 = @splat(0);
+        for (0..dec_keys_total) |idx| {
+            const t: u32 = if (idx < dec_cnt * 4) (dec_blks[idx / 4] << 2) | @as(u32, @intCast(idx & 3)) else dec_tail0 + @as(u32, @intCast(idx - dec_cnt * 4));
+            var dot: f64 = 0;
+            for (0..dim) |d| dot += @as(f64, af[q_off + dec_row * heads * dim + h * dim + d]) * @as(f64, k32f[(t * kv_heads + kvh) * dim + d]);
+            const dist = dec_pos - t;
+            const rel: f64 = if (dist < m) @floatCast(af[bias_off + dec_row * heads * m + h * m + dist]) else 0;
+            const score = dot * scale + rel;
+            const next_m = @max(max_s, score);
+            const prev = @exp(max_s - next_m);
+            const w = @exp(score - next_m);
+            denom = denom * prev + w;
+            for (0..dim) |d| acc[d] = acc[d] * prev + w * @as(f64, v32f[(t * kv_heads + kvh) * dim + d]);
+            max_s = next_m;
+        }
+        for (0..dim) |d| try close(acc[d] / denom, af[out_off + dec_row * heads * dim + h * dim + d], 2e-3);
+    }
+
+    // Inline bias + gated merge variant.
+    lp_dec.bias_off = r_off;
+    lp_dec.bias_stride = heads * rel_dim;
+    p_merge.z = gate_off;
+    p_merge.zs = heads * dim;
+    p_merge.flags = gpu.flag_round_bf16 | gpu.flag_round_out;
+    try gpu.dispatch(ctx, "mk_relative_lsa_decode_keys_inline_fast", &.{ arena, k16, v16, parts, block_list, block_count, rel_w_buf }, &lp_dec, @as(usize, kv_heads) * lp_dec.taps * 256, 256);
+    try gpu.dispatch(ctx, "mk_relative_long_merge_gated", &.{ arena, parts }, &p_merge, heads * 128, 128);
+    try ctx.finish();
+
+    for (0..heads) |h| {
+        const kvh = h / (heads / kv_heads);
+        var max_s: f64 = @floatCast(af[sink_off + dec_row * heads + h]);
+        var denom: f64 = 1.0;
+        var acc: [dim]f64 = @splat(0);
+        for (0..dec_keys_total) |idx| {
+            const t: u32 = if (idx < dec_cnt * 4) (dec_blks[idx / 4] << 2) | @as(u32, @intCast(idx & 3)) else dec_tail0 + @as(u32, @intCast(idx - dec_cnt * 4));
+            var dot: f64 = 0;
+            for (0..dim) |d| dot += @as(f64, af[q_off + dec_row * heads * dim + h * dim + d]) * @as(f64, k32f[(t * kv_heads + kvh) * dim + d]);
+            const dist = dec_pos - t;
+            var rel: f64 = 0;
+            if (dist < m) {
+                var rsum: f32 = 0;
+                for (0..rel_dim) |k| rsum += af[r_off + dec_row * heads * rel_dim + h * rel_dim + k] * fromBf16(rel_wu[k * m + dist]);
+                rel = @floatCast(fromBf16(bf16(rsum)));
+            }
+            const score = dot * scale + rel;
+            const next_m = @max(max_s, score);
+            const prev = @exp(max_s - next_m);
+            const w = @exp(score - next_m);
+            denom = denom * prev + w;
+            for (0..dim) |d| acc[d] = acc[d] * prev + w * @as(f64, v32f[(t * kv_heads + kvh) * dim + d]);
+            max_s = next_m;
+        }
+        for (0..dim) |d| {
+            const g_val = @as(f64, af[gate_off + dec_row * heads * dim + h * dim + d]);
+            const sig = 1.0 / (1.0 + @exp(-g_val));
+            const gated = (acc[d] / denom) * sig;
+            const expected_bf16 = fromBf16(bf16(@floatCast(gated)));
+            try close(expected_bf16, af[out_off + dec_row * heads * dim + h * dim + d], 2e-3);
+        }
+    }
+}

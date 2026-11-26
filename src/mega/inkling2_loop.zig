@@ -306,10 +306,41 @@ test "Inkling2 rejects unsupported loop geometry" {
 
 // Checkpoint names and math pinned to the released safetensors header and the
 // Inkling 2 Mini MLX reference (jundot/mlx-lm 0c4c99192230f).
+pub const LoopCdMode = enum { off, hidden, logits, logits_adaptive };
+
+pub const Options = struct {
+    loop_passes: ?u32 = null,
+    loopcd: LoopCdMode = .off,
+    loopcd_omega: f32 = 1.0,
+    loopcd_weak_pass: u32 = 1,
+};
+
+pub fn parseLoopCdMode(value: []const u8) ?LoopCdMode {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "hidden")) return .hidden;
+    if (std.mem.eql(u8, value, "logits")) return .logits;
+    if (std.mem.eql(u8, value, "logits-adaptive") or std.mem.eql(u8, value, "logits_adaptive")) return .logits_adaptive;
+    return null;
+}
+
 pub fn build(gpa: std.mem.Allocator, bytes: []const u8) !ir.Program {
+    return buildWithOptions(gpa, bytes, .{});
+}
+
+pub fn buildWithOptions(gpa: std.mem.Allocator, bytes: []const u8, options: Options) !ir.Program {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    return lower(gpa, try parse(arena.allocator(), bytes));
+    var c = try parse(arena.allocator(), bytes);
+    if (options.loop_passes) |lp| {
+        if (lp == 0 or lp > c.loop_passes) return error.InvalidLoopPasses;
+        c.loop_passes = lp;
+    }
+    if (!std.math.isFinite(options.loopcd_omega) or options.loopcd_omega < 0) return error.InvalidLoopCdOptions;
+    if (options.loopcd != .off) {
+        if (c.loop_passes < 2) return error.InvalidLoopCdOptions;
+        if (options.loopcd_weak_pass == 0 or options.loopcd_weak_pass >= c.loop_passes) return error.InvalidLoopCdOptions;
+    } else if (options.loopcd_weak_pass == 0) return error.InvalidLoopCdOptions;
+    return lowerWithOptions(gpa, c, options);
 }
 
 const Lowering = struct {
@@ -508,6 +539,10 @@ const Lowering = struct {
 };
 
 fn lower(gpa: std.mem.Allocator, c: Config) !ir.Program {
+    return lowerWithOptions(gpa, c, .{});
+}
+
+fn lowerWithOptions(gpa: std.mem.Allocator, c: Config, options: Options) !ir.Program {
     var b = ir.Builder.init(gpa);
     errdefer b.deinit();
     const l: Lowering = .{ .b = &b, .c = c };
@@ -525,6 +560,8 @@ fn lower(gpa: std.mem.Allocator, c: Config) !ir.Program {
     var count: u32 = 0;
     var prelude: ir.View = undefined;
     var prior: ?Lowering.Bank = null;
+    var weak_hidden: ?ir.View = null;
+    var weak_blocks: ?ir.View = null;
     for (try visitSchedule(b.allocator(), c)) |v| {
         if (v.stage == .loop and v.physical_layer == c.loop_start) {
             if (v.pass == 0) {
@@ -542,14 +579,61 @@ fn lower(gpa: std.mem.Allocator, c: Config) !ir.Program {
         }
         hidden = try l.visit(v, hidden, blocks, &count, if (v.stage == .loop) prior else null);
         try b.trace(hidden);
+        if (v.stage == .loop and v.physical_layer == c.loop_end - 1) {
+            if (options.loopcd != .off and v.pass + 1 == options.loopcd_weak_pass) {
+                const wh = try l.scratch("loopcd_weak_hidden", h);
+                try l.transform(hidden, wh, .copy, .none);
+                weak_hidden = wh;
+                if (options.loopcd == .logits or options.loopcd == .logits_adaptive) {
+                    const wb = try l.scratch("loopcd_weak_blocks", count * h);
+                    try l.transform(Lowering.slice(blocks, 0, count * h), wb, .copy, .none);
+                    weak_blocks = wb;
+                }
+            }
+            if (options.loopcd == .hidden and v.pass + 1 == c.loop_passes) {
+                const contrasted = try l.scratch("loopcd_hidden", h);
+                try b.op(.{ .loopcd_contrast = .{
+                    .strong = hidden,
+                    .weak = weak_hidden.?,
+                    .out = contrasted,
+                    .omega = options.loopcd_omega,
+                    .adaptive = false,
+                    .round = .bf16,
+                } });
+                hidden = contrasted;
+            }
+        }
     }
+    const output_query = try l.weight("attn_res.output_query", &.{h});
+    const norm_w = try l.weight("norm.weight", &.{h});
+    const unembed_w = try l.weight("unembed.weight", &.{ c.vocab, h });
     const head = b.mark();
     const partial = try l.norm(hidden, null, h, .none);
-    const final = try l.depth(Lowering.slice(blocks, 0, count * h), partial, try l.weight("attn_res.output_query", &.{h}), 0);
-    const normed = try l.norm(final, try l.weight("norm.weight", &.{h}), h, .bf16);
-    const raw = try l.dense(normed, try l.weight("unembed.weight", &.{ c.vocab, h }), c.vocab, .bf16);
+    const final = try l.depth(Lowering.slice(blocks, 0, count * h), partial, output_query, 0);
+    const normed = try l.norm(final, norm_w, h, .bf16);
+    var weak_normed_opt: ?ir.View = null;
+    if (options.loopcd == .logits or options.loopcd == .logits_adaptive) {
+        const weak_partial = try l.norm(weak_hidden.?, null, h, .none);
+        const weak_final = try l.depth(weak_blocks.?, weak_partial, output_query, 0);
+        weak_normed_opt = try l.norm(weak_final, norm_w, h, .bf16);
+    }
+    const raw = try l.dense(normed, unembed_w, c.vocab, .bf16);
     const logits = try l.scratch("usable_logits", c.unpadded_vocab);
     try l.transform(raw, logits, .{ .softcap = c.final_softcap }, .none);
+    if (weak_normed_opt) |weak_normed| {
+        try b.op(.{ .linear = .{ .w = unembed_w, .x = weak_normed, .out = raw, .input_bf16 = true } });
+        _ = try l.rounded(raw, .bf16);
+        const weak_logits = try l.scratch("weak_logits", c.unpadded_vocab);
+        try l.transform(raw, weak_logits, .{ .softcap = c.final_softcap }, .none);
+        try b.op(.{ .loopcd_contrast = .{
+            .strong = logits,
+            .weak = weak_logits,
+            .out = logits,
+            .omega = options.loopcd_omega,
+            .adaptive = options.loopcd == .logits_adaptive,
+            .round = .none,
+        } });
+    }
     const next = try l.scratch("next", 1);
     try b.op(.{ .argmax = .{ .x = logits, .out = next } });
     return b.finish(.{ .model_type = "inkling2_loop", .vocab = c.unpadded_vocab, .eos = c.eos, .max_context = c.max_context }, head, tokens, logits, next);
@@ -2226,4 +2310,396 @@ test "Inkling Qwegn Wave 4 fuse_merge_norm matches reference" {
     for (ref_logits[0..V], try w4.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-5);
     try w4.forward(seq[17..18], 0);
     for (ref_logits[V .. 2 * V], try w4.logits(0)) |ev, av| try std.testing.expectApproxEqAbs(ev, av, 1e-5);
+}
+
+test "Inkling2 loop passes and LoopCD lowering validation" {
+    const frontend = @import("frontend.zig");
+    const gpa = std.testing.allocator;
+    var p1 = try buildWithOptions(gpa, test_config, .{ .loop_passes = 1 });
+    defer p1.deinit();
+    try std.testing.expectEqual(@as(usize, 25), p1.traces.len);
+
+    var p2 = try buildWithOptions(gpa, test_config, .{ .loop_passes = 2 });
+    defer p2.deinit();
+    try std.testing.expectEqual(@as(usize, 37), p2.traces.len);
+
+    var ph = try buildWithOptions(gpa, test_config, .{ .loop_passes = 2, .loopcd = .hidden, .loopcd_omega = 0.5, .loopcd_weak_pass = 1 });
+    defer ph.deinit();
+    var hidden_cd: usize = 0;
+    for (ph.ops, 0..) |op, i| if (op == .loopcd_contrast) {
+        try std.testing.expect(i < ph.head_start);
+        try std.testing.expect(!op.loopcd_contrast.adaptive);
+        hidden_cd += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), hidden_cd);
+
+    var pl = try buildWithOptions(gpa, test_config, .{ .loopcd = .logits_adaptive, .loopcd_omega = 1.0, .loopcd_weak_pass = 2 });
+    defer pl.deinit();
+    var logit_cd: usize = 0;
+    for (pl.ops, 0..) |op, i| if (op == .loopcd_contrast) {
+        try std.testing.expect(i >= pl.head_start);
+        try std.testing.expect(op.loopcd_contrast.adaptive);
+        logit_cd += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), logit_cd);
+
+    try std.testing.expectError(error.InvalidLoopPasses, buildWithOptions(gpa, test_config, .{ .loop_passes = 0 }));
+    try std.testing.expectError(error.InvalidLoopPasses, buildWithOptions(gpa, test_config, .{ .loop_passes = 4 }));
+    try std.testing.expectError(error.InvalidLoopCdOptions, buildWithOptions(gpa, test_config, .{ .loop_passes = 1, .loopcd = .logits }));
+    try std.testing.expectError(error.InvalidLoopCdOptions, buildWithOptions(gpa, test_config, .{ .loop_passes = 2, .loopcd = .logits, .loopcd_weak_pass = 2 }));
+    try std.testing.expectError(error.InvalidLoopCdOptions, buildWithOptions(gpa, test_config, .{ .loopcd = .hidden, .loopcd_weak_pass = 0 }));
+    try std.testing.expectError(error.InvalidLoopCdOptions, buildWithOptions(gpa, test_config, .{ .loopcd = .hidden, .loopcd_omega = -0.1 }));
+
+    try std.testing.expectError(error.UnsupportedLoopOptions, frontend.build(gpa, "lfm3", "{}", .{ .context = undefined, .has = undefined }, .{ .loop_passes = 2 }));
+    try std.testing.expectError(error.UnsupportedLoopOptions, frontend.build(gpa, "lfm2", "{}", .{ .context = undefined, .has = undefined }, .{ .loopcd = .logits }));
+}
+
+test "Inkling2 LoopCD hidden, logits, adaptive, omega=0 parity, and tuned knobs" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 4;
+    c.kv_heads = 1;
+    c.head_dim = 8;
+    c.rel_dim = 16;
+    c.rel_extent = 8;
+    c.window = 8;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 32;
+
+    var base_p = try lower(gpa, c);
+    defer base_p.deinit();
+    var tmp = "/tmp/nano-inkling-loopcd-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &base_p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const Engine = @import("exec.zig").Engine;
+
+    const seq = [_]u32{ 1, 4, 11, 2, 3, 6, 8, 9 };
+    const V = c.unpadded_vocab;
+    var base_eng = try Engine.init(gpa, &base_p, ctx, &store, .{ .batch = 8 }, 32);
+    defer base_eng.deinit();
+    try base_eng.forward(seq[0..6], 5);
+    try base_eng.forward(seq[6..7], 0);
+    const base_logits = try a.dupe(f32, try base_eng.logits(0));
+
+    // Check omega=0 bit-exactness across all 3 LoopCD modes and non-zero contrast + batched==sequential + tuned knobs.
+    for ([_]LoopCdMode{ .hidden, .logits, .logits_adaptive }) |mode| {
+        var zero_p = try lowerWithOptions(gpa, c, .{ .loopcd = mode, .loopcd_omega = 0.0, .loopcd_weak_pass = 1 });
+        defer zero_p.deinit();
+        var zero_eng = try Engine.init(gpa, &zero_p, ctx, &store, .{ .batch = 8 }, 32);
+        defer zero_eng.deinit();
+        try zero_eng.forward(seq[0..6], 5);
+        try zero_eng.forward(seq[6..7], 0);
+        try std.testing.expectEqualSlices(f32, base_logits, try zero_eng.logits(0));
+
+        var act_p = try lowerWithOptions(gpa, c, .{ .loopcd = mode, .loopcd_omega = 0.8, .loopcd_weak_pass = 1 });
+        defer act_p.deinit();
+        var ref_eng = try Engine.init(gpa, &act_p, ctx, &store, .{ .batch = 8 }, 32);
+        defer ref_eng.deinit();
+        try ref_eng.forward(seq[0..6], 5);
+        try ref_eng.forward(seq[6..7], 0);
+        const ref_out = try a.dupe(f32, try ref_eng.logits(0));
+        var diff: f32 = 0;
+        for (base_logits, ref_out) |bv, rv| diff = @max(diff, @abs(bv - rv));
+        try std.testing.expect(diff > 1e-4);
+
+        var seq_eng = try Engine.init(gpa, &act_p, ctx, &store, .{ .batch = 8 }, 32);
+        defer seq_eng.deinit();
+        for (seq[0..7]) |tok| try seq_eng.forward(&.{tok}, 0);
+        try std.testing.expectEqualSlices(f32, ref_out, try seq_eng.logits(0));
+
+        try seq_eng.forward(seq[7..8], 0);
+        const seq_out = try a.dupe(f32, try seq_eng.logits(0));
+
+        {
+            var tuned_eng = try Engine.init(gpa, &act_p, ctx, &store, .{
+                .batch = 8,
+                .bf16_linear_tile = true,
+                .bf16_prefill_tile = 8,
+                .bf16_matrix_small = true,
+                .bf16_decode_vec = true,
+                .fuse_bf16_cast = true,
+                .fuse_bf16_projections = true,
+                .fuse_controller_merge = true,
+                .fuse_merge_norm = true,
+                .fuse_depth_norm = true,
+                .fuse_head_softcap = true,
+                .rmsnorm_fast = true,
+                .scratch_reuse = true,
+                .concurrent_scratch = true,
+                .tail_trim = 4,
+                .d2_gate = true,
+            }, 32);
+            defer tuned_eng.deinit();
+            try tuned_eng.forward(seq[0..6], 5);
+            try tuned_eng.forward(seq[6..7], 0);
+            try tuned_eng.forward(seq[7..8], 0);
+            for (seq_out[0..V], try tuned_eng.logits(0)) |ev, av| {
+                try std.testing.expect(std.math.isFinite(av));
+                try std.testing.expectApproxEqAbs(ev, av, 2e-2);
+            }
+        }
+    }
+
+    // Check loop_passes=2 + LoopCD.
+    var c2 = c;
+    c2.loop_passes = 2;
+    var p2_cd = try lowerWithOptions(gpa, c2, .{ .loopcd = .logits_adaptive, .loopcd_omega = 0.6, .loopcd_weak_pass = 1 });
+    defer p2_cd.deinit();
+    var e2 = try Engine.init(gpa, &p2_cd, ctx, &store, .{ .batch = 8 }, 32);
+    defer e2.deinit();
+    try e2.forward(seq[0..7], 6);
+    for (try e2.logits(6)) |v| try std.testing.expect(std.math.isFinite(v));
+}
+
+test "Inkling2 LSA dense bypass, sparse selection, tuned knobs, and combined LoopCD" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 3;
+    c.kv_heads = 1;
+    c.head_dim = 128;
+    c.rel_dim = 16;
+    c.rel_extent = 16;
+    c.window = 16;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 64;
+
+    var p = try lowerWithOptions(gpa, c, .{});
+    defer p.deinit();
+    var tmp = "/tmp/nano-inkling-lsa-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const Engine = @import("exec.zig").Engine;
+
+    var seq: [44]u32 = undefined;
+    for (&seq, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 13 + 1);
+
+    // 1. Dense bypass: total_blocks <= 1 + 2 + 3 = 6 blocks (< 28 tokens): bit-identical at seq[0..20].
+    var ref = try Engine.init(gpa, &p, ctx, &store, .{ .batch = 32 }, 64);
+    defer ref.deinit();
+    var lsa_ref = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 32,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 0,
+    }, 64);
+    defer lsa_ref.deinit();
+    try ref.forward(seq[0..20], 19);
+    try lsa_ref.forward(seq[0..20], 19);
+    try std.testing.expectEqualSlices(f32, try ref.logits(19), try lsa_ref.logits(19));
+
+    // 2. Past dense bypass (32..43 tokens):
+    //    (a) FP32 ref LSA (`row_step=1`) vs striped fast BF16 decode + inline bias + gated merge + qkvr (`relative_tile_prefill=false`, same `row_step=1`),
+    //    (b) tiled BF16 MMA prefill baseline (`relative_tile_prefill=true`, `row_step=32`) vs full tuned Qwegn+LSA stack (`tail_trim` + `d2_gate`).
+    try lsa_ref.forward(seq[20..40], 19);
+    try lsa_ref.forward(seq[40..41], 0);
+    try lsa_ref.forward(seq[41..42], 0);
+    const lsa_ref_out = try a.dupe(f32, try lsa_ref.logits(0));
+    for (lsa_ref_out) |v| try std.testing.expect(std.math.isFinite(v));
+
+    {
+        var lsa_fast_base = try Engine.init(gpa, &p, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_long_fast = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .lsa = true,
+            .lsa_budget = 8,
+            .lsa_window = 12,
+            .lsa_coarse_threshold = 0,
+        }, 64);
+        defer lsa_fast_base.deinit();
+        try lsa_fast_base.forward(seq[0..20], 19);
+        try lsa_fast_base.forward(seq[20..40], 19);
+        try lsa_fast_base.forward(seq[40..41], 0);
+        try lsa_fast_base.forward(seq[41..42], 0);
+        const fast_base_out = try a.dupe(f32, try lsa_fast_base.logits(0));
+        for (lsa_ref_out, fast_base_out) |rv, fv| {
+            try std.testing.expect(std.math.isFinite(fv));
+            try std.testing.expectApproxEqAbs(rv, fv, 5e-2);
+        }
+
+        var lsa_fast_r1 = try Engine.init(gpa, &p, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_long_fast = true,
+            .relative_inline_bias = true,
+            .fuse_relative_gate = true,
+            .fuse_qkvr_prep = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .lsa = true,
+            .lsa_budget = 8,
+            .lsa_window = 12,
+            .lsa_coarse_threshold = 0,
+        }, 64);
+        defer lsa_fast_r1.deinit();
+        try lsa_fast_r1.forward(seq[0..20], 19);
+        try lsa_fast_r1.forward(seq[20..40], 19);
+        try lsa_fast_r1.forward(seq[40..41], 0);
+        try lsa_fast_r1.forward(seq[41..42], 0);
+        for (fast_base_out, try lsa_fast_r1.logits(0)) |bv, fv| {
+            try std.testing.expect(std.math.isFinite(fv));
+            try std.testing.expectApproxEqAbs(bv, fv, 1e-4);
+        }
+    }
+
+    var prefill_base_out: [14]f32 = undefined;
+    {
+        var lsa_prefill_base = try Engine.init(gpa, &p, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_tile_prefill = true,
+            .relative_bias16 = true,
+            .relative_bias_d8 = true,
+            .relative_bias_decode = true,
+            .relative_long_fast = true,
+            .relative_prefill_fast = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .lsa = true,
+            .lsa_budget = 8,
+            .lsa_window = 12,
+            .lsa_coarse_threshold = 0,
+        }, 64);
+        defer lsa_prefill_base.deinit();
+        try lsa_prefill_base.forward(seq[0..20], 19);
+        try lsa_prefill_base.forward(seq[20..40], 19);
+        try lsa_prefill_base.forward(seq[40..41], 0);
+        try lsa_prefill_base.forward(seq[41..42], 0);
+        @memcpy(&prefill_base_out, try lsa_prefill_base.logits(0));
+    }
+
+    {
+        var lsa_tuned = try Engine.init(gpa, &p, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_tile_prefill = true,
+            .relative_bias16 = true,
+            .relative_bias_d8 = true,
+            .relative_bias_decode = true,
+            .relative_long_fast = true,
+            .relative_prefill_fast = true,
+            .relative_inline_bias = true,
+            .fuse_relative_gate = true,
+            .fuse_qkvr_prep = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .concurrent_scratch = true,
+            .tail_trim = 8,
+            .d2_gate = true,
+            .lsa = true,
+            .lsa_budget = 8,
+            .lsa_window = 12,
+            .lsa_coarse_threshold = 0,
+        }, 64);
+        defer lsa_tuned.deinit();
+        try lsa_tuned.forward(seq[0..20], 19);
+        try lsa_tuned.forward(seq[20..40], 19); // exercises mk_relative_lsa_prefill (rows >= 8) past bypass
+        try lsa_tuned.forward(seq[40..41], 0); // exercises mk_relative_lsa_decode_keys_inline_fast + gated merge
+        try lsa_tuned.forward(seq[41..42], 0);
+        for (&prefill_base_out, try lsa_tuned.logits(0)) |bv, tv| {
+            try std.testing.expect(std.math.isFinite(tv));
+            try std.testing.expectApproxEqAbs(bv, tv, 1e-3);
+        }
+    }
+
+    // 3. Combined LSA + LoopCD adaptive + reduced passes.
+    var p_combo = try lowerWithOptions(gpa, c, .{ .loop_passes = 2, .loopcd = .logits_adaptive, .loopcd_omega = 0.7, .loopcd_weak_pass = 1 });
+    defer p_combo.deinit();
+    var eng_combo = try Engine.init(gpa, &p_combo, ctx, &store, .{
+        .batch = 32,
+        .relative_stripes = true,
+        .relative_long_fast = true,
+        .relative_tile_prefill = true,
+        .fuse_qkvr_prep = true,
+        .fuse_relative_gate = true,
+        .scratch_reuse = true,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 0,
+    }, 64);
+    defer eng_combo.deinit();
+    try eng_combo.forward(seq[0..20], 20);
+    try eng_combo.forward(seq[20..40], 19);
+    try eng_combo.forward(seq[40..41], 0);
+    for (try eng_combo.logits(0)) |v| try std.testing.expect(std.math.isFinite(v));
+}
+
+test "LoopCD logits_adaptive packs at batch=4096 and fuses head_softcap_loopcd" {
+    const plan = @import("plan.zig");
+    const exec = @import("exec.zig");
+    const gpa = std.testing.allocator;
+    var pl = try buildWithOptions(gpa, test_config, .{ .loopcd = .logits_adaptive, .loopcd_omega = 1.0, .loopcd_weak_pass = 1 });
+    defer pl.deinit();
+
+    const offsets = try gpa.alloc(u32, pl.states.len);
+    defer gpa.free(offsets);
+    const total = try exec.packScratch(gpa, &pl, 4096, 4200, offsets);
+    try std.testing.expect(total <= std.math.maxInt(u32));
+
+    const info = try gpa.alloc(plan.WeightInfo, pl.weights.len);
+    defer gpa.free(info);
+    @memset(info, .{ .q4 = false, .buffer = 1, .dense = true });
+    const steps = try plan.build(gpa, &pl, .{ .head_softcap = true }, info);
+    defer gpa.free(steps);
+    var head_softcaps: usize = 0;
+    var head_softcap_loopcd: usize = 0;
+    for (steps) |s| switch (s) {
+        .head_softcap => head_softcaps += 1,
+        .head_softcap_loopcd => head_softcap_loopcd += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 0), head_softcaps);
+    try std.testing.expectEqual(@as(usize, 1), head_softcap_loopcd);
 }

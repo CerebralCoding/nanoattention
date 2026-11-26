@@ -24,7 +24,9 @@ const usage =
     \\  nano attnbench [REPEATS] [KEYS...] [rows=N]  (Inkling relative attention on synthetic K/V)
     \\Common: --context N (default 4096), --knobs FILE.json, --knob name=value (repeatable,
     \\        applied after --knobs),
-    \\        --sliding-visible N, --embed-round none|bf16.
+    \\        --sliding-visible N, --embed-round none|bf16,
+    \\        --loop-passes 1..N, --loopcd off|hidden|logits|logits-adaptive,
+    \\        --loopcd-omega W (default 1.0), --loopcd-weak-pass N (default 1).
     \\Token files are a JSON array or {"tokens":[...]}. eval feeds T tokens per
     \\forward (default 1) and writes raw little-endian float32: logits
     \\[positions, vocab] and residual streams [traces, tokens, width].
@@ -124,6 +126,15 @@ pub fn main(init: std.process.Init) !void {
             common.options.sliding_visible = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--embed-round")) {
             common.options.embed_round = std.meta.stringToEnum(ir.Round, value) orelse return error.InvalidEmbedRound;
+        } else if (std.mem.eql(u8, flag, "--loop-passes")) {
+            common.options.loop_passes = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--loopcd")) {
+            common.options.loopcd = frontend.parseLoopCdMode(value) orelse return error.InvalidLoopCdMode;
+        } else if (std.mem.eql(u8, flag, "--loopcd-omega")) {
+            common.options.loopcd_omega = try std.fmt.parseFloat(f32, value);
+            if (!std.math.isFinite(common.options.loopcd_omega) or common.options.loopcd_omega < 0) return error.InvalidLoopCdOmega;
+        } else if (std.mem.eql(u8, flag, "--loopcd-weak-pass")) {
+            common.options.loopcd_weak_pass = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--tokens-file")) {
             tokens = try parseTokens(a, try loader.readFile(a, value), "tokens");
         } else if (std.mem.eql(u8, flag, "--tokens")) {
