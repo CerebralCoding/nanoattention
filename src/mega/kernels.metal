@@ -515,3 +515,15 @@ kernel void mk_gated_delta_net(device const uchar *a_log [[buffer(0)]],
         if (c < p.dim) st_ptr[c] = st[e];
     }
 }
+
+kernel void mk_copy_slot(
+    device const float *arena [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    constant MK &p [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+    ulong total = ulong(p.rows) * p.n;
+    if (gid >= total) return;
+    uint r = uint(gid / p.n);
+    uint c = uint(gid % p.n);
+    dst[ulong(p.row0 + r) * p.ys + p.y + c] = arena[ulong(p.x) + ulong(p.pos + r) * p.xs + c];
+}

@@ -1006,7 +1006,7 @@ inline void mk_bf16_matrix_tile(const device uchar *weights, device float *arena
     const device float4 *xlo = reinterpret_cast<const device float4 *>(arena + p.x + (p.row0 + (lo ? r0+rr : 0)) * p.xs);
     const device float4 *xhi = reinterpret_cast<const device float4 *>(arena + p.x + (p.row0 + (hi ? r0+rr+16 : 0)) * p.xs);
     for (uint k = 0; k < p.n; k += K) {
-        reinterpret_cast<threadgroup bfloat4 *>(a + rr*L)[ac] = bfloat4(lo ? xlo[k/4+ac] : float4(0));
+        if (rr < M) reinterpret_cast<threadgroup bfloat4 *>(a + rr*L)[ac] = bfloat4(lo ? xlo[k/4+ac] : float4(0));
         if constexpr (M > 16) reinterpret_cast<threadgroup bfloat4 *>(a + (rr+16)*L)[ac] = bfloat4(hi ? xhi[k/4+ac] : float4(0));
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma unroll

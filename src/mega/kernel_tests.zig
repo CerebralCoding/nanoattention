@@ -2511,3 +2511,831 @@ test "odd safetensors byte offsets match aligned offsets bit for bit" {
     try ctx.finish();
     try testing.expectEqualSlices(u32, x_buf.structs(u32)[out0 .. out0 + rows * m], x_buf.structs(u32)[out1 .. out1 + rows * m]);
 }
+
+test "dflash2 kernels match f64 CPU reference" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var prng = rng(9001);
+    const rand = prng.random();
+
+    // 1. df_bf16_linear (rows=7, m=13 unaligned, k=64), df_bf16_linear_tile (rows=37, m=37, k=64),
+    //    hardware MMA df_bf16_matrix8 / df_bf16_matrix32 (rows=7, 37; m=130 with w_rows=192, k=64),
+    //    and coalesced df_bf16_linear_2xR_vec / 2xR_vec8 / splitk_rows (rows=7, 8; m=130; k=256).
+    for ([_][4]u32{ .{ 7, 13, 13, 64 }, .{ 37, 37, 37, 64 }, .{ 7, 130, 192, 64 }, .{ 37, 130, 192, 64 } }) |shape| {
+        const rows = shape[0];
+        const m = shape[1];
+        const w_rows = shape[2];
+        const k = shape[3];
+        const mma = (w_rows > m);
+        const pad_bytes: u32 = if (!mma and rows <= 8) 2 else 0; // test unaligned BF16 weight offset
+        const x_buf = try ctx.alloc(rows * k);
+        defer x_buf.deinit();
+        const w_buf = try ctx.alloc((w_rows * k + 1) / 2 + 2);
+        defer w_buf.deinit();
+        const y_buf = try ctx.alloc(rows * m + 64);
+        defer y_buf.deinit();
+        @memset(y_buf.floats(), -999.0);
+        for (x_buf.floats()) |*v| v.* = rand.floatNorm(f32);
+        const w_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats())[pad_bytes..]);
+        const w_f32 = try a.alloc(f32, w_rows * k);
+        for (w_f32, 0..) |*wf, idx| {
+            const h = bf16(rand.floatNorm(f32) * 0.25);
+            w_u16[idx] = h;
+            wf.* = fromBf16(h);
+        }
+        var p: gpu.Params = .{ .w = pad_bytes, .dtype = 2, .rows = rows, .row0 = 0, .x = 0, .xs = k, .y = 0, .ys = m, .n = k, .m = m };
+        if (mma) {
+            const tiles_n = (@as(usize, m) + 63) / 64;
+            if (rows <= 8) {
+                try gpu.dispatch(ctx, "df_bf16_matrix8", &.{ x_buf, w_buf, y_buf }, &p, tiles_n * 128, 128);
+            } else {
+                const tiles_r = (@as(usize, rows) + 31) / 32;
+                try gpu.dispatch(ctx, "df_bf16_matrix32", &.{ x_buf, w_buf, y_buf }, &p, tiles_n * tiles_r * 128, 128);
+            }
+        } else if (rows <= 8) {
+            try gpu.dispatch(ctx, "df_bf16_linear", &.{ x_buf, w_buf, y_buf }, &p, ((@as(usize, m) + 15) / 16) * 128, 128);
+        } else {
+            const tm = (@as(usize, m) + 31) / 32;
+            const tr = (@as(usize, rows) + 31) / 32;
+            try gpu.dispatch(ctx, "df_bf16_linear_tile", &.{ x_buf, w_buf, y_buf }, &p, tm * tr * 128, 128);
+        }
+        try ctx.finish();
+        const yf = y_buf.floats();
+        const xf = x_buf.floats();
+        const tol: f64 = if (mma) 2e-3 else 1e-4;
+        for (0..rows) |r| {
+            for (0..m) |j| {
+                var ref_sum: f64 = 0;
+                for (0..k) |kk| {
+                    const xv: f64 = if (mma) fromBf16(bf16(xf[r * k + kk])) else xf[r * k + kk];
+                    ref_sum += xv * w_f32[j * k + kk];
+                }
+                try close(ref_sum, yf[r * m + j], tol);
+            }
+        }
+        if (mma) try testing.expectEqual(@as(f32, -999.0), yf[rows * m]);
+    }
+
+    // 2. df_grouped_dyn_conv (stage 0 prepare + stage 1 finish + residual)
+    {
+        const B: u32 = 5;
+        const H: u32 = 16;
+        const grp_sz: u32 = 4;
+        const groups: u32 = H / grp_sz;
+        const taps: u32 = 2;
+        const dyn_w: u32 = 2 * taps * groups;
+        const ab = try ctx.alloc(B * H * 4 + B * dyn_w);
+        defer ab.deinit();
+        const base_buf = try ctx.alloc((2 * taps * H + 1) / 2);
+        defer base_buf.deinit();
+        const af = ab.floats();
+        const x0: u32 = 0;
+        const res0: u32 = B * H;
+        const y0: u32 = 2 * B * H;
+        const dyn0: u32 = 4 * B * H;
+        for (af[x0 .. x0 + B * H]) |*v| v.* = rand.floatNorm(f32);
+        for (af[res0 .. res0 + B * H]) |*v| v.* = rand.floatNorm(f32);
+        for (af[dyn0 .. dyn0 + B * dyn_w]) |*v| v.* = rand.floatNorm(f32) * 0.3;
+        const bu16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(base_buf.floats()));
+        for (0..2 * taps * H) |i| bu16[i] = bf16(rand.floatNorm(f32) * 0.5);
+
+        for ([_]u32{ 0, 1 }) |stage| {
+            var p: gpu.Params = .{
+                .rows = B,
+                .row0 = 0,
+                .kind = stage,
+                .heads = groups,
+                .dim = grp_sz,
+                .taps = taps,
+                .n = H,
+                .x = x0,
+                .xs = H,
+                .y = y0,
+                .ys = H,
+                .z = dyn0,
+                .zs = dyn_w,
+                .pad_r = res0,
+                .pad_k = H,
+                .w = 0,
+                .dtype = 2,
+            };
+            try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ ab, base_buf }, &p, @as(usize, B) * H, 256);
+            try ctx.finish();
+            for (0..B) |r| {
+                for (0..H) |c| {
+                    var acc: f64 = 0;
+                    const g = c / grp_sz;
+                    for (0..taps) |off| {
+                        if (r >= off) {
+                            const xv: f64 = af[x0 + (r - off) * H + c];
+                            const bw: f64 = fromBf16(bu16[(stage * taps + off) * H + c]);
+                            const dw: f64 = af[dyn0 + r * dyn_w + (stage * taps + off) * groups + g];
+                            acc += bw * xv + dw * xv;
+                        }
+                    }
+                    if (stage == 1) acc += af[res0 + r * H + c];
+                    try close(acc, af[y0 + r * H + c], 1e-5);
+                }
+            }
+        }
+    }
+
+    // 3. df_attention (sliding window BF16 ring wrap-around + bidirectional noise block)
+    {
+        const B: u32 = 4;
+        const ctx_pos: u32 = 10;
+        const cap: u32 = 8;
+        const window: u32 = 6;
+        const Hq: u32 = 4;
+        const Hkv: u32 = 2;
+        const D: u32 = 64;
+        const q_dim = Hq * D;
+        const kv_dim = Hkv * D;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+        const ab = try ctx.alloc(B * (2 * q_dim + 2 * kv_dim));
+        defer ab.deinit();
+        const k_ring = try ctx.alloc((cap * kv_dim + 1) / 2);
+        defer k_ring.deinit();
+        const v_ring = try ctx.alloc((cap * kv_dim + 1) / 2);
+        defer v_ring.deinit();
+
+        const af = ab.floats();
+        const q_off: u32 = 0;
+        const k_off: u32 = B * q_dim;
+        const v_off: u32 = k_off + B * kv_dim;
+        const out_off: u32 = v_off + B * kv_dim;
+        for (af[0..out_off]) |*v| v.* = rand.floatNorm(f32) * 0.4;
+        const kr_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(k_ring.floats()));
+        const vr_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(v_ring.floats()));
+        for (0..cap * kv_dim) |i| {
+            kr_u16[i] = bf16(rand.floatNorm(f32) * 0.4);
+            vr_u16[i] = bf16(rand.floatNorm(f32) * 0.4);
+        }
+
+        var ap: gpu.Params = .{
+            .rows = B,
+            .pos = ctx_pos,
+            .heads = Hq,
+            .kv_heads = Hkv,
+            .dim = D,
+            .window = window,
+            .capacity = cap,
+            .scale = scale,
+            .x = q_off,
+            .xs = q_dim,
+            .y = k_off,
+            .ys = kv_dim,
+            .z = v_off,
+            .zs = kv_dim,
+            .every = out_off,
+            .pad_k = q_dim,
+        };
+        try gpu.dispatch(ctx, "df_attention", &.{ ab, k_ring, v_ring }, &ap, @as(usize, B) * Hq * 256, 256);
+        try ctx.finish();
+
+        for (0..B) |r| {
+            const q_pos = ctx_pos + r;
+            const cstart = if (q_pos + 1 > window) @min(ctx_pos, q_pos + 1 - window) else 0;
+            const tot = (ctx_pos - cstart) + B;
+            for (0..Hq) |h| {
+                const kvh = h / (Hq / Hkv);
+                var scores = try a.alloc(f64, tot);
+                var max_s: f64 = -std.math.inf(f64);
+                for (0..tot) |j| {
+                    const k_pos = cstart + j;
+                    var dot: f64 = 0;
+                    for (0..D) |d| {
+                        const kv: f64 = if (k_pos < ctx_pos)
+                            fromBf16(kr_u16[(k_pos % cap) * kv_dim + kvh * D + d])
+                        else
+                            af[k_off + (k_pos - ctx_pos) * kv_dim + kvh * D + d];
+                        dot += @as(f64, af[q_off + r * q_dim + h * D + d]) * kv;
+                    }
+                    scores[j] = dot * scale;
+                    max_s = @max(max_s, scores[j]);
+                }
+                var denom: f64 = 0;
+                for (scores) |*s| {
+                    s.* = @exp(s.* - max_s);
+                    denom += s.*;
+                }
+                for (0..D) |d| {
+                    var acc: f64 = 0;
+                    for (0..tot) |j| {
+                        const k_pos = cstart + j;
+                        const vv: f64 = if (k_pos < ctx_pos)
+                            fromBf16(vr_u16[(k_pos % cap) * kv_dim + kvh * D + d])
+                        else
+                            af[v_off + (k_pos - ctx_pos) * kv_dim + kvh * D + d];
+                        acc += (scores[j] / denom) * vv;
+                    }
+                    try close(acc, af[out_off + r * q_dim + h * D + d], 1e-4);
+                }
+            }
+        }
+    }
+
+    // 4. df_top16_part + df_top16_merge + df_select_path (after_correction softcap=30.0)
+    {
+        const rows: u32 = 3;
+        const vocab: u32 = 500;
+        const rank: u32 = 64;
+        const top_k: u32 = 16;
+        const shards: u32 = 64;
+        const anchor: u32 = 17;
+        const softcap: f32 = 30.0;
+
+        const logits = try ctx.alloc(rows * vocab);
+        defer logits.deinit();
+        const part_v = try ctx.alloc(rows * shards * top_k);
+        defer part_v.deinit();
+        const part_i = try ctx.alloc(rows * shards * top_k);
+        defer part_i.deinit();
+        const top_v = try ctx.alloc(rows * top_k);
+        defer top_v.deinit();
+        const top_i = try ctx.alloc(rows * top_k);
+        defer top_i.deinit();
+        const h_sel = try ctx.alloc(rows * rank);
+        defer h_sel.deinit();
+        const pred_cb = try ctx.alloc((vocab * rank + 1) / 2);
+        defer pred_cb.deinit();
+        const succ_cb = try ctx.alloc((vocab * rank + 1) / 2);
+        defer succ_cb.deinit();
+        const out_tok = try ctx.alloc(1 + rows);
+        defer out_tok.deinit();
+
+        const lf = logits.floats();
+        for (lf) |*v| v.* = rand.floatNorm(f32) * 15.0;
+        const hf = h_sel.floats();
+        for (hf) |*v| v.* = rand.floatNorm(f32) * 0.2;
+        const pu16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(pred_cb.floats()));
+        const su16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(succ_cb.floats()));
+        for (0..vocab * rank) |i| {
+            pu16[i] = bf16(rand.floatNorm(f32) * 0.25);
+            su16[i] = bf16(rand.floatNorm(f32) * 0.25);
+        }
+
+        var p1: gpu.Params = .{ .rows = rows, .x = 0, .xs = vocab, .m = vocab, .heads = shards, .n = top_k };
+        var p2: gpu.Params = .{ .rows = rows, .heads = shards, .n = top_k };
+        var p3: gpu.Params = .{ .rows = rows, .n = rank, .m = top_k, .pos = anchor, .x = 0, .xs = rank, .dtype = 2, .eps = softcap };
+        try gpu.dispatch(ctx, "df_top16_part", &.{ logits, part_v, part_i }, &p1, rows * shards * 256, 256);
+        try gpu.dispatch(ctx, "df_top16_merge", &.{ part_v, part_i, top_v, top_i }, &p2, rows * 256, 256);
+        try gpu.dispatch(ctx, "df_select_path", &.{ h_sel, pred_cb, succ_cb, top_v, top_i, out_tok }, &p3, 512, 512);
+        try ctx.finish();
+
+        const ot = out_tok.structs(u32);
+        try testing.expectEqual(anchor, ot[0]);
+        var prev: u32 = anchor;
+        for (0..rows) |pos| {
+            var used = try a.alloc(bool, vocab);
+            @memset(used, false);
+            var best_s: f64 = -std.math.inf(f64);
+            var best_c: u32 = 0;
+            for (0..top_k) |_| {
+                var bv: f32 = -std.math.inf(f32);
+                var bi: u32 = 0;
+                for (0..vocab) |vid| {
+                    if (used[vid]) continue;
+                    const val = lf[pos * vocab + vid];
+                    if (val > bv) {
+                        bv = val;
+                        bi = @intCast(vid);
+                    }
+                }
+                used[bi] = true;
+                var dot: f64 = 0;
+                for (0..rank) |d| {
+                    dot += @as(f64, fromBf16(pu16[prev * rank + d])) * hf[pos * rank + d] * fromBf16(su16[bi * rank + d]);
+                }
+                const sc = @as(f64, softcap) * std.math.tanh((@as(f64, bv) + dot) / @as(f64, softcap));
+                if (sc > best_s) {
+                    best_s = sc;
+                    best_c = bi;
+                }
+            }
+            prev = best_c;
+            try testing.expectEqual(prev, ot[1 + pos]);
+        }
+    }
+
+    // 5. Coalesced df_bf16_linear_2xR_vec8, df_bf16_linear_2xR_vec, df_bf16_linear_splitk_rows
+    //    (rows = 7, 8; m = 130 unaligned mod-4; k = 256; including round_in / round_out).
+    for ([_]u32{ 7, 8 }) |rows| {
+        const m: u32 = 130;
+        const k: u32 = 256;
+        const x_buf = try ctx.alloc(rows * k);
+        defer x_buf.deinit();
+        const w_buf = try ctx.alloc((m * k + 1) / 2 + 4);
+        defer w_buf.deinit();
+        const y_buf = try ctx.alloc(rows * m + 32);
+        defer y_buf.deinit();
+        for (x_buf.floats()) |*v| v.* = rand.floatNorm(f32);
+        const w_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats()));
+        const w_f32 = try a.alloc(f32, m * k);
+        for (w_f32, 0..) |*wf, idx| {
+            const h = bf16(rand.floatNorm(f32) * 0.25);
+            w_u16[idx] = h;
+            wf.* = fromBf16(h);
+        }
+        const names = [_][:0]const u8{ "df_bf16_linear_2xR_vec8", "df_bf16_linear_2xR_vec", "df_bf16_linear_splitk_rows", "df_bf16_mma_m8n16" };
+        for (names, 0..) |kname, ki| {
+            const flags: u32 = if (ki == 0) (gpu.flag_round_bf16 | gpu.flag_round_out) else gpu.flag_round_out;
+            @memset(y_buf.floats(), -999.0);
+            var p: gpu.Params = .{ .w = 0, .dtype = 2, .rows = rows, .row0 = 0, .x = 0, .xs = k, .y = 0, .ys = m, .n = k, .m = m, .flags = flags };
+            if (ki == 2) {
+                try gpu.dispatch(ctx, kname, &.{ x_buf, w_buf, y_buf }, &p, @as(usize, m) * 256, 256);
+            } else if (ki == 3) {
+                try gpu.dispatch(ctx, kname, &.{ x_buf, w_buf, y_buf }, &p, ((@as(usize, m) + 15) / 16) * 64, 64);
+            } else {
+                try gpu.dispatch(ctx, kname, &.{ x_buf, w_buf, y_buf }, &p, ((@as(usize, m) + 1) / 2) * 32, 128);
+            }
+            try ctx.finish();
+            const yf = y_buf.floats();
+            const xf = x_buf.floats();
+            const use_bf16_x = (flags & gpu.flag_round_bf16) != 0 or ki == 3;
+            for (0..rows) |r| {
+                for (0..m) |j| {
+                    var ref_sum: f64 = 0;
+                    for (0..k) |kk| {
+                        const xv: f64 = if (use_bf16_x) fromBf16(bf16(xf[r * k + kk])) else xf[r * k + kk];
+                        ref_sum += xv * w_f32[j * k + kk];
+                    }
+                    const ref_val: f64 = fromBf16(bf16(@floatCast(ref_sum)));
+                    try close(ref_val, yf[r * m + j], 2e-3);
+                }
+            }
+            try testing.expectEqual(@as(f32, -999.0), yf[rows * m]);
+        }
+    }
+
+    // 6. df_bf16_mma_m8n16_direct (splits = 1 and splits = 4 + df_bf16_splitk_reduce).
+    for ([_]u32{ 7, 8 }) |rows| {
+        const m: u32 = 128;
+        const k: u32 = 256;
+        const x_buf = try ctx.alloc(rows * k);
+        defer x_buf.deinit();
+        const w_buf = try ctx.alloc((m * k + 1) / 2 + 4);
+        defer w_buf.deinit();
+        const y_buf = try ctx.alloc(rows * m + 32);
+        defer y_buf.deinit();
+        const splitk_buf = try ctx.alloc(4 * rows * m);
+        defer splitk_buf.deinit();
+        for (x_buf.floats()) |*v| v.* = rand.floatNorm(f32);
+        const w_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats()));
+        const w_f32 = try a.alloc(f32, m * k);
+        for (w_f32, 0..) |*wf, idx| {
+            const h = bf16(rand.floatNorm(f32) * 0.25);
+            w_u16[idx] = h;
+            wf.* = fromBf16(h);
+        }
+        const n_tiles: usize = m / 16;
+        for ([_]u32{ 1, 4 }) |splits| {
+            @memset(y_buf.floats(), -999.0);
+            var p: gpu.Params = .{ .w = 0, .dtype = 2, .rows = rows, .row0 = 0, .x = 0, .xs = k, .y = 0, .ys = m, .n = k, .m = m, .taps = splits, .flags = gpu.flag_round_out };
+            if (splits == 1) {
+                try gpu.dispatch(ctx, "df_bf16_mma_m8n16_direct", &.{ x_buf, w_buf, y_buf }, &p, n_tiles * 64, 64);
+            } else {
+                try gpu.dispatch(ctx, "df_bf16_mma_m8n16_direct", &.{ x_buf, w_buf, splitk_buf }, &p, @as(usize, splits) * n_tiles * 64, 64);
+                try gpu.dispatch(ctx, "df_bf16_splitk_reduce", &.{ splitk_buf, y_buf }, &p, @as(usize, rows) * (m / 4), 256);
+            }
+            try ctx.finish();
+            const yf = y_buf.floats();
+            const xf = x_buf.floats();
+            for (0..rows) |r| {
+                for (0..m) |j| {
+                    var ref_sum: f64 = 0;
+                    for (0..k) |kk| {
+                        const xv: f64 = fromBf16(bf16(xf[r * k + kk]));
+                        ref_sum += xv * w_f32[j * k + kk];
+                    }
+                    const ref_val: f64 = fromBf16(bf16(@floatCast(ref_sum)));
+                    try close(ref_val, yf[r * m + j], 2e-3);
+                }
+            }
+            try testing.expectEqual(@as(f32, -999.0), yf[rows * m]);
+        }
+    }
+}
+
+test "inkling 1xR, 2xR, and splitk_rows bf16 kernels match T=1 kernels bit-for-bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var prng = rng(202604);
+    const rand = prng.random();
+
+    // 1. mk_bf16_linear_{2xR_vec8, 1xR_vec8} == mk_bf16_linear_4x1_vec8 (rows = 2, 7, 8, m = 130)
+    //    and mk_bf16_linear_2xR_softcap_vec8 == mk_bf16_linear_4x1_softcap_vec8 (rows = 7, 8, m = 130 & 131).
+    for ([_]u32{ 130, 131 }) |m| {
+        const max_rows: u32 = 8;
+        const n: u32 = 256;
+        const w_buf = try ctx.alloc((m * n + 1) / 2 + 4);
+        defer w_buf.deinit();
+        const w_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats()));
+        for (0..m * n) |i| w_u16[i] = bf16(rand.floatNorm(f32) * 0.25);
+
+        const row0: u32 = 1;
+        const xs: u32 = n + 4;
+        const ys: u32 = m + 3;
+        const total_r = row0 + max_rows;
+        const ref_off: u32 = total_r * xs;
+        const got_off: u32 = ref_off + total_r * ys;
+        const one_off: u32 = got_off + total_r * ys;
+        const arena = try ctx.alloc(one_off + total_r * ys);
+        defer arena.deinit();
+        const af = arena.floats();
+        for (af[0..ref_off]) |*v| v.* = rand.floatNorm(f32);
+
+        for ([_]u32{ 2, 7, 8 }) |rows| {
+            if (m == 130) {
+                @memset(af[ref_off..], -777.0);
+                for (0..rows) |r| {
+                    var p1: gpu.Params = .{ .w = 0, .dtype = 2, .rows = 1, .row0 = row0 + @as(u32, @intCast(r)), .x = 0, .xs = xs, .y = ref_off, .ys = ys, .n = n, .m = m, .flags = gpu.flag_round_out };
+                    try gpu.dispatch(ctx, "mk_bf16_linear_4x1_vec8", &.{ w_buf, arena }, &p1, ((@as(usize, m) + 3) / 4) * 32, 128);
+                }
+                var pr: gpu.Params = .{ .w = 0, .dtype = 2, .rows = rows, .row0 = row0, .x = 0, .xs = xs, .y = got_off, .ys = ys, .n = n, .m = m, .flags = gpu.flag_round_out };
+                try gpu.dispatch(ctx, "mk_bf16_linear_2xR_vec8", &.{ w_buf, arena }, &pr, ((@as(usize, m) + 1) / 2) * 32, 128);
+                var p1x = pr;
+                p1x.y = one_off;
+                try gpu.dispatch(ctx, "mk_bf16_linear_1xR_vec8", &.{ w_buf, arena }, &p1x, @as(usize, m) * 32, 128);
+                try ctx.finish();
+                for (0..rows) |r| {
+                    const rr = row0 + @as(u32, @intCast(r));
+                    const u = arena.structs(u32);
+                    try testing.expectEqualSlices(u32, u[ref_off + rr * ys ..][0..m], u[got_off + rr * ys ..][0..m]);
+                    try testing.expectEqualSlices(u32, u[ref_off + rr * ys ..][0..m], u[one_off + rr * ys ..][0..m]);
+                }
+            }
+
+            if (rows >= 7) {
+                @memset(af[ref_off..], -777.0);
+                for (0..rows) |r| {
+                    var p1: gpu.Params = .{ .w = 0, .dtype = 2, .rows = 1, .row0 = row0 + @as(u32, @intCast(r)), .x = 0, .xs = xs, .y = ref_off, .ys = ys, .n = n, .m = m, .scale = 30.0 };
+                    try gpu.dispatch(ctx, "mk_bf16_linear_4x1_softcap_vec8", &.{ w_buf, arena }, &p1, ((@as(usize, m) + 3) / 4) * 32, 128);
+                }
+                var ps: gpu.Params = .{ .w = 0, .dtype = 2, .rows = rows, .row0 = row0, .x = 0, .xs = xs, .y = got_off, .ys = ys, .n = n, .m = m, .scale = 30.0 };
+                try gpu.dispatch(ctx, "mk_bf16_linear_2xR_softcap_vec8", &.{ w_buf, arena }, &ps, ((@as(usize, m) + 1) / 2) * 32, 128);
+                try ctx.finish();
+                for (0..rows) |r| {
+                    const rr = row0 + @as(u32, @intCast(r));
+                    const u = arena.structs(u32);
+                    try testing.expectEqualSlices(u32, u[ref_off + rr * ys ..][0..m], u[got_off + rr * ys ..][0..m]);
+                }
+            }
+        }
+    }
+
+    // 2. mk_multi_bf16_{2xR_vec8, 1xR_vec8} == mk_multi_bf16_4x1_vec8 for rows = 8 across 3 projections (128, 64, 32).
+    {
+        const rows: u32 = 8;
+        const row0: u32 = 1;
+        const n: u32 = 256;
+        const ms = [3]u32{ 128, 64, 32 };
+        const sum_m: u32 = ms[0] + ms[1] + ms[2];
+        const w_buf = try ctx.alloc((sum_m * n + 1) / 2 + 16);
+        defer w_buf.deinit();
+        const w_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats()));
+        for (w_u16) |*h| h.* = bf16(rand.floatNorm(f32) * 0.25);
+
+        const total_r = row0 + rows;
+        const ref_base: u32 = total_r * n;
+        const got_base: u32 = ref_base + total_r * sum_m;
+        const one_base: u32 = got_base + total_r * sum_m;
+        const arena = try ctx.alloc(one_base + total_r * sum_m);
+        defer arena.deinit();
+        for (arena.floats()[0..ref_base]) |*v| v.* = rand.floatNorm(f32);
+
+        var x1: gpu.ParamsX = .{ .p = .{ .rows = 1, .row0 = row0, .x = 0, .xs = n, .n = n }, .count = 3, .kind = 0b101 };
+        var xr: gpu.ParamsX = .{ .p = .{ .rows = rows, .row0 = row0, .x = 0, .xs = n, .n = n }, .count = 3, .kind = 0b101 };
+        var x1r = xr;
+        var w_off_b: u64 = 0;
+        var cur_ref: u32 = ref_base;
+        var cur_got: u32 = got_base;
+        var cur_one: u32 = one_base;
+        var simds4: usize = 0;
+        for (ms, 0..) |mk, idx| {
+            x1.mat[idx] = .{ .w = w_off_b, .m = mk, .y = cur_ref, .ys = mk };
+            xr.mat[idx] = .{ .w = w_off_b, .m = mk, .y = cur_got, .ys = mk };
+            x1r.mat[idx] = .{ .w = w_off_b, .m = mk, .y = cur_one, .ys = mk };
+            w_off_b += @as(u64, mk) * n * 2;
+            cur_ref += total_r * mk;
+            cur_got += total_r * mk;
+            cur_one += total_r * mk;
+            simds4 += mk / 4;
+        }
+        for (0..rows) |r| {
+            x1.p.row0 = row0 + @as(u32, @intCast(r));
+            try gpu.dispatch(ctx, "mk_multi_bf16_4x1_vec8", &.{ w_buf, arena }, &x1, simds4 * 32, 128);
+        }
+        try gpu.dispatch(ctx, "mk_multi_bf16_2xR_vec8", &.{ w_buf, arena }, &xr, (simds4 * 2) * 32, 128);
+        try gpu.dispatch(ctx, "mk_multi_bf16_1xR_vec8", &.{ w_buf, arena }, &x1r, simds4 * 4 * 32, 128);
+        try ctx.finish();
+        const u = arena.structs(u32);
+        for (0..3) |idx| {
+            for (0..rows) |r| {
+                const rr = row0 + @as(u32, @intCast(r));
+                const r0 = x1.mat[idx].y + rr * ms[idx];
+                const g0 = xr.mat[idx].y + rr * ms[idx];
+                const o0 = x1r.mat[idx].y + rr * ms[idx];
+                try testing.expectEqualSlices(u32, u[r0 .. r0 + ms[idx]], u[g0 .. g0 + ms[idx]]);
+                try testing.expectEqualSlices(u32, u[r0 .. r0 + ms[idx]], u[o0 .. o0 + ms[idx]]);
+            }
+        }
+    }
+
+    // 3. 1-row-per-TG mk_bf16_linear_splitk_rows == mk_bf16_linear_splitk for rows = 7, 8, m = 64 and m = 24, n = 256.
+    for ([_]u32{ 7, 8 }) |rows| {
+        for ([_]u32{ 64, 24 }) |m| {
+            const row0: u32 = 1;
+            const n: u32 = 256;
+            const xs: u32 = n + 4;
+            const ys: u32 = m + 4;
+            const w_buf = try ctx.alloc(m * n / 2 + 4);
+            defer w_buf.deinit();
+            const w_u16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(w_buf.floats()));
+            for (w_u16) |*h| h.* = bf16(rand.floatNorm(f32) * 0.25);
+
+            const total_r = row0 + rows;
+            const ref_off: u32 = total_r * xs;
+            const got_off: u32 = ref_off + total_r * ys;
+            const arena = try ctx.alloc(got_off + total_r * ys);
+            defer arena.deinit();
+            for (arena.floats()[0..ref_off]) |*v| v.* = rand.floatNorm(f32);
+
+            const splitk_threads: usize = @import("inkling_plan.zig").splitk_threads;
+            for (0..rows) |r| {
+                var p1: gpu.Params = .{ .w = 0, .dtype = 2, .rows = 1, .row0 = row0 + @as(u32, @intCast(r)), .x = 0, .xs = xs, .y = ref_off, .ys = ys, .n = n, .m = m, .flags = gpu.flag_round_out };
+                try gpu.dispatch(ctx, "mk_bf16_linear_splitk", &.{ w_buf, arena }, &p1, @as(usize, m) * splitk_threads, splitk_threads);
+            }
+            var pr: gpu.Params = .{ .w = 0, .dtype = 2, .rows = rows, .row0 = row0, .x = 0, .xs = xs, .y = got_off, .ys = ys, .n = n, .m = m, .flags = gpu.flag_round_out };
+            try gpu.dispatch(ctx, "mk_bf16_linear_splitk_rows", &.{ w_buf, arena }, &pr, @as(usize, m) * splitk_threads, splitk_threads);
+            try ctx.finish();
+            const u = arena.structs(u32);
+            for (0..rows) |r| {
+                const rr = row0 + @as(u32, @intCast(r));
+                try testing.expectEqualSlices(u32, u[ref_off + rr * ys ..][0..m], u[got_off + rr * ys ..][0..m]);
+            }
+        }
+    }
+}
+
+test "grouped MoE and multi-row striped attention match T=1 kernels bit-for-bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var prng = rng(202611);
+    const rand = prng.random();
+    const inkling_plan = @import("inkling_plan.zig");
+
+    // 1. Grouped NVFP4 + MXFP8 MoE (count=1, count=2, and count=5 fast paths; round_bf16 = 0 & 1) == 8 single-row T=1 calls bit-for-bit.
+    {
+        const rows: u32 = 8;
+        const row0: u32 = 1;
+        const total_r = row0 + rows;
+        const experts: u32 = 16;
+        const top_k: u32 = 8;
+        const u_k: u32 = 256;
+        const u_n: u32 = 128; // also d_k
+        const d_n: u32 = 256;
+
+        const w_up = try ctx.alloc(@as(usize, experts) * 2 * u_n * u_k / 4 + 16);
+        defer w_up.deinit();
+        const s_up = try ctx.alloc(@as(usize, experts) * 2 * u_n * (u_k / 16) / 4 + 16);
+        defer s_up.deinit();
+        const w_dn = try ctx.alloc(@as(usize, experts) * d_n * u_n / 4 + 16);
+        defer w_dn.deinit();
+        const s_dn = try ctx.alloc(@as(usize, experts) * d_n * (u_n / 16) / 4 + 16);
+        defer s_dn.deinit();
+        const amax_up = try ctx.alloc(experts);
+        defer amax_up.deinit();
+        const amax_dn = try ctx.alloc(experts);
+        defer amax_dn.deinit();
+        const denom = try ctx.alloc(1);
+        defer denom.deinit();
+
+        const lists = try ctx.alloc(2048);
+        defer lists.deinit();
+        const partial = try ctx.alloc(rows * top_k * d_n);
+        defer partial.deinit();
+
+        const x_off: u32 = 0;
+        const r_off: u32 = total_r * u_k;
+        const up_ref_off: u32 = r_off + total_r * (2 * top_k);
+        const up_grp_off: u32 = up_ref_off + total_r * (top_k * u_n);
+        const out_ref_off: u32 = up_grp_off + total_r * (top_k * u_n);
+        const out_grp_off: u32 = out_ref_off + total_r * d_n;
+        const arena = try ctx.alloc(out_grp_off + total_r * d_n);
+        defer arena.deinit();
+        const af = arena.floats();
+
+        for (af[x_off..r_off]) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -8, 8))) * 0.125;
+        for (amax_up.floats(), amax_dn.floats()) |*au, *ad| {
+            au.* = 0.5 + rand.float(f32);
+            ad.* = 0.5 + rand.float(f32);
+        }
+        denom.floats()[0] = 2.0;
+
+        // Distinct top_k=8 routes per row giving count=1 (expert 0), count=2 (expert 1), count=5 (expert 2), count=3..7 (others).
+        const route_table = [8][8]u32{
+            .{ 0, 1, 2, 3, 4, 5, 6, 7 },
+            .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+            .{ 2, 3, 4, 5, 6, 7, 8, 9 },
+            .{ 2, 4, 5, 6, 7, 8, 9, 10 },
+            .{ 2, 5, 6, 7, 8, 9, 10, 11 },
+            .{ 6, 7, 8, 9, 10, 11, 12, 13 },
+            .{ 7, 8, 9, 10, 11, 12, 13, 14 },
+            .{ 8, 9, 10, 11, 12, 13, 14, 15 },
+        };
+        for (0..rows) |r| {
+            const rb = r_off + (row0 + r) * (2 * top_k);
+            var wsum: f32 = 0;
+            for (0..top_k) |s| {
+                af[rb + s] = @floatFromInt(route_table[r][s]);
+                const wv = @as(f32, @floatFromInt(s + 1)) * 0.125;
+                af[rb + top_k + s] = wv;
+                wsum += wv;
+            }
+            for (0..top_k) |s| af[rb + top_k + s] /= wsum;
+        }
+
+        // Fill signed random weight bytes (avoiding FP8 e4m3 NaN 0x7f/0xff) and valid FP8 e4m3 scales cleanly.
+        for ([_]metal.Buffer{ w_up, w_dn }) |wb| {
+            const bytes = std.mem.sliceAsBytes(wb.floats());
+            for (bytes) |*b| {
+                var bv = rand.int(u8);
+                if ((bv & 0x7f) == 0x7f) bv &= 0xfe;
+                b.* = bv;
+            }
+        }
+        for ([_]metal.Buffer{ s_up, s_dn }) |sb| {
+            const bytes = std.mem.sliceAsBytes(sb.floats());
+            for (bytes) |*b| b.* = 0x38 + (rand.int(u8) % 8);
+        }
+
+        for ([_]u32{ 0, 1 }) |round_bf16| {
+            for ([_]u32{ 1, 0 }) |nvfp4| {
+                @memset(af[up_ref_off..], 0);
+                const up1_k: [:0]const u8 = if (nvfp4 != 0)
+                    (if (round_bf16 != 0) "mk_expert_gate_up_nv16_lut_bf16" else "mk_expert_gate_up_nv16_lut")
+                else
+                    (if (round_bf16 != 0) "mk_expert_gate_up_mx_lut_bf16" else "mk_expert_gate_up_mx_lut");
+                const dn1_k: [:0]const u8 = if (nvfp4 != 0)
+                    (if (round_bf16 != 0) "mk_expert_down_nv8_lut_bf16" else "mk_expert_down_nv8_lut")
+                else
+                    (if (round_bf16 != 0) "mk_expert_down_mx_lut_bf16" else "mk_expert_down_mx_lut");
+                const upg_k: [:0]const u8 = if (nvfp4 != 0)
+                    (if (round_bf16 != 0) "mk_expert_grouped_up_nv16_lut_bf16" else "mk_expert_grouped_up_nv16_lut")
+                else
+                    (if (round_bf16 != 0) "mk_expert_grouped_up_mx_lut_bf16" else "mk_expert_grouped_up_mx_lut");
+                const dng_k: [:0]const u8 = if (nvfp4 != 0)
+                    (if (round_bf16 != 0) "mk_expert_grouped_down_nv8_lut_bf16" else "mk_expert_grouped_down_nv8_lut")
+                else
+                    (if (round_bf16 != 0) "mk_expert_grouped_down_mx_lut_bf16" else "mk_expert_grouped_down_mx_lut");
+
+                for (0..rows) |r| {
+                    const rr = row0 + @as(u32, @intCast(r));
+                    var eu1: gpu.ExpertParams = .{ .rows = 1, .row0 = rr, .x = x_off, .xs = u_k, .routes = r_off, .rs = 2 * top_k, .y = up_ref_off, .ys = top_k * u_n, .k = u_k, .n = u_n, .experts = experts, .top_k = top_k, .nvfp4 = nvfp4, .round_bf16 = round_bf16, .gate_cap = 20.0, .up_cap = 20.0 };
+                    const up_simds = @as(usize, top_k) * (if (nvfp4 != 0) (u_n / 4) else (u_n / 2));
+                    try gpu.dispatch(ctx, up1_k, &.{ arena, w_up, s_up, amax_up, denom }, &eu1, up_simds * 32, if (nvfp4 != 0) 128 else 256);
+                    var ed1: gpu.ExpertParams = .{ .rows = 1, .row0 = rr, .x = up_ref_off, .xs = top_k * u_n, .routes = r_off, .rs = 2 * top_k, .y = out_ref_off, .ys = d_n, .k = u_n, .n = d_n, .experts = experts, .top_k = top_k, .nvfp4 = nvfp4, .round_bf16 = round_bf16 };
+                    if (nvfp4 != 0) {
+                        try gpu.dispatch(ctx, dn1_k, &.{ arena, w_dn, s_dn, amax_dn, denom }, &ed1, @as(usize, d_n / 4) * 64, 64);
+                    } else {
+                        try gpu.dispatch(ctx, dn1_k, &.{ arena, w_dn, s_dn, amax_dn, denom }, &ed1, @as(usize, d_n / 4) * 256, 256);
+                    }
+                }
+
+                var eug: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .x = x_off, .xs = u_k, .routes = r_off, .rs = 2 * top_k, .y = up_grp_off, .ys = top_k * u_n, .k = u_k, .n = u_n, .experts = experts, .top_k = top_k, .nvfp4 = nvfp4, .round_bf16 = round_bf16, .gate_cap = 20.0, .up_cap = 20.0 };
+                try gpu.dispatch(ctx, "mk_expert_group_tiles", &.{ arena, lists }, &eug, 256, 256);
+                const max_tiles: usize = inkling_plan.moeMaxTiles(experts, rows * top_k);
+                const up_units = max_tiles * (if (nvfp4 != 0) (u_n / 4) else (u_n / 2));
+                try gpu.dispatch(ctx, upg_k, &.{ arena, w_up, s_up, amax_up, denom, lists, partial }, &eug, up_units * 32, 128);
+
+                var edg: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .x = up_grp_off, .xs = top_k * u_n, .routes = r_off, .rs = 2 * top_k, .y = out_grp_off, .ys = d_n, .k = u_n, .n = d_n, .experts = experts, .top_k = top_k, .nvfp4 = nvfp4, .round_bf16 = round_bf16 };
+                const dn_threads = max_tiles * (d_n / 4) * @as(usize, if (nvfp4 != 0) 8 else 32);
+                try gpu.dispatch(ctx, dng_k, &.{ arena, w_dn, s_dn, amax_dn, denom, lists, partial }, &edg, dn_threads, 128);
+                try gpu.dispatch(ctx, "mk_expert_combine_sum4", &.{ arena, partial }, &edg, @as(usize, rows) * (d_n / 4), 256);
+                try ctx.finish();
+
+                const u = arena.structs(u32);
+                for (0..rows) |r| {
+                    const rr = row0 + @as(u32, @intCast(r));
+                    try testing.expectEqualSlices(u32, u[out_ref_off + rr * d_n ..][0..d_n], u[out_grp_off + rr * d_n ..][0..d_n]);
+                }
+            }
+        }
+    }
+
+    // 2. Multi-row mk_relative_long_keys_inline_fast + mk_relative_long_merge_gated across 64-key stripe boundary (pos 61..68) == T=1 bit-for-bit.
+    {
+        const rows: u32 = 8;
+        const row0: u32 = 1;
+        const total_r = row0 + rows;
+        const heads: u32 = 3;
+        const kv_heads: u32 = 1;
+        const dim: u32 = 128;
+        const rel_dim: u32 = 16;
+        const rel_ext: u32 = 16;
+        const pos0: u32 = 60; // row0=1 -> positions 61..68 (visible=62..69, crossing 64->65 1->2 stripes)
+        const capacity: u32 = 80;
+        const half_keys = try ctx.alloc((capacity + 16) * dim / 2);
+        defer half_keys.deinit();
+        const half_vals = try ctx.alloc((capacity + 16) * dim / 2);
+        defer half_vals.deinit();
+        const rel_w = try ctx.alloc((rel_dim * rel_ext + 1) / 2);
+        defer rel_w.deinit();
+
+        for ([_]metal.Buffer{ half_keys, half_vals }) |b| {
+            const h16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(b.floats()));
+            for (h16) |*h| h.* = bf16(rand.floatNorm(f32) * 0.25);
+        }
+        const rw16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(rel_w.floats()));
+        for (rw16) |*h| h.* = bf16(rand.floatNorm(f32) * 0.25);
+
+        const q_w = heads * dim;
+        const r_w = heads * rel_dim;
+        const q_off: u32 = 0;
+        const r_off: u32 = total_r * q_w;
+        const g_off: u32 = r_off + total_r * r_w;
+        const s_off: u32 = g_off + total_r * q_w;
+        const out_ref_off: u32 = s_off + total_r * heads;
+        const out_grp_off: u32 = out_ref_off + total_r * q_w;
+        const arena = try ctx.alloc(out_grp_off + total_r * q_w);
+        defer arena.deinit();
+        for (arena.floats()[0..out_ref_off]) |*v| v.* = rand.floatNorm(f32) * 0.25;
+
+        const max_taps: u32 = 2;
+        const parts = try ctx.alloc(rows * heads * max_taps * 130);
+        defer parts.deinit();
+
+        for (0..rows) |r| {
+            const rr = row0 + @as(u32, @intCast(r));
+            const vis = pos0 + rr + 1;
+            const taps: u32 = (vis + 63) / 64;
+            var p1: gpu.Params = .{
+                .rows = 1,
+                .row0 = rr,
+                .pos = pos0,
+                .x = q_off,
+                .xs = q_w,
+                .z = r_off,
+                .zs = r_w,
+                .s = s_off,
+                .every = heads,
+                .w = 0,
+                .heads = heads,
+                .kv_heads = kv_heads,
+                .dim = dim,
+                .m = rel_ext,
+                .window = 0,
+                .capacity = capacity,
+                .scale = 1.0 / @sqrt(128.0),
+                .taps = taps,
+            };
+            try gpu.dispatch(ctx, "mk_relative_long_keys_inline_fast", &.{ arena, half_keys, half_vals, parts, rel_w }, &p1, @as(usize, kv_heads) * taps * 256, 256);
+            p1.y = out_ref_off;
+            p1.ys = q_w;
+            p1.z = g_off;
+            p1.zs = q_w;
+            p1.flags = gpu.flag_round_bf16 | gpu.flag_round_out;
+            try gpu.dispatch(ctx, "mk_relative_long_merge_gated", &.{ arena, parts }, &p1, @as(usize, heads) * 128, 128);
+        }
+
+        var pg: gpu.Params = .{
+            .rows = rows,
+            .row0 = row0,
+            .pos = pos0,
+            .x = q_off,
+            .xs = q_w,
+            .z = r_off,
+            .zs = r_w,
+            .s = s_off,
+            .every = heads,
+            .w = 0,
+            .heads = heads,
+            .kv_heads = kv_heads,
+            .dim = dim,
+            .m = rel_ext,
+            .window = 0,
+            .capacity = capacity,
+            .scale = 1.0 / @sqrt(128.0),
+            .taps = max_taps,
+        };
+        try gpu.dispatch(ctx, "mk_relative_long_keys_inline_fast", &.{ arena, half_keys, half_vals, parts, rel_w }, &pg, @as(usize, rows) * kv_heads * max_taps * 256, 256);
+        pg.y = out_grp_off;
+        pg.ys = q_w;
+        pg.z = g_off;
+        pg.zs = q_w;
+        pg.flags = gpu.flag_round_bf16 | gpu.flag_round_out;
+        try gpu.dispatch(ctx, "mk_relative_long_merge_gated", &.{ arena, parts }, &pg, @as(usize, rows) * heads * 128, 128);
+        try ctx.finish();
+
+        const u = arena.structs(u32);
+        for (0..rows) |r| {
+            const rr = row0 + @as(u32, @intCast(r));
+            try testing.expectEqualSlices(u32, u[out_ref_off + rr * q_w ..][0..q_w], u[out_grp_off + rr * q_w ..][0..q_w]);
+        }
+    }
+}

@@ -193,6 +193,8 @@ pub const Program = struct {
     head_start: u32,
     /// Residual-stream checkpoints (embedding output, then each layer's output).
     traces: []const Trace,
+    /// Normalized hidden state immediately before unembed (for draft models).
+    draft_final_norm: ?Trace = null,
     tokens: View,
     logits: View,
     next: View,
@@ -225,6 +227,10 @@ pub const Program = struct {
         for (self.traces) |t| {
             if (t.after_op >= self.ops.len) return error.InvalidTrace;
             try self.checkView(t.view, .scratch);
+        }
+        if (self.draft_final_norm) |dfn| {
+            if (dfn.after_op >= self.ops.len) return error.InvalidTrace;
+            try self.checkView(dfn.view, .scratch);
         }
         for (self.ops) |op| try self.checkOp(op);
     }
@@ -507,6 +513,7 @@ pub const Builder = struct {
     tables: std.ArrayList([]const f32) = .empty,
     ops: std.ArrayList(Op) = .empty,
     traces: std.ArrayList(Trace) = .empty,
+    draft_final_norm: ?Trace = null,
 
     pub fn init(gpa: std.mem.Allocator) Builder {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -559,6 +566,10 @@ pub const Builder = struct {
         if (self.ops.items.len == 0) return error.InvalidTrace;
         try self.traces.append(self.allocator(), .{ .after_op = @intCast(self.ops.items.len - 1), .view = v });
     }
+    pub fn setDraftFinalNorm(self: *Builder, v: View) !void {
+        if (self.ops.items.len == 0) return error.InvalidTrace;
+        self.draft_final_norm = .{ .after_op = @intCast(self.ops.items.len - 1), .view = v };
+    }
     pub fn mark(self: *Builder) u32 {
         return @intCast(self.ops.items.len);
     }
@@ -575,6 +586,7 @@ pub const Builder = struct {
             .ops = self.ops.items,
             .head_start = head_start,
             .traces = self.traces.items,
+            .draft_final_norm = self.draft_final_norm,
             .tokens = tokens,
             .logits = logits,
             .next = next,

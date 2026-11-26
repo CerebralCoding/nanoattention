@@ -400,6 +400,7 @@ pub fn independentLaunches(gpa: std.mem.Allocator, steps: []const Step, p: *cons
 pub fn deadAfter(p: *const ir.Program, v: ir.View, last_reader: u32) bool {
     if (overlaps(v, p.logits) or overlaps(v, p.next)) return false;
     for (p.traces) |t| if (t.view.state == v.state) return false;
+    if (p.draft_final_norm) |dfn| if (dfn.view.state == v.state) return false;
     var i = last_reader + 1;
     while (i < p.ops.len) : (i += 1) {
         var reads: [3]?ir.View = undefined;
