@@ -1267,12 +1267,12 @@ kernel void mk_relative_lsa_ref(device float *arena [[buffer(0)]], device const 
 
     uint E = (p.dim + 31u) / 32u;
     float q[8], acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    device const float *qp = arena + p.q_off + row * p.q_stride + h * p.dim;
+    device const float *qp = arena + p.q_off + ulong(row) * p.q_stride + h * p.dim;
     for (uint e = 0u; e < E; ++e) {
         uint d = lane + 32u * e;
         q[e] = d < p.dim ? qp[d] : 0.0f;
     }
-    float maximum = (p.has_sink != 0u) ? arena[p.sink_off + row * p.sink_stride + h] : -INFINITY;
+    float maximum = (p.has_sink != 0u) ? arena[p.sink_off + ulong(row) * p.sink_stride + h] : -INFINITY;
     float denominator = (p.has_sink != 0u) ? 1.0f : 0.0f;
 
     uint tail0 = 0u;
@@ -1304,7 +1304,7 @@ kernel void mk_relative_lsa_ref(device float *arena [[buffer(0)]], device const 
         }
         dot = simd_sum(dot);
         uint distance = position - t;
-        float relative = distance < p.m ? arena[p.bias_off + row * p.bias_stride + h * p.m + distance] : 0.0f;
+        float relative = distance < p.m ? arena[p.bias_off + ulong(row) * p.bias_stride + h * p.m + distance] : 0.0f;
         float score = dot * p.scale + relative;
         float next_maximum = max(maximum, score);
         float old_weight = (denominator > 0.0f || maximum > -INFINITY) ? metal::precise::exp(maximum - next_maximum) : 0.0f;
@@ -1316,15 +1316,15 @@ kernel void mk_relative_lsa_ref(device float *arena [[buffer(0)]], device const 
         }
         maximum = next_maximum;
     }
-    device float *out = arena + p.out_off + row * p.out_stride + h * p.dim;
+    device float *out = arena + p.out_off + ulong(row) * p.out_stride + h * p.dim;
     for (uint e = 0u; e < E; ++e) {
         uint d = lane + 32u * e;
         if (d < p.dim) out[d] = (denominator > 0.0f) ? (acc[e] / denominator) : 0.0f;
     }
 }
 
-// Striped single-row sparse relative decode (dim == 128, heads == 3 * kv_heads) reading BF16 mirrors.
-// Emits log2 softmax partials into parts[h * taps * 130 + part * 130], matching mk_relative_long_merge_fast/_gated.
+// Striped sparse relative decode/verify (rows = 1..8, dim == 128, heads == 3 * kv_heads) reading BF16 mirrors.
+// Emits log2 softmax partials into parts[((r * heads + h) * taps + part) * 130], matching mk_relative_long_merge_fast/_gated.
 #define MK_LSA_DEC_SIMDS 8u
 template <bool InlineBias>
 inline void mk_relative_lsa_decode_keys_fast_impl(device const float *arena, device const ushort *key,
@@ -1334,9 +1334,13 @@ inline void mk_relative_lsa_decode_keys_fast_impl(device const float *arena, dev
                                                   uint lane, uint simd, uint simds, uint g,
                                                   threadgroup float4 *red_acc, threadgroup float *red_m,
                                                   threadgroup float *red_d) {
-    uint kvh = g / p.taps, part = g % p.taps;
-    uint row = p.row0, pos = p.pos0;
-    uint cnt = blockCount[0];
+    const uint kv_parts = p.kv_heads * p.taps;
+    const uint r = g / kv_parts, rem = g % kv_parts;
+    if (r >= p.rows) return;
+    const uint kvh = rem / p.taps, part = rem % p.taps;
+    const uint row = p.row0 + r, pos = p.pos0 + r;
+    const uint cnt = blockCount[r];
+    device const uint *rowBlocks = blockList + ulong(r) * p.list_stride;
     uint tail0 = (cnt > 0u) ? ((pos + 1u) & ~3u) : 0u;
     uint total_keys = cnt * 4u + (pos + 1u - tail0);
     uint s_off = uint(ulong(total_keys) * part / p.taps);
@@ -1349,14 +1353,14 @@ inline void mk_relative_lsa_decode_keys_fast_impl(device const float *arena, dev
     float4 q[3];
     #pragma unroll
     for (uint h = 0u; h < 3u; ++h) {
-        q[h] = float4(*(device const packed_float4 *)(arena + p.q_off + row * p.q_stride + (h0 + h) * 128u + lane * 4u)) * qscale;
+        q[h] = float4(*(device const packed_float4 *)(arena + p.q_off + ulong(row) * p.q_stride + (h0 + h) * 128u + lane * 4u)) * qscale;
     }
 
     uint last_t = 0u;
     if (n > 0u) {
         uint last_idx = e_off - 1u;
         last_t = (cnt > 0u && last_idx < cnt * 4u)
-               ? ((blockList[last_idx >> 2u] << 2u) | (last_idx & 3u))
+               ? ((rowBlocks[last_idx >> 2u] << 2u) | (last_idx & 3u))
                : (tail0 + (cnt > 0u ? (last_idx - cnt * 4u) : last_idx));
     }
     bool stripe_has_rel = (n > 0u) && ((pos - last_t) < p.m);
@@ -1364,7 +1368,7 @@ inline void mk_relative_lsa_decode_keys_fast_impl(device const float *arena, dev
     device const ushort *rel_w = InlineBias ? reinterpret_cast<device const ushort *>(rel_w_bytes + p.rel_w_off) : nullptr;
     if constexpr (InlineBias) {
         if (stripe_has_rel && lane < 16u) {
-            device const float *rp = arena + p.bias_off + row * p.bias_stride;
+            device const float *rp = arena + p.bias_off + ulong(row) * p.bias_stride;
             r0 = rp[(h0 + 0u) * 16u + lane];
             r1 = rp[(h0 + 1u) * 16u + lane];
             r2 = rp[(h0 + 2u) * 16u + lane];
@@ -1374,13 +1378,13 @@ inline void mk_relative_lsa_decode_keys_fast_impl(device const float *arena, dev
     float m[3] = { -INFINITY, -INFINITY, -INFINITY };
     float d[3] = { 0.0f, 0.0f, 0.0f };
     float4 acc[3] = { float4(0.0f), float4(0.0f), float4(0.0f) };
-    device const float *bias_base = InlineBias ? nullptr : (arena + p.bias_off + row * p.bias_stride + h0 * p.m);
+    device const float *bias_base = InlineBias ? nullptr : (arena + p.bias_off + ulong(row) * p.bias_stride + h0 * p.m);
     uint k_off = kvh * 128u + lane * 4u;
 
     for (uint i = simd; i < n; i += simds) {
         uint idx = s_off + i;
         uint t = (cnt > 0u && idx < cnt * 4u)
-               ? ((blockList[idx >> 2u] << 2u) | (idx & 3u))
+               ? ((rowBlocks[idx >> 2u] << 2u) | (idx & 3u))
                : (tail0 + (cnt > 0u ? (idx - cnt * 4u) : idx));
         uint slot = (t < p.capacity) ? t : (t % p.capacity);
         ulong kv_idx = ulong(slot) * stride + k_off;
@@ -1455,7 +1459,7 @@ inline void mk_relative_lsa_decode_keys_fast_impl(device const float *arena, dev
                 }
             }
         }
-        device float *dst = parts + (ulong(h0 + h) * p.taps + part) * 130u;
+        device float *dst = parts + ((ulong(r) * p.heads + (h0 + h)) * p.taps + part) * 130u;
         *(device packed_float4 *)(dst + lane * 4u) = packed_float4(tot_acc);
         if (lane == 0u) {
             dst[128] = m_max;

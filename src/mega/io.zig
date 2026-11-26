@@ -11,7 +11,9 @@ extern "c" fn clock_gettime(c_int, *Timespec) c_int;
 pub fn writeAll(fd: c_int, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const n = write(fd, bytes[offset..].ptr, bytes.len - offset);
+        // Darwin write(2) rejects single transfers >= 2 GiB with EINVAL.
+        const chunk = @min(bytes.len - offset, 128 * 1024 * 1024);
+        const n = write(fd, bytes[offset..].ptr, chunk);
         if (n <= 0) return error.OutputFailed;
         offset += @intCast(n);
     }

@@ -198,9 +198,15 @@ pub const Engine = struct {
     /// knobs.lsa: per global key cache state, 4-token / 16-token Q4 pooled blocks and shared scratch.
     lsa_layers: ?[]?LsaLayer = null,
     lsa_scratch: ?metal.Buffer = null,
-    lsa_block_list: ?metal.Buffer = null,
-    lsa_block_count: ?metal.Buffer = null,
+    lsa_block_lists: ?[]metal.Buffer = null,
+    lsa_block_counts: ?[]metal.Buffer = null,
+    lsa_slot_valid: ?[]?LsaSlotKey = null,
     lsa_layout: LsaScratchLayout = .{},
+    const LsaSlotKey = struct {
+        row0: u32,
+        rows: u32,
+        row_step: u32,
+    };
     const LsaScratchLayout = struct {
         select_units: u32 = 0,
         list_stride: u32 = 0,
@@ -296,8 +302,10 @@ pub const Engine = struct {
         capacity: u32,
         pooled_meta_bytes: u32,
         pooled_row_bytes: u32,
-        fine: metal.Buffer,
+        fine: ?metal.Buffer,
         coarse: ?metal.Buffer,
+        reuse_slot: u32 = 0,
+        donor_state: ?ir.StateId = null,
     };
     const max_prefill_stripes: u32 = 4;
     const list_segments: u32 = 32; // MK_LIST_SEGS
@@ -601,7 +609,9 @@ pub const Engine = struct {
                     };
                     if (inline_bias_ok) |ok| {
                         const visible = if (a.window == 0) context else @min(context, a.window);
-                        if (a.heads == 3 * a.kv_heads and maxStripeParts(visible, true) <= max_stripe_parts) {
+                        const dense_thresh = 1 + (knobs.lsa_budget / 4) + (knobs.lsa_window / 4);
+                        const eff_visible = if (knobs.lsa and a.window == 0) @min(visible, dense_thresh * 4 + 3) else visible;
+                        if (a.heads == 3 * a.kv_heads and maxStripeParts(eff_visible, true) <= max_stripe_parts) {
                             if (gp_idx[a.bias.state]) |gi| if (ra_idx[a.bias.state]) |ri| if (gi < ri and (gi >= head_start) == (ri >= head_start)) {
                                 const g = program.ops[gi].grouped_project;
                                 const gw = bound[g.weight];
@@ -629,16 +639,24 @@ pub const Engine = struct {
         };
         var lsa_layers: ?[]?LsaLayer = null;
         var lsa_scratch: ?metal.Buffer = null;
-        var lsa_block_list: ?metal.Buffer = null;
-        var lsa_block_count: ?metal.Buffer = null;
+        var lsa_block_lists: ?[]metal.Buffer = null;
+        var lsa_block_counts: ?[]metal.Buffer = null;
+        var lsa_slot_valid: ?[]?LsaSlotKey = null;
         var lsa_layout: LsaScratchLayout = .{};
         errdefer {
-            if (lsa_block_count) |b| b.deinit();
-            if (lsa_block_list) |b| b.deinit();
+            if (lsa_slot_valid) |sv| gpa.free(sv);
+            if (lsa_block_counts) |bs| {
+                for (bs) |b| b.deinit();
+                gpa.free(bs);
+            }
+            if (lsa_block_lists) |bs| {
+                for (bs) |b| b.deinit();
+                gpa.free(bs);
+            }
             if (lsa_scratch) |b| b.deinit();
             if (lsa_layers) |ls| {
                 for (ls) |entry| if (entry) |l| {
-                    l.fine.deinit();
+                    if (l.fine) |f| f.deinit();
                     if (l.coarse) |c| c.deinit();
                 };
                 gpa.free(ls);
@@ -659,6 +677,27 @@ pub const Engine = struct {
                 else => {},
             };
             if (max_heads > 0 and max_cap > 0) {
+                const LsaReuseGroup = struct {
+                    weight: ir.WeightId,
+                    dim: u32,
+                    kv_heads: u32,
+                    heads: u32,
+                    capacity: u32,
+                    donor_state: ir.StateId,
+                    slot: u32,
+                };
+                const q_weights = try gpa.alloc(?ir.WeightId, n);
+                defer gpa.free(q_weights);
+                @memset(q_weights, null);
+                for (program.ops) |op| switch (op) {
+                    .linear => |l| q_weights[l.out.state] = l.w,
+                    else => {},
+                };
+                const groups = try gpa.alloc(LsaReuseGroup, n);
+                defer gpa.free(groups);
+                var group_count: usize = 0;
+                var next_slot: u32 = 0;
+
                 const layers = try gpa.alloc(?LsaLayer, n);
                 @memset(layers, null);
                 lsa_layers = layers;
@@ -667,26 +706,75 @@ pub const Engine = struct {
                         const cap = program.states[a.keys].capacity(batch, context);
                         const meta_bytes = a.kv_heads * 4;
                         const row_bytes = ((meta_bytes + a.kv_heads * (a.dim / 2)) + 3) & ~@as(u32, 3);
-                        const n_fine = @max(cap / 4, 1);
-                        const fine_buf = try ctx.alloc((@as(usize, n_fine) * row_bytes + 3) / 4);
-                        errdefer fine_buf.deinit();
-                        @memset(std.mem.sliceAsBytes(fine_buf.floats()), 0);
-                        var coarse_buf: ?metal.Buffer = null;
-                        if (can_ever_coarse and cap >= 16) {
-                            const n_coarse = cap / 16;
-                            const cb = try ctx.alloc((@as(usize, n_coarse) * row_bytes + 3) / 4);
-                            @memset(std.mem.sliceAsBytes(cb.floats()), 0);
-                            coarse_buf = cb;
+                        var reuse_slot: u32 = 0;
+                        var donor_state: ?ir.StateId = null;
+                        if (knobs.lsa_cross_loop_reuse) {
+                            if (q_weights[a.q.state]) |qw| {
+                                var matched: ?LsaReuseGroup = null;
+                                for (groups[0..group_count]) |g| {
+                                    if (g.weight == qw and g.dim == a.dim and g.kv_heads == a.kv_heads and g.heads == a.heads and g.capacity == cap) {
+                                        matched = g;
+                                        break;
+                                    }
+                                }
+                                if (matched) |m| {
+                                    reuse_slot = m.slot;
+                                    donor_state = m.donor_state;
+                                } else {
+                                    reuse_slot = next_slot;
+                                    next_slot += 1;
+                                    groups[group_count] = .{
+                                        .weight = qw,
+                                        .dim = a.dim,
+                                        .kv_heads = a.kv_heads,
+                                        .heads = a.heads,
+                                        .capacity = cap,
+                                        .donor_state = a.keys,
+                                        .slot = reuse_slot,
+                                    };
+                                    group_count += 1;
+                                }
+                            } else {
+                                reuse_slot = next_slot;
+                                next_slot += 1;
+                            }
                         }
-                        layers[a.keys] = .{
-                            .dim = a.dim,
-                            .kv_heads = a.kv_heads,
-                            .capacity = cap,
-                            .pooled_meta_bytes = meta_bytes,
-                            .pooled_row_bytes = row_bytes,
-                            .fine = fine_buf,
-                            .coarse = coarse_buf,
-                        };
+                        if (donor_state != null) {
+                            layers[a.keys] = .{
+                                .dim = a.dim,
+                                .kv_heads = a.kv_heads,
+                                .capacity = cap,
+                                .pooled_meta_bytes = meta_bytes,
+                                .pooled_row_bytes = row_bytes,
+                                .fine = null,
+                                .coarse = null,
+                                .reuse_slot = reuse_slot,
+                                .donor_state = donor_state,
+                            };
+                        } else {
+                            const n_fine = @max(cap / 4, 1);
+                            const fine_buf = try ctx.alloc((@as(usize, n_fine) * row_bytes + 3) / 4);
+                            errdefer fine_buf.deinit();
+                            @memset(std.mem.sliceAsBytes(fine_buf.floats()), 0);
+                            var coarse_buf: ?metal.Buffer = null;
+                            if (can_ever_coarse and cap >= 16) {
+                                const n_coarse = cap / 16;
+                                const cb = try ctx.alloc((@as(usize, n_coarse) * row_bytes + 3) / 4);
+                                @memset(std.mem.sliceAsBytes(cb.floats()), 0);
+                                coarse_buf = cb;
+                            }
+                            layers[a.keys] = .{
+                                .dim = a.dim,
+                                .kv_heads = a.kv_heads,
+                                .capacity = cap,
+                                .pooled_meta_bytes = meta_bytes,
+                                .pooled_row_bytes = row_bytes,
+                                .fine = fine_buf,
+                                .coarse = coarse_buf,
+                                .reuse_slot = reuse_slot,
+                                .donor_state = null,
+                            };
+                        }
                     },
                     else => {},
                 };
@@ -695,12 +783,39 @@ pub const Engine = struct {
                 const scratch_buf = try ctx.alloc((lsa_layout.total_bytes + 3) / 4);
                 @memset(std.mem.sliceAsBytes(scratch_buf.floats()), 0);
                 lsa_scratch = scratch_buf;
-                const list_buf = try ctx.alloc(@as(usize, batch) * lsa_layout.list_stride);
-                @memset(list_buf.floats(), 0);
-                lsa_block_list = list_buf;
-                const count_buf = try ctx.alloc(batch);
-                @memset(count_buf.floats(), 0);
-                lsa_block_count = count_buf;
+
+                const num_slots: usize = if (knobs.lsa_cross_loop_reuse) @max(@as(usize, 1), next_slot) else 1;
+                const lists = try gpa.alloc(metal.Buffer, num_slots);
+                var lists_init: usize = 0;
+                errdefer {
+                    for (lists[0..lists_init]) |b| b.deinit();
+                    gpa.free(lists);
+                }
+                while (lists_init < num_slots) : (lists_init += 1) {
+                    const list_buf = try ctx.alloc(@as(usize, batch) * lsa_layout.list_stride);
+                    @memset(list_buf.floats(), 0);
+                    lists[lists_init] = list_buf;
+                }
+                lsa_block_lists = lists;
+
+                const counts = try gpa.alloc(metal.Buffer, num_slots);
+                var counts_init: usize = 0;
+                errdefer {
+                    for (counts[0..counts_init]) |b| b.deinit();
+                    gpa.free(counts);
+                }
+                while (counts_init < num_slots) : (counts_init += 1) {
+                    const count_buf = try ctx.alloc(batch);
+                    @memset(count_buf.floats(), 0);
+                    counts[counts_init] = count_buf;
+                }
+                lsa_block_counts = counts;
+
+                if (knobs.lsa_cross_loop_reuse) {
+                    const sv = try gpa.alloc(?LsaSlotKey, num_slots);
+                    @memset(sv, null);
+                    lsa_slot_valid = sv;
+                }
             }
         }
         return .{
@@ -742,23 +857,27 @@ pub const Engine = struct {
             .prefill_parts = prefill_parts,
             .lsa_layers = lsa_layers,
             .lsa_scratch = lsa_scratch,
-            .lsa_block_list = lsa_block_list,
-            .lsa_block_count = lsa_block_count,
+            .lsa_block_lists = lsa_block_lists,
+            .lsa_block_counts = lsa_block_counts,
+            .lsa_slot_valid = lsa_slot_valid,
             .lsa_layout = lsa_layout,
         };
     }
 
     /// Stripes of the single-row striped attention over `visible` keys: 128 keys
-    /// a stripe up to 2,048 keys, 256 up to 16,384, then 512 (`nano attnbench`).
+    /// a stripe up to 2,048 keys, 256 up to 16,384, 512 up to 524,288, then 1,024 (`nano attnbench`).
     fn stripeParts(visible: u32, fast: bool) u32 {
-        const stripe: u32 = if (fast and visible <= 2048) 64 else if (visible <= 2048) 128 else if (visible <= 16384) 256 else 512;
+        const stripe: u32 = if (fast and visible <= 2048) 64 else if (visible <= 2048) 128 else if (visible <= 16384) 256 else if (visible <= 524288) 512 else 1024;
         return (visible + stripe - 1) / stripe;
     }
     /// The most stripes any key count up to `visible` takes. The count drops where
     /// the stripe widens, so the last count is not the largest: 16,384 keys take
     /// 64 stripes and 16,385 take 33.
     fn maxStripeParts(visible: u32, fast: bool) u32 {
-        return @max(stripeParts(visible, fast), @max(stripeParts(@min(visible, 2048), fast), stripeParts(@min(visible, 16384), fast)));
+        return @max(
+            @max(stripeParts(visible, fast), stripeParts(@min(visible, 2048), fast)),
+            @max(stripeParts(@min(visible, 16384), fast), stripeParts(@min(visible, 524288), fast)),
+        );
     }
 
     pub fn deinit(self: *Engine) void {
@@ -792,12 +911,19 @@ pub const Engine = struct {
         }
         if (self.stripe_parts) |b| b.deinit();
         if (self.prefill_parts) |b| b.deinit();
-        if (self.lsa_block_count) |b| b.deinit();
-        if (self.lsa_block_list) |b| b.deinit();
+        if (self.lsa_slot_valid) |sv| self.gpa.free(sv);
+        if (self.lsa_block_counts) |bs| {
+            for (bs) |b| b.deinit();
+            self.gpa.free(bs);
+        }
+        if (self.lsa_block_lists) |bs| {
+            for (bs) |b| b.deinit();
+            self.gpa.free(bs);
+        }
         if (self.lsa_scratch) |b| b.deinit();
         if (self.lsa_layers) |ls| {
             for (ls) |entry| if (entry) |l| {
-                l.fine.deinit();
+                if (l.fine) |f| f.deinit();
                 if (l.coarse) |c| c.deinit();
             };
             self.gpa.free(ls);
@@ -823,6 +949,7 @@ pub const Engine = struct {
         self.d2_last = null;
         self.prep_key = null;
         self.x2_key = null;
+        if (self.lsa_slot_valid) |sv| @memset(sv, null);
         self.out_end = if (self.out_end > rewound and self.out_first <= self.out_end - rewound) self.out_end - rewound else 0;
         if (self.out_end == 0) self.out_first = 0;
         self.position = new_position;
@@ -843,6 +970,7 @@ pub const Engine = struct {
         self.out_first = 0;
         self.out_end = 0;
         if (self.lsa_scratch) |b| @memset(std.mem.sliceAsBytes(b.floats()), 0);
+        if (self.lsa_slot_valid) |sv| @memset(sv, null);
     }
 
     /// Rebuild derived BF16 mirrors and Q4 LSA pooled blocks after loading KV/ring states.
@@ -878,7 +1006,8 @@ pub const Engine = struct {
             var ran_lsa = false;
             for (ls, 0..) |entry, id| {
                 const layer = entry orelse continue;
-                @memset(std.mem.sliceAsBytes(layer.fine.floats()), 0);
+                const fine = layer.fine orelse continue;
+                @memset(std.mem.sliceAsBytes(fine.floats()), 0);
                 if (layer.coarse) |c| @memset(std.mem.sliceAsBytes(c.floats()), 0);
                 if (position >= 4) {
                     try self.encodeLsaPool(@intCast(id), 0, position);
@@ -891,6 +1020,7 @@ pub const Engine = struct {
             }
         }
         if (self.lsa_scratch) |b| @memset(std.mem.sliceAsBytes(b.floats()), 0);
+        if (self.lsa_slot_valid) |sv| @memset(sv, null);
         self.position = position;
         self.failed = false;
         self.d2_last = null;
@@ -974,6 +1104,7 @@ pub const Engine = struct {
         self.cur_T = T;
         self.cur_out_first = out_first;
         self.cur_traced = trace != null;
+        if (self.lsa_slot_valid) |sv| @memset(sv, null);
         self.prep_key = null;
         self.x2_key = null; // climb 2, exact prefill
         self.expert_routes = null;
@@ -1780,7 +1911,7 @@ pub const Engine = struct {
                 const y = self.words(g.out);
                 const w = self.bound[g.weight];
                 if (w.quant != null or !w.tensor.dtype.isFloat()) return error.InvalidGroupedProjection;
-                if (rows >= 1 and rows <= 8 and (rows == 1 or (self.knobs.relative_long_fast and !self.knobs.lsa)) and
+                if (rows >= 1 and rows <= 8 and (rows == 1 or self.knobs.relative_long_fast) and
                     self.relative_half != null and self.stripe_parts != null and self.bias16 == null and
                     !self.cur_traced and self.cur_out_first == 0 and self.tap == null)
                 if (self.inline_bias_ok) |ok| if (ok[g.out.state]) {
@@ -2296,6 +2427,7 @@ pub const Engine = struct {
     fn encodeLsaPool(self: *Engine, state_id: ir.StateId, row0: u32, rows: u32) !void {
         const ls = self.lsa_layers orelse return;
         const layer = ls[state_id] orelse return;
+        const fine = layer.fine orelse return;
         const p_start = self.position + row0;
         const p_end = p_start + rows;
         const start_fine = p_start / 4;
@@ -2316,9 +2448,9 @@ pub const Engine = struct {
         };
         const half_k = if (self.relative_half) |hs| hs[state_id] else null;
         if (half_k) |hk| {
-            try gpu.dispatch(self.ctx, "mk_lsa_pool_fine_bf16", &.{ hk, layer.fine }, &lp, @as(usize, lp.num_blks) * 128, 128);
+            try gpu.dispatch(self.ctx, "mk_lsa_pool_fine_bf16", &.{ hk, fine }, &lp, @as(usize, lp.num_blks) * 128, 128);
         } else {
-            try gpu.dispatch(self.ctx, "mk_lsa_pool_fine_f32", &.{ self.caches[state_id].?, layer.fine }, &lp, @as(usize, lp.num_blks) * 128, 128);
+            try gpu.dispatch(self.ctx, "mk_lsa_pool_fine_f32", &.{ self.caches[state_id].?, fine }, &lp, @as(usize, lp.num_blks) * 128, 128);
         }
         if (layer.coarse) |coarse| {
             const start_coarse = p_start / 16;
@@ -2326,7 +2458,7 @@ pub const Engine = struct {
             if (end_coarse > start_coarse) {
                 lp.start_blk = start_coarse;
                 lp.num_blks = end_coarse - start_coarse;
-                try gpu.dispatch(self.ctx, "mk_lsa_pool_coarse", &.{ layer.fine, coarse }, &lp, @as(usize, lp.num_blks) * 128, 128);
+                try gpu.dispatch(self.ctx, "mk_lsa_pool_coarse", &.{ fine, coarse }, &lp, @as(usize, lp.num_blks) * 128, 128);
             }
         }
     }
@@ -2346,10 +2478,18 @@ pub const Engine = struct {
         return 128;
     }
 
-    fn encodeLsaSelect(self: *Engine, layer: LsaLayer, a: @FieldType(ir.Op, "relative_attention"), row0: u32, rows: u32, row_step: u32) !void {
+    fn encodeLsaSelect(
+        self: *Engine,
+        layer: LsaLayer,
+        a: @FieldType(ir.Op, "relative_attention"),
+        row0: u32,
+        rows: u32,
+        row_step: u32,
+        block_list: metal.Buffer,
+        block_count: metal.Buffer,
+    ) !void {
         const scratch = self.lsa_scratch.?;
-        const block_list = self.lsa_block_list.?;
-        const block_count = self.lsa_block_count.?;
+        const fine = layer.fine.?;
         const lay = self.lsa_layout;
         var lp = self.lsaBaseParams(layer, a, a.out, row0, rows, row_step);
 
@@ -2379,7 +2519,7 @@ pub const Engine = struct {
                     const dtile = Engine.lsaDecodeScoreTile(batch_total_blocks);
                     lp.tile_items = dtile;
                     lp.score_tiles_x = @max((batch_total_blocks + dtile - 1) / dtile, 1);
-                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, fine, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
                     const agg0 = Engine.lsaDecodeAggTile(batch_num_mid);
                     lp.bq_tile = agg0;
                     const agg0_tiles = @max((batch_num_mid + agg0 - 1) / agg0, 1);
@@ -2397,7 +2537,7 @@ pub const Engine = struct {
                     lp.bq_tile = @min(u_cnt, 4);
                     lp.score_tiles_x = @max((batch_total_blocks + 255) / 256, 1);
                     const y_groups = (u_cnt + lp.bq_tile - 1) / lp.bq_tile;
-                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, y_groups) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, fine, scratch }, &lp, @as(usize, y_groups) * lp.score_tiles_x * 256, 256);
                     try gpu.dispatch(self.ctx, "mk_lsa_mh_reduce_lse", &.{ self.arena, scratch }, &lp, @as(usize, u_cnt) * a.heads * 32, 32);
                     try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
                     try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
@@ -2443,7 +2583,7 @@ pub const Engine = struct {
                     const dtile2 = Engine.lsaDecodeScoreTile(s2_max_items);
                     lp.tile_items = dtile2;
                     lp.score_tiles_x = @max((s2_max_items + dtile2 - 1) / dtile2, 1);
-                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score_dec", &.{ self.arena, fine, scratch }, &lp, @as(usize, lp.score_tiles_x) * 256, 256);
                     const agg2 = Engine.lsaDecodeAggTile(s2_fine_max);
                     lp.bq_tile = agg2;
                     const agg2_tiles = @max((s2_fine_max + agg2 - 1) / agg2, 1);
@@ -2459,7 +2599,7 @@ pub const Engine = struct {
                 } else {
                     lp.tile_items = 256;
                     lp.score_tiles_x = @max((s2_max_items + 255) / 256, 1);
-                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, layer.fine, scratch }, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_lsa_mh_score", &.{ self.arena, fine, scratch }, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
                     try gpu.dispatch(self.ctx, "mk_lsa_mh_reduce_lse", &.{ self.arena, scratch }, &lp, @as(usize, u_cnt) * a.heads * 32, 32);
                     try gpu.dispatch(self.ctx, "mk_lsa_mh_agg_hist", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
                     try gpu.dispatch(self.ctx, "mk_lsa_mh_collect", &.{scratch}, &lp, @as(usize, u_cnt) * lp.score_tiles_x * 256, 256);
@@ -2470,10 +2610,24 @@ pub const Engine = struct {
         }
     }
 
+    fn ensureLsaSelected(self: *Engine, layer: LsaLayer, a: @FieldType(ir.Op, "relative_attention"), row0: u32, rows: u32, row_step: u32) !void {
+        const block_list = self.lsa_block_lists.?[layer.reuse_slot];
+        const block_count = self.lsa_block_counts.?[layer.reuse_slot];
+        const key: LsaSlotKey = .{ .row0 = row0, .rows = rows, .row_step = row_step };
+        if (layer.donor_state) |donor_id| {
+            if (self.lsa_slot_valid) |sv| if (sv[layer.reuse_slot]) |prev| if (std.meta.eql(prev, key)) return;
+            const donor_layer = self.lsa_layers.?[donor_id].?;
+            try self.encodeLsaSelect(donor_layer, a, row0, rows, row_step, block_list, block_count);
+            return;
+        }
+        try self.encodeLsaSelect(layer, a, row0, rows, row_step, block_list, block_count);
+        if (self.lsa_slot_valid) |sv| sv[layer.reuse_slot] = key;
+    }
+
     fn lsaActive(self: *const Engine, a: @FieldType(ir.Op, "relative_attention"), row0: u32, rows: u32) bool {
         if (self.tap != null or a.window != 0) return false;
         const ls = self.lsa_layers orelse return false;
-        if (ls[a.keys] == null or self.lsa_block_list == null or self.lsa_block_count == null) return false;
+        if (ls[a.keys] == null or self.lsa_block_lists == null or self.lsa_block_counts == null) return false;
         const max_total_blocks = (self.position + row0 + rows) / 4;
         const dense_thresh = 1 + (self.knobs.lsa_budget / 4) + (self.knobs.lsa_window / 4);
         return max_total_blocks > dense_thresh;
@@ -2485,8 +2639,10 @@ pub const Engine = struct {
         if (self.tap != null or a.window != 0) return false;
         const ls = self.lsa_layers orelse return false;
         const layer = ls[a.keys] orelse return false;
-        const block_list = self.lsa_block_list orelse return false;
-        const block_count = self.lsa_block_count orelse return false;
+        const block_lists = self.lsa_block_lists orelse return false;
+        const block_counts = self.lsa_block_counts orelse return false;
+        const block_list = block_lists[layer.reuse_slot];
+        const block_count = block_counts[layer.reuse_slot];
 
         const max_total_blocks = (self.position + row0 + rows) / 4;
         const dense_thresh = 1 + (self.knobs.lsa_budget / 4) + (self.knobs.lsa_window / 4);
@@ -2495,33 +2651,35 @@ pub const Engine = struct {
         self.ctx.nano_dispatch_flags = null;
         self.force_barrier = true;
 
-        // Fast BF16 striped sparse decode (supports inline relative bias + fused gate merge).
-        if (rows == 1 and self.knobs.relative_long_fast and a.dim == 128 and a.heads == a.kv_heads * 3) {
+        // Fast BF16 striped sparse decode/verify (rows = 1..8, supports inline relative bias + fused gate merge).
+        if (rows >= 1 and rows <= 8 and (rows < 8 or self.cur_T <= 8 or !self.knobs.relative_tile_prefill) and rows <= self.batch and self.knobs.relative_long_fast and a.dim == 128 and a.heads == a.kv_heads * 3) {
             if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| if (self.stripe_parts) |parts| {
-                try self.encodeLsaSelect(layer, a, row0, rows, 1);
+                try self.ensureLsaSelected(layer, a, row0, rows, 1);
                 const inline_bias: @FieldType(Engine, "inline_bias") = if (self.inline_bias) |ib| blk: {
-                    if (ib.state == a.bias.state and ib.row0 == p.row0) {
+                    if (ib.state == a.bias.state and ib.row0 == p.row0 and ib.rows == p.rows) {
                         self.inline_bias = null;
                         break :blk ib;
                     }
                     break :blk null;
                 } else null;
                 var lp = self.lsaBaseParams(layer, a, out_view, row0, rows, 1);
-                const max_sparse_keys = @min((self.position + row0 + 1), dense_thresh * 4 + 3);
-                const cap_parts = @as(u32, @intCast(parts.floats().len / (@as(usize, a.heads) * 130)));
+                const max_sparse_keys = @min(self.position + row0 + rows, dense_thresh * 4 + 3);
+                const cap_parts = @as(u32, @intCast(parts.floats().len / (@as(usize, rows) * a.heads * 130)));
                 lp.taps = @min(@min(Engine.max_stripe_parts, cap_parts), @max(@as(u32, 1), Engine.stripeParts(max_sparse_keys, true)));
                 p.taps = lp.taps;
+                p.flags |= gpu.flag_fixed_taps;
+                const rows_u: usize = @as(usize, rows);
                 if (inline_bias) |ib| {
                     lp.bias_off = ib.r_off;
                     lp.bias_stride = ib.r_stride;
                     lp.rel_w_off = ib.w_off;
                     try gpu.dispatch(self.ctx, "mk_relative_lsa_decode_keys_inline_fast", &.{
                         self.arena, half_keys, hs[a.values].?, parts, block_list, block_count, ib.w_buf,
-                    }, &lp, @as(usize, a.kv_heads) * lp.taps * 256, 256);
+                    }, &lp, rows_u * @as(usize, a.kv_heads) * lp.taps * 256, 256);
                 } else {
                     try gpu.dispatch(self.ctx, "mk_relative_lsa_decode_keys_fast", &.{
                         self.arena, half_keys, hs[a.values].?, parts, block_list, block_count,
-                    }, &lp, @as(usize, a.kv_heads) * lp.taps * 256, 256);
+                    }, &lp, rows_u * @as(usize, a.kv_heads) * lp.taps * 256, 256);
                 }
                 const o = self.words(out_view);
                 p.y = o.off;
@@ -2531,9 +2689,9 @@ pub const Engine = struct {
                     p.z = g.off;
                     p.zs = g.stride;
                     p.flags |= gpu.flag_round_bf16 | gpu.flag_round_out;
-                    try gpu.dispatch(self.ctx, "mk_relative_long_merge_gated", &.{ self.arena, parts }, p, @as(usize, a.heads) * 128, 128);
+                    try gpu.dispatch(self.ctx, "mk_relative_long_merge_gated", &.{ self.arena, parts }, p, rows_u * @as(usize, a.heads) * 128, 128);
                 } else {
-                    try gpu.dispatch(self.ctx, "mk_relative_long_merge_fast", &.{ self.arena, parts }, p, @as(usize, a.heads) * 128, 128);
+                    try gpu.dispatch(self.ctx, "mk_relative_long_merge_fast", &.{ self.arena, parts }, p, rows_u * @as(usize, a.heads) * 128, 128);
                 }
                 return true;
             };
@@ -2542,12 +2700,12 @@ pub const Engine = struct {
         if (gate_view != null) return false;
 
         // If a single-row grouped_project deferred inline_bias without fast decode path, execute it now.
-        if (rows == 1) if (self.inline_bias) |ib| if (ib.state == a.bias.state and ib.row0 == p.row0) return false;
+        if (rows == 1) if (self.inline_bias) |ib| if (ib.state == a.bias.state and ib.row0 == p.row0 and ib.rows == p.rows) return false;
 
         // Fast tiled BF16 MMA sparse prefill when mirrors exist.
         if (rows >= 8 and self.knobs.relative_tile_prefill and a.dim == 128) {
             if (self.relative_half) |hs| if (hs[a.keys]) |half_keys| {
-                try self.encodeLsaSelect(layer, a, row0, rows, 32);
+                try self.ensureLsaSelected(layer, a, row0, rows, 32);
                 const lp = self.lsaBaseParams(layer, a, out_view, row0, rows, 32);
                 try gpu.dispatch(self.ctx, "mk_relative_lsa_prefill", &.{
                     self.arena, half_keys, hs[a.values].?, block_list, block_count,
@@ -2557,7 +2715,7 @@ pub const Engine = struct {
         }
 
         // General FP32 sparse reference attention.
-        try self.encodeLsaSelect(layer, a, row0, rows, 1);
+        try self.ensureLsaSelected(layer, a, row0, rows, 1);
         const lp = self.lsaBaseParams(layer, a, out_view, row0, rows, 1);
         try gpu.dispatch(self.ctx, "mk_relative_lsa_ref", &.{
             self.arena, self.caches[a.keys].?, self.caches[a.values].?, block_list, block_count,
@@ -2981,7 +3139,7 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             const weak_out = self.words(cap1.out);
             const vector = l0.x.width % 128 == 0 and xs.off % 4 == 0 and xs.stride % 4 == 0 and
                 xw.off % 4 == 0 and xw.stride % 4 == 0 and w.tensor.offset % 8 == 0;
-            if (rows == 1 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
+            if (rows >= 1 and rows <= 8 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
                 p.w = w.tensor.offset;
                 p.x = xs.off;
                 p.xs = xs.stride;
@@ -2996,11 +3154,15 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 p.scale = cap0.transform.softcap;
                 p.eps = cd.omega;
                 const wide8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
-                const kname: [:0]const u8 = if (!cd.adaptive)
+                const kname: [:0]const u8 = if (rows == 1) (if (!cd.adaptive)
                     (if (wide8) "mk_bf16_linear_4x2_softcap_loopcd_vec8" else "mk_bf16_linear_4x2_softcap_loopcd")
                 else
-                    (if (wide8) "mk_bf16_linear_4x2_softcap_dual_vec8" else "mk_bf16_linear_4x2_softcap_dual");
-                try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 3) / 4) * 32, self.knobs.linear_group);
+                    (if (wide8) "mk_bf16_linear_4x2_softcap_dual_vec8" else "mk_bf16_linear_4x2_softcap_dual")) else (if (!cd.adaptive)
+                    (if (wide8) "mk_bf16_linear_1xR_softcap_loopcd_vec8" else "mk_bf16_linear_1xR_softcap_loopcd")
+                else
+                    (if (wide8) "mk_bf16_linear_1xR_softcap_dual_vec8" else "mk_bf16_linear_1xR_softcap_dual"));
+                const threads: usize = if (rows == 1) ((@as(usize, p.m) + 3) / 4) * 32 else @as(usize, p.m) * 32;
+                try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, threads, self.knobs.linear_group);
                 if (cd.adaptive) {
                     self.ctx.nano_dispatch_flags = null;
                     try self.encodeLoopCdContrast(cd, row0, rows);
@@ -3591,6 +3753,7 @@ fn d2Encode(self: *Engine, pos: u32, gen: ?u32) !void {
     self.expert_up_bf16 = null;
     self.bias16 = null;
     self.inline_bias = null;
+    if (self.lsa_slot_valid) |sv| @memset(sv, null);
     self.force_barrier = false;
     if (gen) |g| {
         if (self.independent_launches != null) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
@@ -4347,4 +4510,14 @@ pub fn modelType(a: std.mem.Allocator, config_bytes: []const u8) ![]const u8 {
     const t = parsed.object.get("model_type") orelse return error.MissingModelType;
     if (t != .string) return error.InvalidConfig;
     return t.string;
+}
+
+test "Engine stripeParts, maxStripeParts, and 1M context LsaScratchLayout" {
+    try std.testing.expectEqual(@as(u32, 1024), Engine.stripeParts(1_048_576, true));
+    try std.testing.expectEqual(@as(u32, 1024), Engine.maxStripeParts(1_048_576, true));
+    try std.testing.expectEqual(@as(u32, 513), Engine.stripeParts(524_289, true));
+    const lay = Engine.LsaScratchLayout.init(16, 24, 1_048_576, 64, 256, 2048);
+    try std.testing.expect(lay.total_bytes > 0);
+    try std.testing.expect(lay.score_tiles_x >= 256);
+    try std.testing.expectEqual(@as(u32, 321), lay.list_stride);
 }

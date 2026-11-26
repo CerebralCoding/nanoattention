@@ -3062,3 +3062,288 @@ test "Engine.Capture and Engine.rewind preserve exact logits and traces" {
         }
     }
 }
+
+test "Inkling2 multi-row LSA rewind, LoopCD 1xR fusion, and cross-loop LSA reuse" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 3;
+    c.kv_heads = 1;
+    c.head_dim = 128;
+    c.rel_dim = 16;
+    c.rel_extent = 16;
+    c.window = 16;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 64;
+
+    var p = try lower(gpa, c);
+    defer p.deinit();
+    var tmp = "/tmp/nano-inkling-mix-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+    const exec_mod = @import("exec.zig");
+    const Engine = exec_mod.Engine;
+
+    var seq: [44]u32 = undefined;
+    for (&seq, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % 13 + 1);
+
+    // 1. Multi-row LSA (rows=8) + inline_bias + relative_gate + rewind across 4-token / 16-token boundaries.
+    var lsa_ref = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 32,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 16,
+    }, 64);
+    defer lsa_ref.deinit();
+    const lsa_fast_knobs: @import("knobs.zig").Knobs = .{
+        .batch = 32,
+        .relative_stripes = true,
+        .relative_long_fast = true,
+        .relative_inline_bias = true,
+        .fuse_relative_gate = true,
+        .fuse_qkvr_prep = true,
+        .store_pack_bf16 = true,
+        .conv_ring = true,
+        .fuse_inkling_conv = true,
+        .fuse_bf16_cast = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 16,
+    };
+    var lsa_fast = try Engine.init(gpa, &p, ctx, &store, lsa_fast_knobs, 64);
+    defer lsa_fast.deinit();
+    var lsa_bf16_ref_knobs = lsa_fast_knobs;
+    lsa_bf16_ref_knobs.relative_inline_bias = false;
+    lsa_bf16_ref_knobs.fuse_relative_gate = false;
+    lsa_bf16_ref_knobs.fuse_qkvr_prep = false;
+    var lsa_bf16_ref = try Engine.init(gpa, &p, ctx, &store, lsa_bf16_ref_knobs, 64);
+    defer lsa_bf16_ref.deinit();
+    var lsa_fast_seq = try Engine.init(gpa, &p, ctx, &store, lsa_fast_knobs, 64);
+    defer lsa_fast_seq.deinit();
+
+    try lsa_ref.forward(seq[0..32], 31);
+    try lsa_bf16_ref.forward(seq[0..32], 31);
+    try lsa_fast.forward(seq[0..32], 31);
+    try lsa_fast_seq.forward(seq[0..32], 31);
+    try lsa_ref.forward(seq[32..40], 0);
+    try lsa_bf16_ref.forward(seq[32..40], 0);
+    try lsa_fast.forward(seq[32..40], 0);
+    const ref_r3_pre = try a.dupe(f32, try lsa_ref.logits(3));
+    const seq_step_logits = try a.alloc([]const f32, 8);
+    for (0..8) |r| {
+        try lsa_fast_seq.forward(seq[32 + r .. 33 + r], 0);
+        seq_step_logits[r] = try a.dupe(f32, try lsa_fast_seq.logits(0));
+    }
+    for (0..8) |r| {
+        const fl = try lsa_fast.logits(@intCast(r));
+        const brl = try lsa_bf16_ref.logits(@intCast(r));
+        for (brl, fl, seq_step_logits[r]) |bv, fv, sv| {
+            try std.testing.expect(std.math.isFinite(fv));
+            try std.testing.expectApproxEqAbs(sv, fv, 1e-4);
+            try std.testing.expectApproxEqAbs(bv, fv, 1e-3);
+        }
+    }
+    try lsa_fast.rewind(35);
+    try lsa_fast.forward(seq[35..36], 0);
+    try lsa_bf16_ref.rewind(35);
+    try lsa_bf16_ref.forward(seq[35..36], 0);
+    try lsa_ref.rewind(35);
+    try lsa_ref.forward(seq[35..36], 0);
+    for (ref_r3_pre, try lsa_ref.logits(0), try lsa_bf16_ref.logits(0), try lsa_fast.logits(0), seq_step_logits[3]) |rpre, rpost, bv, fv, sv| {
+        try std.testing.expect(std.math.isFinite(fv));
+        try std.testing.expectApproxEqAbs(rpre, rpost, 1e-5);
+        try std.testing.expectApproxEqAbs(sv, fv, 1e-4);
+        try std.testing.expectApproxEqAbs(bv, fv, 1e-3);
+    }
+
+    // 2. Cross-loop LSA block reuse preserves close finite logits with strictly fewer dispatches (including d2_gate).
+    var eng_no_reuse = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 32,
+        .relative_stripes = true,
+        .relative_long_fast = true,
+        .relative_inline_bias = true,
+        .fuse_relative_gate = true,
+        .fuse_qkvr_prep = true,
+        .store_pack_bf16 = true,
+        .fuse_bf16_cast = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .d2_gate = true,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 16,
+        .lsa_cross_loop_reuse = false,
+    }, 64);
+    defer eng_no_reuse.deinit();
+    var eng_reuse = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 32,
+        .relative_stripes = true,
+        .relative_long_fast = true,
+        .relative_inline_bias = true,
+        .fuse_relative_gate = true,
+        .fuse_qkvr_prep = true,
+        .store_pack_bf16 = true,
+        .fuse_bf16_cast = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .d2_gate = true,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 16,
+        .lsa_cross_loop_reuse = true,
+    }, 64);
+    defer eng_reuse.deinit();
+
+    var disp_no: u64 = 0;
+    var disp_yes: u64 = 0;
+    try eng_no_reuse.forward(seq[0..32], 31);
+    disp_no += eng_no_reuse.last.dispatches;
+    try eng_no_reuse.forward(seq[32..40], 0);
+    disp_no += eng_no_reuse.last.dispatches;
+    try eng_no_reuse.forward(seq[40..41], 0);
+    disp_no += eng_no_reuse.last.dispatches;
+    try eng_no_reuse.forward(seq[41..42], 0);
+    disp_no += eng_no_reuse.last.dispatches;
+    const no_reuse_logits = try a.dupe(f32, try eng_no_reuse.logits(0));
+    try eng_no_reuse.d2Settle();
+
+    try eng_reuse.forward(seq[0..32], 31);
+    disp_yes += eng_reuse.last.dispatches;
+    try eng_reuse.forward(seq[32..40], 0);
+    disp_yes += eng_reuse.last.dispatches;
+    try eng_reuse.forward(seq[40..41], 0);
+    disp_yes += eng_reuse.last.dispatches;
+    try eng_reuse.forward(seq[41..42], 0);
+    disp_yes += eng_reuse.last.dispatches;
+
+    const reuse_logits = try a.dupe(f32, try eng_reuse.logits(0));
+    try eng_reuse.d2Settle();
+    try std.testing.expect(disp_yes < disp_no);
+    for (no_reuse_logits, reuse_logits) |nv, yv| {
+        try std.testing.expect(std.math.isFinite(yv));
+        try std.testing.expectApproxEqAbs(nv, yv, 0.25);
+    }
+
+    var eng_reuse_sync = try Engine.init(gpa, &p, ctx, &store, .{
+        .batch = 32,
+        .relative_stripes = true,
+        .relative_long_fast = true,
+        .relative_inline_bias = true,
+        .fuse_relative_gate = true,
+        .fuse_qkvr_prep = true,
+        .store_pack_bf16 = true,
+        .fuse_bf16_cast = true,
+        .rmsnorm_fast = true,
+        .scratch_reuse = true,
+        .d2_gate = false,
+        .lsa = true,
+        .lsa_budget = 8,
+        .lsa_window = 12,
+        .lsa_coarse_threshold = 16,
+        .lsa_cross_loop_reuse = true,
+    }, 64);
+    defer eng_reuse_sync.deinit();
+    try eng_reuse_sync.forward(seq[0..32], 31);
+    try eng_reuse_sync.forward(seq[32..40], 0);
+    try eng_reuse_sync.forward(seq[40..41], 0);
+    try eng_reuse_sync.forward(seq[41..42], 0);
+    for (try eng_reuse_sync.logits(0), reuse_logits) |sv, rv| {
+        try std.testing.expectApproxEqAbs(sv, rv, 1e-4);
+    }
+
+    // 3. Multi-row LoopCD (rows=5, rows=8) + 2-pass Capture parity across hidden/logits/logits_adaptive.
+    var c2 = c;
+    c2.loop_passes = 2;
+    inline for (.{ LoopCdMode.hidden, LoopCdMode.logits, LoopCdMode.logits_adaptive }) |mode| {
+        var p_cd = try lowerWithOptions(gpa, c2, .{ .loop_passes = 2, .loopcd = mode, .loopcd_omega = 0.7, .loopcd_weak_pass = 1 });
+        defer p_cd.deinit();
+        try std.testing.expectEqual(@as(usize, 37), p_cd.traces.len);
+        var tmp_cd = "/tmp/nano-inkling-cd-XXXXXX".*;
+        const dir_cd = std.mem.span(mkdtemp(&tmp_cd) orelse return error.TempDirectoryFailed);
+        defer _ = rmdir(dir_cd);
+        const path_cd = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir_cd}, 0);
+        defer _ = unlink(path_cd);
+        try writeFixture(a, &p_cd, path_cd);
+        var store_cd = try @import("weights").Store.init(a, ctx, dir_cd, 0);
+        defer store_cd.deinit();
+
+        var cd_ref = try Engine.init(gpa, &p_cd, ctx, &store_cd, .{ .batch = 16 }, 64);
+        defer cd_ref.deinit();
+        var cd_fast = try Engine.init(gpa, &p_cd, ctx, &store_cd, .{
+            .batch = 16,
+            .bf16_linear_tile = true,
+            .bf16_prefill_tile = 8,
+            .bf16_decode_vec = true,
+            .bf16_decode_wide = true,
+            .fuse_bf16_cast = true,
+            .tail_trim = 2,
+            .scratch_reuse = true,
+            .concurrent_scratch = true,
+        }, 64);
+        defer cd_fast.deinit();
+
+        const cap_ids = [_]u32{ 5, 17, 29 };
+        const cap_buf = try ctx.alloc(8 * 4 * c.hidden);
+        defer cap_buf.deinit();
+        var cap5: exec_mod.Capture = .{
+            .trace_indices = &cap_ids,
+            .include_final_norm = true,
+            .row0 = 0,
+            .rows = 5,
+            .dest = cap_buf,
+            .width = c.hidden,
+            .stride = 4 * c.hidden,
+        };
+        cd_fast.capture = &cap5;
+        try cd_ref.forward(seq[0..5], 0);
+        try cd_fast.forward(seq[0..5], 0);
+        cd_fast.capture = null;
+        for (0..5) |r| {
+            for (try cd_ref.logits(@intCast(r)), try cd_fast.logits(@intCast(r))) |ev, av| {
+                try std.testing.expect(std.math.isFinite(av));
+                try std.testing.expectApproxEqAbs(ev, av, 1e-3);
+            }
+        }
+
+        var cap8: exec_mod.Capture = .{
+            .trace_indices = &cap_ids,
+            .include_final_norm = true,
+            .row0 = 0,
+            .rows = 8,
+            .dest = cap_buf,
+            .width = c.hidden,
+            .stride = 4 * c.hidden,
+        };
+        cd_fast.capture = &cap8;
+        try cd_ref.forward(seq[5..13], 0);
+        try cd_fast.forward(seq[5..13], 0);
+        cd_fast.capture = null;
+        for (0..8) |r| {
+            for (try cd_ref.logits(@intCast(r)), try cd_fast.logits(@intCast(r))) |ev, av| {
+                try std.testing.expect(std.math.isFinite(av));
+                try std.testing.expectApproxEqAbs(ev, av, 1e-3);
+            }
+        }
+    }
+}

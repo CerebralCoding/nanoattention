@@ -30,6 +30,7 @@ pub const Config = struct {
     selector_rank: u32,
     selector_top_k: u32,
     selector_softcap_mode: SoftcapMode,
+    num_target_layers: u32,
     target_layer_ids: []u32,
 };
 
@@ -109,6 +110,7 @@ pub fn parseConfig(a: std.mem.Allocator, bytes: []const u8) !Config {
         .selector_rank = try jsonU32(dc.get("selector_rank"), 256),
         .selector_top_k = try jsonU32(dc.get("selector_top_k"), 16),
         .selector_softcap_mode = mode,
+        .num_target_layers = try jsonU32(root.get("num_target_layers"), ids[ids.len - 1]),
         .target_layer_ids = ids,
     };
     if (cfg.block_size < 2 or cfg.hidden_size % cfg.conv_group_size != 0 or cfg.hidden_size % 4 != 0 or cfg.head_dim % 2 != 0 or cfg.head_dim > 256) return error.InvalidDraftConfig;
@@ -240,20 +242,71 @@ pub const Draft = struct {
 
         // Resolve target capture slots.
         const total_ids = cfg.target_layer_ids.len;
+        if (total_ids == 0) return error.InvalidDraftCaptureLayers;
         const traces_len = target.program.traces.len;
         var include_final_norm = false;
         var trace_count = total_ids;
         if (traces_len > 0 and cfg.target_layer_ids[total_ids - 1] == traces_len - 1 and target.program.draft_final_norm != null) {
             include_final_norm = true;
             trace_count = total_ids - 1;
+        } else if (std.mem.eql(u8, target.program.meta.model_type, "inkling2_loop") and
+            traces_len > 1 and cfg.target_layer_ids[total_ids - 1] >= traces_len and
+            cfg.target_layer_ids[total_ids - 1] == cfg.num_target_layers and
+            target.program.draft_final_norm != null)
+        {
+            include_final_norm = true;
+            trace_count = total_ids - 1;
         }
         const trace_indices = try gpa.alloc(u32, trace_count);
         errdefer gpa.free(trace_indices);
-        for (0..trace_count) |i| {
-            const tid = cfg.target_layer_ids[i];
-            if (tid >= traces_len) return error.InvalidDraftCaptureLayers;
-            if (target.program.traces[tid].view.width != cfg.hidden_size) return error.DraftHiddenSizeMismatch;
-            trace_indices[i] = tid;
+        const remapping = traces_len > 1 and std.mem.eql(u8, target.program.meta.model_type, "inkling2_loop") and
+            cfg.target_layer_ids[total_ids - 1] >= traces_len;
+        if (remapping) {
+            if (std.c.getenv("NANO_DFLASH_REMAP")) |raw| {
+                const spec = std.mem.span(raw);
+                if (spec.len > 0) {
+                    var it = std.mem.splitScalar(u8, spec, ',');
+                    var idx: usize = 0;
+                    while (it.next()) |tok| {
+                        const trimmed = std.mem.trim(u8, tok, " \t");
+                        if (trimmed.len == 0 or idx >= trace_count) return error.InvalidDraftCaptureLayers;
+                        const tid = std.fmt.parseInt(u32, trimmed, 10) catch return error.InvalidDraftCaptureLayers;
+                        if (tid >= traces_len) return error.InvalidDraftCaptureLayers;
+                        trace_indices[idx] = tid;
+                        idx += 1;
+                    }
+                    if (idx != trace_count) return error.InvalidDraftCaptureLayers;
+                } else if (traces_len == 37 and trace_count == 3) {
+                    trace_indices[0] = 5;
+                    trace_indices[1] = 17;
+                    trace_indices[2] = 29;
+                } else {
+                    for (0..trace_count) |i| {
+                        const tid = cfg.target_layer_ids[i];
+                        trace_indices[i] = @min(@as(u32, @intCast(traces_len - 1)), @as(u32, @intCast((@as(u64, tid) * (traces_len - 1) + cfg.num_target_layers / 2) / cfg.num_target_layers)));
+                    }
+                }
+            } else if (traces_len == 37 and trace_count == 3) {
+                trace_indices[0] = 5;
+                trace_indices[1] = 17;
+                trace_indices[2] = 29;
+            } else {
+                for (0..trace_count) |i| {
+                    const tid = cfg.target_layer_ids[i];
+                    trace_indices[i] = @min(@as(u32, @intCast(traces_len - 1)), @as(u32, @intCast((@as(u64, tid) * (traces_len - 1) + cfg.num_target_layers / 2) / cfg.num_target_layers)));
+                }
+            }
+            for (trace_indices) |tid| {
+                if (tid >= traces_len) return error.InvalidDraftCaptureLayers;
+                if (target.program.traces[tid].view.width != cfg.hidden_size) return error.DraftHiddenSizeMismatch;
+            }
+        } else {
+            for (0..trace_count) |i| {
+                const tid = cfg.target_layer_ids[i];
+                if (tid >= traces_len) return error.InvalidDraftCaptureLayers;
+                if (target.program.traces[tid].view.width != cfg.hidden_size) return error.DraftHiddenSizeMismatch;
+                trace_indices[i] = tid;
+            }
         }
         if (include_final_norm) {
             if (target.program.draft_final_norm.?.view.width != cfg.hidden_size) return error.DraftHiddenSizeMismatch;

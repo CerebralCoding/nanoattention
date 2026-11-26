@@ -269,6 +269,8 @@ pub const Knobs = struct {
     lsa_window: u32 = 1024,
     /// Middle-context token threshold above which 2-stage coarse->fine selection activates (0 = always 1-stage).
     lsa_coarse_threshold: u32 = 8192,
+    /// Reuse donor loop pass LSA selected block lists across recurrent visits sharing physical weights.
+    lsa_cross_loop_reuse: bool = false,
 
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};

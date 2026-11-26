@@ -350,6 +350,105 @@ kernel void mk_bf16_linear_4x2_softcap_dual_vec8(device const uchar *w [[buffer(
     mk_bf16_softcap_loopcd_impl<true, false>(w, arena, p, gid, lane);
 }
 
+// 1-output-row-per-SIMD dual head linear + BF16 round + tanh softcap for batched LoopCD (rows = 2..8).
+// Preserves exact FMA order of 4x2_softcap_loopcd / _dual bit-for-bit across r = 0..rows-1.
+template <bool Wide, bool Fixed>
+inline void mk_bf16_1xR_softcap_loopcd_impl(device const uchar *w, device float *arena, constant MK &p, uint gid, uint lane) {
+    const uint row = gid / 32u;
+    if (row >= p.m) return;
+    const uint rows = p.rows;
+    const uint xs4 = p.xs / 4u;
+    const uint zs4 = p.zs / 4u;
+    device const float4 *xs_base = (device const float4 *)(arena + p.x + ulong(p.row0) * p.xs);
+    device const float4 *xw_base = (device const float4 *)(arena + p.z + ulong(p.row0) * p.zs);
+    float ps[8] = {};
+    float pw[8] = {};
+    if constexpr (Wide) {
+        const uint wstride = p.n / 8u;
+        device const uint4 *w8 = (device const uint4 *)(w + p.w) + ulong(row) * wstride;
+        for (uint k = lane; k < wstride; k += 32u) {
+            const uint4 raw = w8[k];
+            const ushort4 u0(ushort(raw.x), ushort(raw.x >> 16), ushort(raw.y), ushort(raw.y >> 16));
+            const ushort4 u1(ushort(raw.z), ushort(raw.z >> 16), ushort(raw.w), ushort(raw.w >> 16));
+            const float4 b0 = as_type<float4>(uint4(u0) << 16);
+            const float4 b1 = as_type<float4>(uint4(u1) << 16);
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                if (r < rows) {
+                    const float4 as0 = xs_base[ulong(r) * xs4 + 2u * k];
+                    const float4 as1 = xs_base[ulong(r) * xs4 + 2u * k + 1u];
+                    const float4 aw0 = xw_base[ulong(r) * zs4 + 2u * k];
+                    const float4 aw1 = xw_base[ulong(r) * zs4 + 2u * k + 1u];
+                    ps[r] = fma(as0.x, b0.x, fma(as0.y, b0.y, fma(as0.z, b0.z, fma(as0.w, b0.w, ps[r]))));
+                    ps[r] = fma(as1.x, b1.x, fma(as1.y, b1.y, fma(as1.z, b1.z, fma(as1.w, b1.w, ps[r]))));
+                    pw[r] = fma(aw0.x, b0.x, fma(aw0.y, b0.y, fma(aw0.z, b0.z, fma(aw0.w, b0.w, pw[r]))));
+                    pw[r] = fma(aw1.x, b1.x, fma(aw1.y, b1.y, fma(aw1.z, b1.z, fma(aw1.w, b1.w, pw[r]))));
+                }
+            }
+        }
+    } else {
+        const uint stride = p.n / 4u;
+        device const ushort4 *weights = (device const ushort4 *)(w + p.w) + ulong(row) * stride;
+        #pragma unroll 4
+        for (uint k = lane; k < stride; k += 32u) {
+            const float4 b = as_type<float4>(uint4(weights[k]) << 16);
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                if (r < rows) {
+                    const float4 as = xs_base[ulong(r) * xs4 + k];
+                    const float4 aw = xw_base[ulong(r) * zs4 + k];
+                    #pragma unroll
+                    for (uint i = 0u; i < 4u; ++i) {
+                        ps[r] = fma(as[i], b[i], ps[r]);
+                        pw[r] = fma(aw[i], b[i], pw[r]);
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint r = 0u; r < 8u; ++r) {
+        if (r < rows) {
+            const float sum_s = simd_sum(ps[r]);
+            const float sum_w = simd_sum(pw[r]);
+            if (lane == 0u) {
+                const float ss = tanh(mk_bf16(sum_s) / p.scale) * p.scale;
+                const float sw = tanh(mk_bf16(sum_w) / p.scale) * p.scale;
+                if constexpr (Fixed) {
+                    arena[p.y + ulong(p.row0 + r) * p.ys + row] = (p.eps == 0.0f) ? ss : (ss + p.eps * (ss - sw));
+                } else {
+                    arena[p.y + ulong(p.row0 + r) * p.ys + row] = ss;
+                    arena[p.every + ulong(p.row0 + r) * p.pad_k + row] = sw;
+                }
+            }
+        }
+    }
+}
+
+kernel void mk_bf16_linear_1xR_softcap_loopcd(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                              constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                              uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_1xR_softcap_loopcd_impl<false, true>(w, arena, p, gid, lane);
+}
+
+kernel void mk_bf16_linear_1xR_softcap_loopcd_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                   constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                                   uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_1xR_softcap_loopcd_impl<true, true>(w, arena, p, gid, lane);
+}
+
+kernel void mk_bf16_linear_1xR_softcap_dual(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                            constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                            uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_1xR_softcap_loopcd_impl<false, false>(w, arena, p, gid, lane);
+}
+
+kernel void mk_bf16_linear_1xR_softcap_dual_vec8(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                 constant MK &p [[buffer(8)]], uint gid [[thread_position_in_grid]],
+                                                 uint lane [[thread_index_in_simdgroup]]) {
+    mk_bf16_1xR_softcap_loopcd_impl<true, false>(w, arena, p, gid, lane);
+}
+
 // Coalesced 2-output-row-per-SIMD BF16 linear core for small batches (rows = 2..8).
 // Exact FMA order matches 4x1_vec8 / 4x1_vec / 4x1_softcap bit-for-bit.
 template <bool Wide, bool Softcap>
@@ -2162,7 +2261,7 @@ kernel void mk_inkling_qkvr_dyn_prep_fused(device float *arena [[buffer(0)]], de
 // maxima stored in parts[*][128] are in log2 units and pair with mk_relative_long_merge_fast / _gated.
 #define MK_LONG_FAST_SIMDS 8u
 inline uint mk_long_fast_taps(uint visible) {
-    const uint stripe = (visible <= 2048u) ? 64u : (visible <= 16384u) ? 256u : 512u;
+    const uint stripe = (visible <= 2048u) ? 64u : (visible <= 16384u) ? 256u : (visible <= 524288u) ? 512u : 1024u;
     return (visible + stripe - 1u) / stripe;
 }
 
@@ -2192,7 +2291,7 @@ inline void mk_relative_long_keys_fast_impl(device const float *arena, device co
     float4 q[3];
     #pragma unroll
     for (uint h = 0u; h < 3u; ++h) {
-        q[h] = float4(*(device const packed_float4 *)(arena + p.x + row * p.xs + (h0 + h) * 128u + lane * 4u)) * qscale;
+        q[h] = float4(*(device const packed_float4 *)(arena + p.x + ulong(row) * p.xs + (h0 + h) * 128u + lane * 4u)) * qscale;
     }
 
     const bool stripe_has_rel = (n > 0u) && ((pos - (start + n - 1u)) < p.m);
@@ -2200,7 +2299,7 @@ inline void mk_relative_long_keys_fast_impl(device const float *arena, device co
     const device ushort *rel_w = InlineBias ? reinterpret_cast<const device ushort *>(rel_w_bytes + p.w) : nullptr;
     if constexpr (InlineBias) {
         if (stripe_has_rel && lane < 16u) {
-            const device float *rp = arena + p.z + row * p.zs;
+            const device float *rp = arena + p.z + ulong(row) * p.zs;
             r0 = rp[(h0 + 0u) * 16u + lane];
             r1 = rp[(h0 + 1u) * 16u + lane];
             r2 = rp[(h0 + 2u) * 16u + lane];
@@ -2210,7 +2309,7 @@ inline void mk_relative_long_keys_fast_impl(device const float *arena, device co
     float m[3] = { -INFINITY, -INFINITY, -INFINITY };
     float d[3] = { 0.0f, 0.0f, 0.0f };
     float4 acc[3] = { float4(0.0f), float4(0.0f), float4(0.0f) };
-    device const float *bias_base = InlineBias ? nullptr : (arena + p.z + row * p.zs + h0 * p.m);
+    device const float *bias_base = InlineBias ? nullptr : (arena + p.z + ulong(row) * p.zs + h0 * p.m);
     const uint k_off = kvh * 128u + lane * 4u;
     if (simd < n) {
         const bool linear_slot = (p.window == 0u);
@@ -2329,7 +2428,7 @@ inline void mk_relative_long_merge_impl(device float *arena, device const float 
     const uint visible = p.window ? min(p.window, pos + 1u) : pos + 1u;
     const uint row_taps = (p.rows == 1u || (p.flags & MK_FIXED_TAPS) != 0u) ? p.taps : mk_long_fast_taps(visible);
     device const float *src = parts + (ulong(r) * p.heads + h) * p.taps * 130u;
-    const float sink = arena[p.s + row * p.every + h] * M_LOG2E_F;
+    const float sink = arena[p.s + ulong(row) * p.every + h] * M_LOG2E_F;
     float m = -INFINITY;
     for (uint k = tid; k < row_taps; k += 128u) m = max(m, src[ulong(k) * 130u + 128u]);
     m = simd_max(m);
@@ -2353,10 +2452,10 @@ inline void mk_relative_long_merge_impl(device float *arena, device const float 
     float val = acc / denominator;
     if constexpr (Gated) {
         if (p.flags & MK_ROUND_BF16) val = mk_bf16(val);
-        const float res = val * mk_sigmoid(arena[p.z + row * p.zs + h * 128u + tid]);
-        arena[p.y + row * p.ys + h * 128u + tid] = (p.flags & MK_ROUND_OUT) ? mk_bf16(res) : res;
+        const float res = val * mk_sigmoid(arena[p.z + ulong(row) * p.zs + h * 128u + tid]);
+        arena[p.y + ulong(row) * p.ys + h * 128u + tid] = (p.flags & MK_ROUND_OUT) ? mk_bf16(res) : res;
     } else {
-        arena[p.y + row * p.ys + h * 128u + tid] = (p.flags & MK_ROUND_OUT) ? mk_bf16(val) : val;
+        arena[p.y + ulong(row) * p.ys + h * 128u + tid] = (p.flags & MK_ROUND_OUT) ? mk_bf16(val) : val;
     }
 }
 
