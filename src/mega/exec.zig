@@ -581,7 +581,7 @@ pub const Engine = struct {
             }
             for (program.traces) |t| users[t.view.state] += 1;
             for (program.ops) |op| switch (op) {
-                .relative_attention => |a| if (a.dim == 128 and hs[a.keys] != null and hs[a.values] != null and users[a.bias.state] == 2) {
+                .relative_attention => |a| if (a.relative_extent > 0 and a.dim == 128 and hs[a.keys] != null and hs[a.values] != null and users[a.bias.state] == 2) {
                     if (bias16_ok) |ok| if (!(knobs.lsa and a.window == 0)) {
                         ok[a.bias.state] = true;
                     };
@@ -802,6 +802,59 @@ pub const Engine = struct {
         self.out_first = 0;
         self.out_end = 0;
         if (self.lsa_scratch) |b| @memset(std.mem.sliceAsBytes(b.floats()), 0);
+    }
+
+    /// Rebuild derived BF16 mirrors and Q4 LSA pooled blocks after loading KV/ring states.
+    pub fn syncDerivedCaches(self: *Engine, position: u32) !void {
+        try self.d2Settle();
+        if (self.relative_half) |hs| {
+            for (self.program.states, 0..) |s, id| {
+                const half_buf = hs[id] orelse continue;
+                const src_buf = self.caches[id] orelse return error.MissingBackingCache;
+                const src = src_buf.floats();
+                const dst = half_buf.structs(u16);
+                const cap = s.capacity(self.batch, self.context);
+                const width: usize = s.width;
+                const n_pack: usize = if (s.kind == .sequence) @min(position, cap) else cap;
+                for (0..n_pack) |slot| {
+                    const s_row = src[slot * width ..][0..width];
+                    const d_row = dst[slot * width ..][0..width];
+                    for (s_row, d_row) |v, *h| h.* = @truncate(@as(u32, @bitCast(v)) >> 16);
+                }
+                const tail_start: usize = @min(n_pack, @as(usize, cap) + mirror_pad);
+                const mirror_end: usize = (@as(usize, cap) + mirror_pad) * width;
+                if (tail_start * width < mirror_end) {
+                    @memset(dst[tail_start * width .. mirror_end], 0);
+                }
+                const m_rows = @min(cap, mirror_pad);
+                if (m_rows > 0) {
+                    @memcpy(dst[@as(usize, cap) * width ..][0 .. m_rows * width], dst[0 .. m_rows * width]);
+                }
+            }
+        }
+        if (self.lsa_layers) |ls| {
+            self.position = 0;
+            var ran_lsa = false;
+            for (ls, 0..) |entry, id| {
+                const layer = entry orelse continue;
+                @memset(std.mem.sliceAsBytes(layer.fine.floats()), 0);
+                if (layer.coarse) |c| @memset(std.mem.sliceAsBytes(c.floats()), 0);
+                if (position >= 4) {
+                    try self.encodeLsaPool(@intCast(id), 0, position);
+                    ran_lsa = true;
+                }
+            }
+            if (ran_lsa) {
+                try self.ctx.finish();
+                self.force_barrier = false;
+            }
+        }
+        if (self.lsa_scratch) |b| @memset(std.mem.sliceAsBytes(b.floats()), 0);
+        self.position = position;
+        self.failed = false;
+        self.d2_last = null;
+        self.out_first = 0;
+        self.out_end = 0;
     }
 
     /// decode climb 2 (knob d2_gate): open a gate still waiting (its forward runs on
@@ -1561,7 +1614,7 @@ pub const Engine = struct {
                 p.taps = if (g.causal_prefix) @min(p.m, self.position + row0 + rows) else p.m;
                 if (self.knobs.bf16_prefill_tile != 0 and rows % 4 == 0 and p.dim == 16 and w.tensor.dtype == .bf16 and p.w % 2 == 0) {
                     // knobs.relative_bias16: a chunk's bias for the staged tiles, as 16-bit words.
-                    const pack16 = if (self.bias16_ok) |ok| ok[g.out.state] and g.causal_prefix and g.round == .bf16 and rows >= min_tile_rows else false;
+                    const pack16 = if (self.bias16_ok) |ok| ok[g.out.state] and g.causal_prefix and g.round == .bf16 and rows >= min_tile_rows and self.tap == null else false;
                     if (pack16) self.bias16 = .{ .state = g.out.state, .row0 = row0, .rows = rows };
                     if (self.knobs.relative_bias_d8 and p.m % 8 == 0) {
                         try gpu.dispatch(self.ctx, if (pack16) "mk_grouped_project_bf16d8_pack" else "mk_grouped_project_bf16d8", &.{ self.arena, w.buffer }, &p, @as(usize, rows / 2) * g.groups * ((p.taps + 7) / 8), 256);
@@ -2847,35 +2900,54 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 try self.encode(ops[i + 3], row0, rows);
             }
         },
-        .qkvr_sconv_prep => |i| try encodeQkvrPrep(self, true, i, row0, rows),
-        .qkvr_dyn_prep => |i| try encodeQkvrPrep(self, false, i, row0, rows),
+        .qkvr_sconv_prep => |i| try encodeQkvrPrep(self, true, true, i, row0, rows),
+        .qkvr_dyn_prep => |i| try encodeQkvrPrep(self, false, true, i, row0, rows),
+        .qkv_sconv_prep => |i| try encodeQkvrPrep(self, true, false, i, row0, rows),
+        .qkv_dyn_prep => |i| try encodeQkvrPrep(self, false, false, i, row0, rows),
     }
 }
 
-fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: u32) !void {
+fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, comptime has_r: bool, i: u32, row0: u32, rows: u32) !void {
     const ops = self.program.ops;
-    const ops_len: usize = if (sconv) 15 else 13;
+    const ops_len: usize = if (sconv) (if (has_r) 15 else 12) else (if (has_r) 13 else 9);
     const tail = if (sconv) i + 4 else i;
     const nv = ops[tail].rmsnorm;
     const cl_q = ops[tail + 2].l2_clip;
     const cl_k = ops[tail + 4].l2_clip;
-    const cl_r = ops[tail + 6].l2_clip;
     const gp_idx = if (sconv) i + 12 else i + 10;
-    const st_k = ops[gp_idx + 1].store;
-    const st_v = ops[gp_idx + 2].store;
+    const st_off = if (has_r) gp_idx + 1 else tail + 6 + @intFromBool(!sconv);
+    const st_k = ops[st_off].store;
+    const st_v = ops[st_off + 1].store;
     const q = self.words(cl_q.x);
-    const r = self.words(cl_r.x);
     const dim = cl_q.group;
     const heads = cl_q.x.width / dim;
     const kv_heads = st_k.src.width / dim;
-    const rel_dim = cl_r.group;
     const wq = self.bound[cl_q.scale.?];
-    const wr = self.bound[cl_r.scale.?];
     const keys_cap = self.program.states[st_k.dst].capacity(self.batch, self.context);
     const vals_cap = self.program.states[st_v.dst].capacity(self.batch, self.context);
-    var can_fuse = self.tap == null and self.relative_half != null and dim == 128 and rel_dim == 16 and
-        wq.quant == null and wq.tensor.dtype.isFloat() and wr.quant == null and wr.tensor.dtype.isFloat() and
-        q.off % 4 == 0 and q.stride % 4 == 0 and r.off % 4 == 0 and r.stride % 4 == 0;
+    var can_fuse = self.tap == null and self.relative_half != null and dim == 128 and
+        wq.quant == null and wq.tensor.dtype.isFloat() and
+        q.off % 4 == 0 and q.stride % 4 == 0;
+    var r_off: u32 = 0;
+    var r_stride: u32 = 0;
+    var rel_dim: u32 = 0;
+    var wr_w: usize = 0;
+    var wr_dtype: u32 = 0;
+    var wr_thresh: u32 = 0;
+    var wr_buf = wq.buffer;
+    if (has_r) {
+        const cl_r = ops[tail + 6].l2_clip;
+        const r = self.words(cl_r.x);
+        const wr = self.bound[cl_r.scale.?];
+        r_off = r.off;
+        r_stride = r.stride;
+        rel_dim = cl_r.group;
+        wr_w = wr.tensor.offset;
+        wr_dtype = @backingInt(wr.tensor.dtype);
+        wr_thresh = @bitCast(cl_r.threshold);
+        wr_buf = wr.buffer;
+        if (rel_dim != 16 or wr.quant != null or !wr.tensor.dtype.isFloat() or r.off % 4 != 0 or r.stride % 4 != 0) can_fuse = false;
+    }
     var half_k: metal.Buffer = undefined;
     var half_v: metal.Buffer = undefined;
     if (can_fuse) {
@@ -2889,8 +2961,8 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
         .pos = self.position,
         .x = q.off,
         .xs = q.stride,
-        .y = r.off,
-        .ys = r.stride,
+        .y = r_off,
+        .ys = r_stride,
         .heads = heads,
         .kv_heads = kv_heads,
         .dim = dim,
@@ -2900,7 +2972,8 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
         .eps = nv.eps,
     } };
     x.mat[0] = .{ .w = wq.tensor.offset, .sdtype = @backingInt(wq.tensor.dtype), .m = @bitCast(cl_q.threshold) };
-    x.mat[1] = .{ .w = wr.tensor.offset, .sdtype = @backingInt(wr.tensor.dtype), .m = @bitCast(cl_r.threshold), .pad = @bitCast(cl_k.threshold) };
+    x.mat[1] = .{ .w = wr_w, .sdtype = wr_dtype, .m = wr_thresh, .pad = @bitCast(cl_k.threshold) };
+    const unit_heads = if (has_r) 2 * heads else heads;
 
     if (can_fuse) {
         if (sconv) {
@@ -2913,7 +2986,7 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
             const wk = self.bound[c_k.weight];
             const wv = self.bound[c_v.weight];
             if (wk.quant != null or !wk.tensor.dtype.isFloat() or wv.quant != null or !wv.tensor.dtype.isFloat() or
-                wk.buffer.handle != wv.buffer.handle or wk.buffer.handle != wq.buffer.handle or wk.buffer.handle != wr.buffer.handle or
+                wk.buffer.handle != wv.buffer.handle or wk.buffer.handle != wq.buffer.handle or (has_r and wk.buffer.handle != wr_buf.handle) or
                 kin.off % 4 != 0 or kin.stride % 4 != 0 or vin.off % 4 != 0 or vin.stride % 4 != 0 or
                 k_ring_cap < c_k.taps or v_ring_cap < c_v.taps or
                 (self.position + row0 != 0 and (k_ring_cap < rows + c_k.taps - 1 or v_ring_cap < rows + c_v.taps - 1)))
@@ -2924,7 +2997,7 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
                 x.p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c_k.taps + 1)));
                 x.mat[2] = .{ .w = wk.tensor.offset, .sdtype = @backingInt(wk.tensor.dtype), .m = k_ring_cap, .y = kin.off, .ys = kin.stride };
                 x.mat[3] = .{ .w = wv.tensor.offset, .sdtype = @backingInt(wv.tensor.dtype), .m = v_ring_cap, .y = vin.off, .ys = vin.stride };
-                const total_threads = @as(usize, rows) * (2 * heads + 2 * kv_heads) * 32;
+                const total_threads = @as(usize, rows) * (unit_heads + 2 * kv_heads) * 32;
                 const tg: usize = if (rows == 1) 32 else 128;
                 try gpu.dispatch(self.ctx, "mk_inkling_qkvr_sconv_fused", &.{
                     self.arena, self.caches[c_k.src].?, self.caches[c_v.src].?,
@@ -2934,7 +3007,7 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
         } else {
             const ck_v = self.words(cl_k.x);
             const cv_v = self.words(nv.x);
-            const tau = ops[i + 8].row_transform.transform.log_position_scale;
+            const tau = ops[if (has_r) i + 8 else i + 6].row_transform.transform.log_position_scale;
             if (ck_v.off % 4 != 0 or ck_v.stride % 4 != 0 or cv_v.off % 4 != 0 or cv_v.stride % 4 != 0) {
                 can_fuse = false;
             } else {
@@ -2942,10 +3015,10 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
                 x.p.scale = tau.alpha;
                 x.mat[2] = .{ .y = ck_v.off, .ys = ck_v.stride };
                 x.mat[3] = .{ .y = cv_v.off, .ys = cv_v.stride };
-                const total_threads = @as(usize, rows) * (2 * heads + 2 * kv_heads) * 32;
+                const total_threads = @as(usize, rows) * (unit_heads + 2 * kv_heads) * 32;
                 const tg: usize = if (rows == 1) 32 else 128;
                 try gpu.dispatch(self.ctx, "mk_inkling_qkvr_dyn_prep_fused", &.{
-                    self.arena, self.caches[st_k.dst].?, half_k, self.caches[st_v.dst].?, half_v, wq.buffer, wr.buffer,
+                    self.arena, self.caches[st_k.dst].?, half_k, self.caches[st_v.dst].?, half_v, wq.buffer, wr_buf,
                 }, &x, total_threads, tg);
             }
         }
@@ -2953,6 +3026,7 @@ fn encodeQkvrPrep(self: *Engine, comptime sconv: bool, i: u32, row0: u32, rows: 
     if (can_fuse) {
         if (!sconv) try self.encodeLsaPool(st_k.dst, row0, rows);
         self.ctx.nano_dispatch_flags = null;
+        if (!has_r) return;
         const gp_row0 = if (!self.cur_traced and self.tap == null) if (self.op_needs) |needs| @min(row0 + rows, needs[gp_idx].firstRow(self.cur_T, self.cur_out_first, self.knobs.tail_trim)) else row0 else row0;
         if (gp_row0 < row0 + rows) try self.encode(ops[gp_idx], gp_row0, row0 + rows - gp_row0);
         return;

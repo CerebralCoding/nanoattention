@@ -1125,7 +1125,7 @@ inline void mk_inkling_qkvr_prep_impl(device float *arena, device float *k_ring,
                                       device const uchar *wk_w, device const uchar *wv_w,
                                       constant MKX &x, uint gid, uint lane) {
     constant MK &p = x.p;
-    const uint units = 2u * p.heads + 2u * p.kv_heads;
+    const uint units = (p.rot > 0u ? 2u : 1u) * p.heads + 2u * p.kv_heads;
     const uint simd_id = gid / 32u;
     const uint r = simd_id / units;
     if (r >= p.rows) return;

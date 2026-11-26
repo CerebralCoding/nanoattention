@@ -8,25 +8,28 @@ const frontend = @import("frontend.zig");
 const session = @import("session.zig");
 const bench = @import("bench.zig");
 const io = @import("io.zig");
+const kv_cartridge = @import("kv_cartridge.zig");
 const Knobs = @import("knobs.zig").Knobs;
 const weights = @import("weights");
 
 const usage =
     \\nano: model-agnostic Zig + Metal megakernel (Apple Silicon)
     \\  nano inspect CHECKPOINT
+    \\  nano encode CHECKPOINT --tokens-file F --kv-out PATH [--kv-in BASE.nkv] [--kv-dtype f32|bf16] [--hidden-out PATH] [--feed T]
     \\  nano eval CHECKPOINT --tokens-file F [--feed T] [--positions-file F | --positions all|i,j,..]
     \\        [--logits-out PATH] [--hidden-out PATH] [--greedy N] [--heads-out PATH [--heads-from POS] [--attention-out PATH]]
     \\  nano generate CHECKPOINT --tokens-file F [--max-tokens N]
-    \\  nano session CHECKPOINT [--context N]
+    \\  nano session CHECKPOINT [--context N] [--kv-in PATH]
     \\  nano mlx-op linear --m M --k K --n N --group G --weights W --x X --out Y  (src/mega/mlxop.zig)
     \\  nano bench CHECKPOINT --prompt-tokens N [--decode-tokens 256] [--repeats 3] [--bench-tokens F]
     \\        [--decode-mode teacher-forced|greedy | --bench-greedy 1] [--profile-decode 1]
     \\  nano attnbench [REPEATS] [KEYS...] [rows=N]  (Inkling relative attention on synthetic K/V)
     \\Common: --context N (default 4096), --knobs FILE.json, --knob name=value (repeatable,
-    \\        applied after --knobs),
+    \\        applied after --knobs), --kv-in PATH, --kv-out PATH, --kv-dtype f32|bf16,
     \\        --sliding-visible N, --embed-round none|bf16,
     \\        --loop-passes 1..N, --loopcd off|hidden|logits|logits-adaptive,
-    \\        --loopcd-omega W (default 1.0), --loopcd-weak-pass N (default 1).
+    \\        --loopcd-omega W (default 1.0), --loopcd-weak-pass N (default 1),
+    \\        --nope off|global|all.
     \\Token files are a JSON array or {"tokens":[...]}. eval feeds T tokens per
     \\forward (default 1) and writes raw little-endian float32: logits
     \\[positions, vocab] and residual streams [traces, tokens, width].
@@ -110,6 +113,9 @@ pub fn main(init: std.process.Init) !void {
     var heads_out: ?[]const u8 = null;
     var heads_from: u32 = 0;
     var attention_out: ?[]const u8 = null;
+    var kv_in: ?[]const u8 = null;
+    var kv_out: ?[]const u8 = null;
+    var kv_dtype: kv_cartridge.DType = .f32;
     var max_tokens: u32 = 32;
     var bench_input: bench.Input = .{};
     // --knob flags apply after --knobs FILE whatever their order on the line.
@@ -135,6 +141,8 @@ pub fn main(init: std.process.Init) !void {
             if (!std.math.isFinite(common.options.loopcd_omega) or common.options.loopcd_omega < 0) return error.InvalidLoopCdOmega;
         } else if (std.mem.eql(u8, flag, "--loopcd-weak-pass")) {
             common.options.loopcd_weak_pass = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--nope")) {
+            common.options.nope = frontend.parseNoPeMode(value) orelse return error.InvalidNoPeMode;
         } else if (std.mem.eql(u8, flag, "--tokens-file")) {
             tokens = try parseTokens(a, try loader.readFile(a, value), "tokens");
         } else if (std.mem.eql(u8, flag, "--tokens")) {
@@ -178,6 +186,12 @@ pub fn main(init: std.process.Init) !void {
             bench_input.decode_detail = std.mem.eql(u8, value, "1"); // decode climb 2
         } else if (std.mem.eql(u8, flag, "--repeats")) {
             bench_input.repeats = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--kv-in")) {
+            kv_in = value;
+        } else if (std.mem.eql(u8, flag, "--kv-out")) {
+            kv_out = value;
+        } else if (std.mem.eql(u8, flag, "--kv-dtype")) {
+            kv_dtype = kv_cartridge.parseDType(value) orelse return error.InvalidKvDType;
         } else {
             std.debug.print("Unknown flag {s}\n", .{flag});
             return error.UnknownFlag;
@@ -196,11 +210,15 @@ pub fn main(init: std.process.Init) !void {
         gpa.destroy(loaded);
     }
     std.debug.print("nano: {s}, {d} ops, {d} states, context={d}, batch={d}, {d} mapped bytes\n", .{ loaded.program.meta.model_type, loaded.program.ops.len, loaded.program.states.len, loaded.engine.context, loaded.engine.batch, loaded.store.bytes });
-    if (std.mem.eql(u8, command, "session")) return session.run(&loaded.engine, gpa);
+    if (std.mem.eql(u8, command, "session")) {
+        if (kv_in) |path| _ = try kv_cartridge.load(&loaded.engine, a, path);
+        return session.run(&loaded.engine, gpa);
+    }
     if (std.mem.eql(u8, command, "bench")) return bench.run(&loaded.engine, a, bench_input, common.knobs);
     const prompt = tokens orelse return error.MissingTokens;
     if (prompt.len == 0) return error.EmptyPrompt;
-    if (std.mem.eql(u8, command, "generate")) return generate(&loaded.engine, a, prompt, max_tokens);
+    if (std.mem.eql(u8, command, "encode")) return encodeCartridge(&loaded.engine, a, prompt, feed, kv_in, kv_out orelse return error.MissingKvOut, kv_dtype, hidden_out);
+    if (std.mem.eql(u8, command, "generate")) return generate(&loaded.engine, a, prompt, max_tokens, kv_in, kv_out, kv_dtype);
     if (std.mem.eql(u8, command, "eval")) {
         var positions: []u32 = undefined;
         if (positions_file) |f| {
@@ -214,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
             while (iter.next()) |item| try list.append(a, try std.fmt.parseInt(u32, item, 10));
             positions = list.items;
         }
-        return evaluate(&loaded.engine, a, prompt, positions, feed, logits_out, hidden_out, greedy, heads_out, heads_from, attention_out);
+        return evaluate(&loaded.engine, a, prompt, positions, feed, logits_out, hidden_out, greedy, heads_out, heads_from, attention_out, kv_in, kv_out, kv_dtype);
     }
     return error.UnknownCommand;
 }
@@ -271,8 +289,57 @@ fn isEos(engine: *const exec.Engine, token: u32) bool {
     return std.mem.indexOfScalar(u32, engine.program.meta.eos, token) != null;
 }
 
-fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max_tokens: u32) !void {
-    const required: u64 = @as(u64, prompt.len) + if (max_tokens == 0) 0 else max_tokens - 1;
+fn encodeCartridge(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, feed_arg: u32, kv_in: ?[]const u8, kv_out: []const u8, kv_dtype: kv_cartridge.DType, hidden_out: ?[]const u8) !void {
+    if (kv_in) |path| _ = try kv_cartridge.load(engine, a, path);
+    const base_pos = engine.position;
+    const T: u32 = @intCast(prompt.len);
+    if (@as(u64, base_pos) + T > engine.context) return error.ContextExhausted;
+    const feed = if (feed_arg == 1) engine.batch else if (feed_arg > engine.batch and engine.batch == engine.context) engine.batch else feed_arg;
+    if (feed == 0 or feed > engine.batch) return error.InvalidFeed;
+
+    const traces = engine.program.traces;
+    var width: u32 = 0;
+    for (traces) |t| width = @max(width, t.view.width);
+    const hidden: ?[]f32 = if (hidden_out != null) try a.alloc(f32, traces.len * @as(usize, T) * width) else null;
+    const chunk_trace: ?[]f32 = if (hidden_out != null) try a.alloc(f32, traces.len * @as(usize, feed) * width) else null;
+
+    const enc_start = try io.now();
+    var i: u32 = 0;
+    while (i < T) {
+        const n = @min(feed, T - i);
+        try engine.forwardTraced(prompt[i..][0..n], n, if (chunk_trace) |c| .{ .data = c, .width = width } else null);
+        if (hidden) |h| for (0..traces.len) |l| for (0..n) |r| {
+            @memcpy(h[(l * T + i + r) * width ..][0..width], chunk_trace.?[(l * n + r) * width ..][0..width]);
+        };
+        i += n;
+    }
+    const encode_seconds = try io.now() - enc_start;
+
+    if (hidden_out) |path| try io.writeFile(a, path, std.mem.sliceAsBytes(hidden.?));
+    const save_start = try io.now();
+    const saved = try kv_cartridge.save(engine, a, kv_out, kv_dtype, "{}");
+    const save_seconds = try io.now() - save_start;
+
+    const summary = .{
+        .tokens = T,
+        .base_position = base_pos,
+        .position = saved.position,
+        .encode_seconds = encode_seconds,
+        .tokens_per_second = if (encode_seconds > 0) @as(f64, @floatFromInt(T)) / encode_seconds else 0,
+        .save_seconds = save_seconds,
+        .kv_bytes = saved.bytes,
+        .dtype = saved.dtype.name(),
+        .states = saved.states,
+        .traces = traces.len,
+        .trace_width = width,
+    };
+    try io.out(try std.json.Stringify.valueAlloc(a, summary, .{}));
+    try io.out("\n");
+}
+
+fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max_tokens: u32, kv_in: ?[]const u8, kv_out: ?[]const u8, kv_dtype: kv_cartridge.DType) !void {
+    if (kv_in) |path| _ = try kv_cartridge.load(engine, a, path);
+    const required: u64 = @as(u64, engine.position) + prompt.len + if (max_tokens == 0) 0 else max_tokens - 1;
     if (required > engine.context) return error.ContextExhausted;
     var row = try prefill(engine, prompt);
     var out: std.ArrayList(u32) = .empty;
@@ -285,11 +352,14 @@ fn generate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, max
             row = 0;
         }
     }
+    if (kv_out) |path| _ = try kv_cartridge.save(engine, a, path, kv_dtype, "{}");
     try io.out(try std.json.Stringify.valueAlloc(a, .{ .tokens = out.items }, .{}));
     try io.out("\n");
 }
 
-fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, positions: []const u32, feed_arg: u32, logits_out: ?[]const u8, hidden_out: ?[]const u8, greedy: u32, heads_out: ?[]const u8, heads_from: u32, attention_out: ?[]const u8) !void {
+fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, positions: []const u32, feed_arg: u32, logits_out: ?[]const u8, hidden_out: ?[]const u8, greedy: u32, heads_out: ?[]const u8, heads_from: u32, attention_out: ?[]const u8, kv_in: ?[]const u8, kv_out: ?[]const u8, kv_dtype: kv_cartridge.DType) !void {
+    if (kv_in) |path| _ = try kv_cartridge.load(engine, a, path);
+    const base_pos = engine.position;
     // A feed beyond a context-clamped batch (engine.batch == context >= prompt)
     // means the whole prompt in one forward; it was rejected as InvalidFeed,
     // which made QD admission reject every batch > context (prefill search).
@@ -300,7 +370,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
         if (p >= T) return error.InvalidLogitPosition;
         if (i > 0 and p <= positions[i - 1]) return error.PositionsNotIncreasing;
     }
-    if (@as(u64, T) + greedy > engine.context) return error.ContextExhausted;
+    if (@as(u64, base_pos) + T + greedy > engine.context) return error.ContextExhausted;
     const vocab = engine.program.meta.vocab;
     const logits = try a.alloc(f32, positions.len * vocab);
     const top1 = try a.alloc(u32, positions.len);
@@ -315,7 +385,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
     var i: u32 = 0;
     // --heads-out: from position `heads_from` on, one row a forward with the engine's tap on
     // (what each attention visit's heads and each router did); before it, the usual feed.
-    var tap: exec.Tap = .{ .gpa = a, .attention = attention_out != null, .context = T };
+    var tap: exec.Tap = .{ .gpa = a, .attention = attention_out != null, .context = base_pos + T };
     defer engine.tap = null;
     while (i < T) {
         var n = @min(feed, T - i);
@@ -361,6 +431,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
         try io.writeFile(a, path, std.mem.sliceAsBytes(tap.weights.items));
         try io.writeFile(a, try std.fmt.allocPrint(a, "{s}.sink", .{path}), std.mem.sliceAsBytes(tap.sinks.items));
     }
+    if (kv_out) |path| _ = try kv_cartridge.save(engine, a, path, kv_dtype, "{}");
     const summary = .{
         .tap_forwards = tap.forwards,
         .tap_context = tap.context,
@@ -368,6 +439,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
         .tap_heads = tap.heads,
         .tap_top_k = tap.top_k,
         .tap_windows = tap.windows.items,
+        .base_position = base_pos,
         .tokens = T,
         .feed = feed,
         .positions = positions,
@@ -390,6 +462,7 @@ test {
     _ = @import("packed.zig");
     _ = @import("knobs.zig");
     _ = @import("session.zig");
+    _ = @import("kv_cartridge.zig");
     _ = @import("kernel_tests.zig");
 }
 test { _ = @import("plan.zig"); }

@@ -380,9 +380,9 @@ pub const Program = struct {
                 try self.checkView(a.out, .scratch);
                 const k = try self.checkCache(a.keys);
                 const v = try self.checkCache(a.values);
-                if (a.kv_heads == 0 or a.heads % a.kv_heads != 0 or a.dim == 0 or a.dim > 256 or a.relative_extent == 0) return error.ShapeMismatch;
+                if (a.kv_heads == 0 or a.heads % a.kv_heads != 0 or a.dim == 0 or a.dim > 256) return error.ShapeMismatch;
                 if (a.q.width != a.heads * a.dim or a.out.width != a.q.width or
-                    a.bias.width != a.heads * a.relative_extent or a.sink.width != a.heads or
+                    (a.relative_extent != 0 and a.bias.width != a.heads * a.relative_extent) or a.sink.width != a.heads or
                     k.width != a.kv_heads * a.dim or v.width != k.width or k.kind != v.kind or !(a.scale > 0)) return error.ShapeMismatch;
                 if (k.kind == .ring and (a.window == 0 or k.horizon + 1 < a.window or v.horizon != k.horizon)) return error.RingTooShort;
                 if (a.out.state == a.q.state or a.out.state == a.bias.state or a.out.state == a.sink.state) return error.AttentionAliasing;

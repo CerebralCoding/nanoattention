@@ -307,12 +307,14 @@ test "Inkling2 rejects unsupported loop geometry" {
 // Checkpoint names and math pinned to the released safetensors header and the
 // Inkling 2 Mini MLX reference (jundot/mlx-lm 0c4c99192230f).
 pub const LoopCdMode = enum { off, hidden, logits, logits_adaptive };
+pub const NoPeMode = enum { off, global, all };
 
 pub const Options = struct {
     loop_passes: ?u32 = null,
     loopcd: LoopCdMode = .off,
     loopcd_omega: f32 = 1.0,
     loopcd_weak_pass: u32 = 1,
+    nope: NoPeMode = .off,
 };
 
 pub fn parseLoopCdMode(value: []const u8) ?LoopCdMode {
@@ -320,6 +322,13 @@ pub fn parseLoopCdMode(value: []const u8) ?LoopCdMode {
     if (std.mem.eql(u8, value, "hidden")) return .hidden;
     if (std.mem.eql(u8, value, "logits")) return .logits;
     if (std.mem.eql(u8, value, "logits-adaptive") or std.mem.eql(u8, value, "logits_adaptive")) return .logits_adaptive;
+    return null;
+}
+
+pub fn parseNoPeMode(value: []const u8) ?NoPeMode {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "global")) return .global;
+    if (std.mem.eql(u8, value, "all")) return .all;
     return null;
 }
 
@@ -346,6 +355,7 @@ pub fn buildWithOptions(gpa: std.mem.Allocator, bytes: []const u8, options: Opti
 const Lowering = struct {
     b: *ir.Builder,
     c: Config,
+    nope: NoPeMode = .off,
 
     fn scratch(self: Lowering, name: []const u8, width: u32) !ir.View {
         return self.b.view(try self.b.state(.{ .name = name, .kind = .scratch, .width = width }));
@@ -430,10 +440,11 @@ const Lowering = struct {
         const c = self.c;
         const layer = v.weight_layer;
         const global = c.layers[layer] == .global;
+        const nope = self.nope == .all or (self.nope == .global and global);
         const q_dim = c.heads * c.head_dim;
         const kv_dim = c.kv_heads * c.head_dim;
         const q = try self.layerDense(layer, inputs[0], "attn.wq_du.weight", q_dim, .bf16);
-        const r = try self.layerDense(layer, inputs[0], "attn.wr_du.weight", c.heads * c.rel_dim, .bf16);
+        const r = if (nope) null else try self.layerDense(layer, inputs[0], "attn.wr_du.weight", c.heads * c.rel_dim, .bf16);
         const gate = try self.layerDense(layer, inputs[0], "attn.gate_attn.weight", q_dim, .bf16);
         const sink = try self.layerDense(layer, inputs[0], "attn.attn_sink_proj.weight", c.heads, .bf16);
         const k = try self.layerDense(layer, inputs[1], "attn.wk_dv.weight", kv_dim, .bf16);
@@ -443,17 +454,21 @@ const Lowering = struct {
         const nv = try self.norm(cv, null, c.head_dim, .bf16);
         try self.clip(q, c.head_dim, c.qk_clip, try self.layerWeight(layer, "attn.q_l2_clip.scale", &.{ c.heads, c.head_dim }));
         try self.clip(ck, c.head_dim, c.qk_clip, null);
-        try self.clip(r, c.rel_dim, c.rel_clip, try self.layerWeight(layer, "attn.rel_l2_clip.scale", &.{ c.heads, c.rel_dim }));
+        if (r) |rv| try self.clip(rv, c.rel_dim, c.rel_clip, try self.layerWeight(layer, "attn.rel_l2_clip.scale", &.{ c.heads, c.rel_dim }));
         if (global) {
             const tau: ir.RowTransform = .{ .log_position_scale = .{ .floor = c.log_scaling_floor, .alpha = c.log_scaling_alpha } };
             try self.transform(q, q, tau, .bf16);
-            try self.transform(r, r, tau, .bf16);
+            if (r) |rv| try self.transform(rv, rv, tau, .bf16);
         }
-        const extent = if (global) c.rel_extent else c.window;
-        const bias = try self.scratch("relative_bias", c.heads * extent);
-        const rel = try self.layerWeight(layer, "attn.rel_logits_proj.proj", &.{ c.rel_dim, extent });
-        try self.b.op(.{ .grouped_project = .{ .x = r, .out = bias, .weight = rel, .groups = c.heads, .round = .bf16, .causal_prefix = true } });
         const window = if (global) 0 else c.window;
+        var bias: ir.View = sink;
+        var extent: u32 = 0;
+        if (r) |rv| {
+            extent = if (global) c.rel_extent else c.window;
+            bias = try self.scratch("relative_bias", c.heads * extent);
+            const rel = try self.layerWeight(layer, "attn.rel_logits_proj.proj", &.{ c.rel_dim, extent });
+            try self.b.op(.{ .grouped_project = .{ .x = rv, .out = bias, .weight = rel, .groups = c.heads, .round = .bf16, .causal_prefix = true } });
+        }
         const keys = try self.cache(v, "keys", kv_dim, window -| 1);
         const values = try self.cache(v, "values", kv_dim, window -| 1);
         try self.b.op(.{ .store = .{ .src = ck, .dst = keys } });
@@ -538,14 +553,14 @@ const Lowering = struct {
     }
 };
 
-fn lower(gpa: std.mem.Allocator, c: Config) !ir.Program {
+pub fn lower(gpa: std.mem.Allocator, c: Config) !ir.Program {
     return lowerWithOptions(gpa, c, .{});
 }
 
 fn lowerWithOptions(gpa: std.mem.Allocator, c: Config, options: Options) !ir.Program {
     var b = ir.Builder.init(gpa);
     errdefer b.deinit();
-    const l: Lowering = .{ .b = &b, .c = c };
+    const l: Lowering = .{ .b = &b, .c = c, .nope = options.nope };
     const h = c.hidden;
     const tokens = b.view(try b.state(.{ .name = "tokens", .kind = .tokens, .width = 1 }));
     _ = try b.state(.{ .name = "position", .kind = .position, .width = 1 });
@@ -675,7 +690,7 @@ extern "c" fn mkdtemp([*:0]u8) ?[*:0]u8;
 extern "c" fn unlink([*:0]const u8) c_int;
 extern "c" fn rmdir([*:0]const u8) c_int;
 
-fn writeFixture(a: std.mem.Allocator, p: *const ir.Program, path: []const u8) !void {
+pub fn writeFixture(a: std.mem.Allocator, p: *const ir.Program, path: []const u8) !void {
     // A real safetensors file exercises name/shape binding as well as Metal.
     var header: std.ArrayList(u8) = .empty;
     var data: std.ArrayList(u8) = .empty;
@@ -2702,4 +2717,214 @@ test "LoopCD logits_adaptive packs at batch=4096 and fuses head_softcap_loopcd" 
     };
     try std.testing.expectEqual(@as(usize, 0), head_softcaps);
     try std.testing.expectEqual(@as(usize, 1), head_softcap_loopcd);
+}
+
+test "Inkling2 NoPE global and all lowering, reference vs tuned parity, and LSA" {
+    const frontend = @import("frontend.zig");
+    const plan = @import("plan.zig");
+    const Engine = @import("exec.zig").Engine;
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Non-Inkling models fail closed when --nope != off.
+    try std.testing.expectError(error.UnsupportedLoopOptions, frontend.build(gpa, "lfm2", "{}", .{ .context = undefined, .has = undefined }, .{ .nope = .global }));
+
+    var c = try parse(a, test_config);
+    c.hidden = 128;
+    c.intermediate = 64;
+    c.heads = 3;
+    c.kv_heads = 1;
+    c.head_dim = 128;
+    c.rel_dim = 16;
+    c.rel_extent = 16;
+    c.window = 16;
+    c.log_scaling_floor = 3;
+    c.vocab = 16;
+    c.unpadded_vocab = 14;
+    c.eos = try a.dupe(u32, &.{13});
+    c.gate_rank = 4;
+    c.max_context = 64;
+
+    var p_off = try lowerWithOptions(gpa, c, .{ .nope = .off });
+    defer p_off.deinit();
+    var p_global = try lowerWithOptions(gpa, c, .{ .nope = .global });
+    defer p_global.deinit();
+    var p_all = try lowerWithOptions(gpa, c, .{ .nope = .all });
+    defer p_all.deinit();
+    try std.testing.expect(p_global.ops.len < p_off.ops.len);
+    try std.testing.expect(p_all.ops.len < p_global.ops.len);
+    try std.testing.expect(p_global.states.len < p_off.states.len);
+
+    // Planner uses qkv_sconv_prep / qkv_dyn_prep on NoPE layers.
+    const info_all = try a.alloc(plan.WeightInfo, p_all.weights.len);
+    @memset(info_all, .{ .q4 = false, .buffer = 1, .dense = true });
+    const steps_all = try plan.build(a, &p_all, .{ .qkvr_prep = true }, info_all);
+    var sconv_no_r: usize = 0;
+    var dyn_no_r: usize = 0;
+    for (steps_all) |st| switch (st) {
+        .qkv_sconv_prep => sconv_no_r += 1,
+        .qkv_dyn_prep => dyn_no_r += 1,
+        else => {},
+    };
+    try std.testing.expect(sconv_no_r > 0 and dyn_no_r > 0);
+
+    // Write full checkpoint (including rel_logits_proj) from p_off, then evaluate .global and .all.
+    var tmp = "/tmp/nano-inkling-nope-XXXXXX".*;
+    const dir = std.mem.span(mkdtemp(&tmp) orelse return error.TempDirectoryFailed);
+    defer _ = rmdir(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer _ = unlink(path);
+    try writeFixture(a, &p_off, path);
+    const ctx = try @import("gpu.zig").open();
+    defer ctx.deinit();
+    var store = try @import("weights").Store.init(a, ctx, dir, 0);
+    defer store.deinit();
+
+    var seq: [44]u32 = undefined;
+    for (&seq, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 13 + 1);
+
+    for ([_]*const @import("ir.zig").Program{ &p_global, &p_all }) |prog| {
+        var ref = try Engine.init(gpa, prog, ctx, &store, .{ .batch = 32 }, 64);
+        defer ref.deinit();
+        var fast_base = try Engine.init(gpa, prog, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_long_fast = true,
+            .relative_inline_bias = true,
+            .fuse_relative_gate = true,
+            .fuse_qkvr_prep = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+        }, 64);
+        defer fast_base.deinit();
+        var prefill_base = try Engine.init(gpa, prog, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_tile_prefill = true,
+            .relative_long_fast = true,
+            .relative_prefill_fast = true,
+            .store_pack_bf16 = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+        }, 64);
+        defer prefill_base.deinit();
+        var tuned = try Engine.init(gpa, prog, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_tile_prefill = true,
+            .relative_bias16 = true,
+            .relative_bias_d8 = true,
+            .relative_bias_decode = true,
+            .relative_long_fast = true,
+            .relative_prefill_fast = true,
+            .relative_inline_bias = true,
+            .fuse_relative_gate = true,
+            .fuse_qkvr_prep = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .concurrent_scratch = true,
+            .tail_trim = 8,
+            .d2_gate = true,
+        }, 64);
+        defer tuned.deinit();
+
+        try ref.forward(seq[0..20], 19);
+        try ref.forward(seq[20..40], 19);
+        try ref.forward(seq[40..41], 0);
+        try ref.forward(seq[41..42], 0);
+        const ref_logits = try a.dupe(f32, try ref.logits(0));
+
+        try fast_base.forward(seq[0..20], 19);
+        try fast_base.forward(seq[20..40], 19);
+        try fast_base.forward(seq[40..41], 0);
+        try fast_base.forward(seq[41..42], 0);
+        for (ref_logits, try fast_base.logits(0)) |rv, fv| {
+            try std.testing.expect(std.math.isFinite(fv));
+            try std.testing.expectApproxEqAbs(rv, fv, 5e-2);
+        }
+
+        try prefill_base.forward(seq[0..20], 19);
+        try prefill_base.forward(seq[20..40], 19);
+        try prefill_base.forward(seq[40..41], 0);
+        try prefill_base.forward(seq[41..42], 0);
+        const pbase_logits = try a.dupe(f32, try prefill_base.logits(0));
+        for (pbase_logits) |pv| try std.testing.expect(std.math.isFinite(pv));
+
+        try tuned.forward(seq[0..20], 19);
+        try tuned.forward(seq[20..40], 19);
+        try tuned.forward(seq[40..41], 0);
+        try tuned.forward(seq[41..42], 0);
+        for (pbase_logits, try tuned.logits(0)) |pv, tv| {
+            try std.testing.expect(std.math.isFinite(tv));
+            try std.testing.expectApproxEqAbs(pv, tv, 1e-3);
+        }
+
+        var lsa_prefill_base = try Engine.init(gpa, prog, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_tile_prefill = true,
+            .relative_long_fast = true,
+            .relative_prefill_fast = true,
+            .store_pack_bf16 = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .lsa = true,
+            .lsa_budget = 8,
+            .lsa_window = 12,
+            .lsa_coarse_threshold = 0,
+        }, 64);
+        defer lsa_prefill_base.deinit();
+        var lsa_tuned = try Engine.init(gpa, prog, ctx, &store, .{
+            .batch = 32,
+            .relative_stripes = true,
+            .relative_tile_prefill = true,
+            .relative_bias16 = true,
+            .relative_bias_d8 = true,
+            .relative_bias_decode = true,
+            .relative_long_fast = true,
+            .relative_prefill_fast = true,
+            .relative_inline_bias = true,
+            .fuse_relative_gate = true,
+            .fuse_qkvr_prep = true,
+            .store_pack_bf16 = true,
+            .conv_ring = true,
+            .fuse_inkling_conv = true,
+            .fuse_bf16_cast = true,
+            .rmsnorm_fast = true,
+            .scratch_reuse = true,
+            .concurrent_scratch = true,
+            .tail_trim = 8,
+            .d2_gate = true,
+            .lsa = true,
+            .lsa_budget = 8,
+            .lsa_window = 12,
+            .lsa_coarse_threshold = 0,
+        }, 64);
+        defer lsa_tuned.deinit();
+        try lsa_prefill_base.forward(seq[0..20], 19);
+        try lsa_prefill_base.forward(seq[20..40], 19);
+        try lsa_prefill_base.forward(seq[40..41], 0);
+        try lsa_prefill_base.forward(seq[41..42], 0);
+        const lsa_pbase_out = try a.dupe(f32, try lsa_prefill_base.logits(0));
+        try lsa_tuned.forward(seq[0..20], 19);
+        try lsa_tuned.forward(seq[20..40], 19);
+        try lsa_tuned.forward(seq[40..41], 0);
+        try lsa_tuned.forward(seq[41..42], 0);
+        for (lsa_pbase_out, try lsa_tuned.logits(0)) |pv, tv| {
+            try std.testing.expect(std.math.isFinite(tv));
+            try std.testing.expectApproxEqAbs(pv, tv, 1e-3);
+        }
+    }
 }

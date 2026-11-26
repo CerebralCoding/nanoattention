@@ -4,6 +4,7 @@
 const std = @import("std");
 const exec = @import("exec.zig");
 const io = @import("io.zig");
+const kv_cartridge = @import("kv_cartridge.zig");
 const Allocator = std.mem.Allocator;
 
 extern "c" fn read(c_int, [*]u8, usize) isize;
@@ -16,6 +17,9 @@ pub const Request = struct {
     max_tokens: u32 = 128,
     reset: bool = false,
     return_logits: bool = false,
+    kv_in: ?[]const u8 = null,
+    kv_out: ?[]const u8 = null,
+    kv_dtype: ?[]const u8 = null,
 };
 
 pub const Response = struct {
@@ -77,6 +81,12 @@ fn jsonBool(value: std.json.Value) !bool {
         else => error.InvalidRequestBoolean,
     };
 }
+fn jsonString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidRequestString,
+    };
+}
 
 /// Rejects coercions, duplicate and unknown fields, and missing tokens.
 pub fn parse(a: Allocator, line: []const u8) !Request {
@@ -93,7 +103,7 @@ pub fn parse(a: Allocator, line: []const u8) !Request {
     var fields = object.iterator();
     while (fields.next()) |field| {
         const name = field.key_ptr.*;
-        inline for (.{ "id", "tokens", "max_tokens", "reset", "return_logits" }) |known| {
+        inline for (.{ "id", "tokens", "max_tokens", "reset", "return_logits", "kv_in", "kv_out", "kv_dtype" }) |known| {
             if (std.mem.eql(u8, name, known)) break;
         } else return error.UnknownRequestField;
     }
@@ -111,6 +121,9 @@ pub fn parse(a: Allocator, line: []const u8) !Request {
         .max_tokens = if (object.get("max_tokens")) |v| try jsonU32(v) else 128,
         .reset = if (object.get("reset")) |v| try jsonBool(v) else false,
         .return_logits = if (object.get("return_logits")) |v| try jsonBool(v) else false,
+        .kv_in = if (object.get("kv_in")) |v| try jsonString(v) else null,
+        .kv_out = if (object.get("kv_out")) |v| try jsonString(v) else null,
+        .kv_dtype = if (object.get("kv_dtype")) |v| try jsonString(v) else null,
     };
 }
 
@@ -135,13 +148,18 @@ fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
     defer arena.deinit();
     const a = arena.allocator();
     const request = try parse(a, line);
-    const preflight = try validate(request, engine.position, engine.context, engine.program.meta.vocab);
-    if (engine.failed and !request.reset) return error.ModelNeedsReset;
+    if (request.kv_in) |kv_path| {
+        _ = try kv_cartridge.load(engine, a, kv_path);
+    }
+    var check_req = request;
+    if (request.kv_in != null) check_req.reset = false;
+    const preflight = try validate(check_req, engine.position, engine.context, engine.program.meta.vocab);
+    if (engine.failed and !check_req.reset and request.kv_in == null) return error.ModelNeedsReset;
     const vocab = engine.program.meta.vocab;
     const generated = try a.alloc(u32, request.max_tokens);
     const prefill_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, vocab) else null;
     const final_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, vocab) else null;
-    if (request.reset) engine.reset();
+    if (request.kv_in == null and request.reset) engine.reset();
 
     var dispatches: u64 = 0;
     var forwards: usize = 0;
@@ -180,6 +198,10 @@ fn handle(engine: *exec.Engine, gpa: Allocator, line: []const u8) !void {
     const decode_seconds = try io.now() - decode_start;
     if (final_copy) |c| @memcpy(c, try engine.logits(row));
     if (engine.position != preflight.cache_before + request.tokens.len + count) return error.CachePositionMismatch;
+    if (request.kv_out) |out_path| {
+        const dtype = if (request.kv_dtype) |ds| kv_cartridge.parseDType(ds) orelse return error.InvalidKvDType else .f32;
+        _ = try kv_cartridge.save(engine, a, out_path, dtype, "{}");
+    }
     const bytes = engine.stateBytes(engine.position);
     const response: Response = .{
         .id = request.id,

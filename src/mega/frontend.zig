@@ -10,6 +10,8 @@ pub const Checkpoint = lfm3.Checkpoint;
 
 pub const LoopCdMode = inkling2_loop.LoopCdMode;
 pub const parseLoopCdMode = inkling2_loop.parseLoopCdMode;
+pub const NoPeMode = inkling2_loop.NoPeMode;
+pub const parseNoPeMode = inkling2_loop.parseNoPeMode;
 
 pub const Options = struct {
     sliding_visible: ?u32 = null,
@@ -18,10 +20,11 @@ pub const Options = struct {
     loopcd: LoopCdMode = .off,
     loopcd_omega: f32 = 1.0,
     loopcd_weak_pass: u32 = 1,
+    nope: NoPeMode = .off,
 };
 
 pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []const u8, checkpoint: Checkpoint, options: Options) !ir.Program {
-    const has_loop_opts = options.loop_passes != null or options.loopcd != .off or options.loopcd_omega != 1.0 or options.loopcd_weak_pass != 1;
+    const has_loop_opts = options.loop_passes != null or options.loopcd != .off or options.loopcd_omega != 1.0 or options.loopcd_weak_pass != 1 or options.nope != .off;
     const opts: lfm3.Options = .{ .sliding_visible = options.sliding_visible, .embed_round = options.embed_round };
     if (std.mem.eql(u8, model_type, "lfm3")) {
         if (has_loop_opts) return error.UnsupportedLoopOptions;
@@ -38,6 +41,7 @@ pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []con
             .loopcd = options.loopcd,
             .loopcd_omega = options.loopcd_omega,
             .loopcd_weak_pass = options.loopcd_weak_pass,
+            .nope = options.nope,
         });
     }
     std.debug.print("No megakernel front end for model_type \"{s}\"\n", .{model_type});
