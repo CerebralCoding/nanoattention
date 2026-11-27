@@ -2,6 +2,7 @@
 //! The language-model path intentionally excludes vision until it has its own
 //! validated tensor/operator implementation.
 const std = @import("std");
+const chat = @import("chat.zig");
 const ir = @import("ir.zig");
 const packed_weights = @import("packed.zig");
 
@@ -3346,4 +3347,88 @@ test "Inkling2 multi-row LSA rewind, LoopCD 1xR fusion, and cross-loop LSA reuse
             }
         }
     }
+}
+
+pub const chat_template: chat.Template = .{
+    .render = renderChat,
+    .next_turn = nextTurn,
+    .think_open = "<|content_thinking|>",
+    .think_close = "<|end_message|>",
+    .starts_in_think = false,
+};
+
+fn emitEffort(out: *std.ArrayList(u8), a: std.mem.Allocator, thinking: bool) !void {
+    try out.print(a, "<|message_system|><|content_text|>Thinking effort level: {s}<|end_message|>", .{
+        if (thinking) "0.9" else "0",
+    });
+}
+
+fn renderChat(a: std.mem.Allocator, messages: []const chat.Message, options: chat.Options) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var effort_emitted = false;
+    for (messages) |m| {
+        if (!effort_emitted and m.role != .system) {
+            try emitEffort(&out, a, options.thinking);
+            effort_emitted = true;
+        }
+        switch (m.role) {
+            .system => try out.print(a, "<|message_system|><|content_text|>{s}<|end_message|>", .{m.content}),
+            .user => try out.print(a, "<|message_user|><|content_text|>{s}<|end_message|>", .{m.content}),
+            .assistant => try out.print(a, "<|message_model|><|content_text|>{s}<|end_message|><|content_model_end_sampling|>", .{m.content}),
+        }
+    }
+    if (!effort_emitted) {
+        try emitEffort(&out, a, options.thinking);
+    }
+    return out.items;
+}
+
+fn nextTurn(a: std.mem.Allocator, closed: bool, user: []const u8, _: chat.Options) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}<|message_user|><|content_text|>{s}<|end_message|>", .{
+        if (closed) "" else "<|end_message|><|content_model_end_sampling|>",
+        user,
+    });
+}
+
+test "Inkling chat template matches HuggingFace text-only chat_template.jinja" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const s_off = try renderChat(a, &.{
+        .{ .role = .system, .content = "Be brief." },
+        .{ .role = .user, .content = "hi" },
+    }, .{ .thinking = false });
+    try std.testing.expectEqualStrings(
+        "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>hi<|end_message|>",
+        s_off,
+    );
+
+    const s_on = try renderChat(a, &.{
+        .{ .role = .system, .content = "Be brief." },
+        .{ .role = .user, .content = "hi" },
+    }, .{ .thinking = true });
+    try std.testing.expectEqualStrings(
+        "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hi<|end_message|>",
+        s_on,
+    );
+
+    const one = try renderChat(a, &.{.{ .role = .user, .content = "hi" }}, .{ .thinking = false });
+    const whole = try renderChat(a, &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "Hello." },
+        .{ .role = .user, .content = "more" },
+    }, .{ .thinking = false });
+    const next_closed = try nextTurn(a, true, "more", .{});
+    try std.testing.expectEqualStrings(whole, try std.mem.concat(a, u8, &.{
+        one,
+        "<|message_model|><|content_text|>Hello.<|end_message|><|content_model_end_sampling|>",
+        next_closed,
+    }));
+    const next_open = try nextTurn(a, false, "more", .{});
+    try std.testing.expectEqualStrings(whole, try std.mem.concat(a, u8, &.{
+        one,
+        "<|message_model|><|content_text|>Hello.",
+        next_open,
+    }));
 }

@@ -316,6 +316,27 @@ Verified **Suite B** multi-turn needle retrieval + technical summary (`32K / 64K
 | **`131K`** (`129,125`) | **`3p_hidden`** | `True` | `(True, True)` | `1,299.5` | `59.8 ->` **`65.8`** (`2.46`) | `60.2 ->` **`64.9`** (`2.56`) |
 | **`131K`** (`129,125`) | **`3p_off`** | `True` | `(True, True)` | `1,328.1` | `60.3 ->` **`68.1`** (`2.46`) | `60.7 ->` **`70.4`** (`2.56`) |
 
+#### `v0.3.1`: Native Inkling CLI (`--draft` + `o200k_base`) & BF16 MMA LoopCD Dual-Unembed
+
+`nano v0.3.1` brings zero-Python native text CLI & chat directly to Inkling 2 Mini with DFlash 2 speculative drafting and fixes the `logits` / `logits-adaptive` LoopCD verification bottleneck:
+
+- **Native Inkling `run` & `chat` (`--draft` + `o200k_base`):** Added Unicode 16.0.0 `o200k_base` pre-tokenization ([`src/mega/tokenizer.zig`](src/mega/tokenizer.zig), [`src/mega/unicode_tables.zig`](src/mega/unicode_tables.zig) — verified `0` ID diffs across `49,939` strings and `0` decoded-text diffs across `164,817` checks vs HuggingFace `tokenizers`), Inkling chat template ([`src/mega/inkling2_loop.zig`](src/mega/inkling2_loop.zig)), auto-selected [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), live streaming `--draft` in [`src/mega/cli.zig`](src/mega/cli.zig) / [`src/mega/dflash2.zig`](src/mega/dflash2.zig), and `--draft` / `--loopcd` / `--lsa` flags in [`tools/inkling_adapter.py`](tools/inkling_adapter.py):
+
+```sh
+./zig-out/bin/nano run "$CKPT" --draft /path/to/inkling-2-mini-dflash2 \
+  --loop-passes 3 --loopcd hidden --loopcd-omega 0.5 "Explain Metal simdgroup_matrix."
+./zig-out/bin/nano chat "$CKPT" --draft /path/to/inkling-2-mini-dflash2 \
+  --loop-passes 3 --loopcd hidden --loopcd-omega 0.5
+```
+
+- **BF16 MMA Dual-Unembed LoopCD Kernels:** Single-weight-read hardware BF16 `simdgroup_matrix` dual-unembed kernels (`mk_bf16_mma_m8n{16,32}_softcap_{loopcd,dual}_direct` in [`src/mega/inkling_fast.metal`](src/mega/inkling_fast.metal) + [`src/mega/exec.zig`](src/mega/exec.zig)) accelerate `.head_softcap_loopcd` (`rows=1..8`), verified on M3 Ultra (`exact=True`, `leak=False`):
+
+| Config | Coding (`tok/s`, vs Base) | Math (`tok/s`, vs Base) | 4K Code (`tok/s`, vs Base) |
+| :--- | ---: | ---: | ---: |
+| **`3p_logits`** (`--loop-passes 3 --loopcd logits --loopcd-omega 0.5`) | `105.85 ->` **`117.11`** (`1.79×`) | `85.92 ->` **`104.93`** (`1.60×`) | `40.88 ->` **`62.38`** (`+52.6%`, `0.99×`) |
+| **`3p_adaptive`** (`--loop-passes 3 --loopcd logits-adaptive --loopcd-omega 0.7`) | `106.79 ->` **`112.14`** (`1.77×`) | `70.56 ->` **`96.37`** (`1.52×`) | `33.58 ->` **`72.16`** (`2.15×` faster, `1.15×` vs base) |
+| **`3p_hidden`** (`--loop-passes 3 --loopcd hidden --loopcd-omega 0.5`, ref) | **`103.36`** (`1.57×`) | **`133.26`** (`2.02×`) | **`92.17`** (`1.46×`) |
+
 See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-Elites QD grid across 4K/16K/32K in [`benchmarks/inkling-qd/elites.md`](benchmarks/inkling-qd/elites.md), the Lean 4 contracts in [`proofs/Inkling.lean`](proofs/Inkling.lean) (`59` public / `65` total theorems) and [`proofs/Speculative.lean`](proofs/Speculative.lean) (`17` theorems), and [`docs/MEGAKERNEL.md`](docs/MEGAKERNEL.md).
 
 **Parity & limits:** `inkling.json` preserves exact greedy token parity across `bf16_verify_mma` + `dflash_dcut` (`0` parity failures across Suite A and Suite B `32K/64K/131K`), is bit-identical (`max_abs = 0.0`) on `bf16_verify_mma=false` to pre-Qwegn `megakernel-v1` across `cake_toks` (`feed=1, 8`), `real_512` (`feed=512`, `560/560` top-1, `32/32` greedy), and `long_real` (`feed=512`, `568/568` top-1, `32/32` greedy), matches `64/64` greedy tokens on `cake_toks` against baseline, and passes [`tools/nano_inkling_attention_check.py`](tools/nano_inkling_attention_check.py) (`24/24` top-1 agreement across six arm pairs). Native `--draft` DFlash 2 speculative decoding is wired; note that the vision tower and the checkpoint's bundled `mtp.safetensors` drafter remain separate.

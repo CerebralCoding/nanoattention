@@ -11,14 +11,16 @@ const frontend = @import("frontend.zig");
 const chat = @import("chat.zig");
 const tokenizer = @import("tokenizer.zig");
 const sample = @import("sample.zig");
+const dflash2 = @import("dflash2.zig");
 const io = @import("io.zig");
 const Knobs = @import("knobs.zig").Knobs;
 const metal = @import("weights").metal;
 const Allocator = std.mem.Allocator;
 
-pub const version = "0.2.0";
+pub const version = "0.3.1";
 const exact_preset = @embedFile("presets/exact.json");
 const mlx_preset = @embedFile("presets/mlx-prefill.json");
+const inkling_preset = @embedFile("presets/inkling.json");
 
 extern "c" fn isatty(c_int) c_int;
 extern "c" fn read(c_int, [*]u8, usize) isize;
@@ -57,6 +59,7 @@ const run_help =
     \\  --loopcd-omega W         LoopCD contrast scale omega >= 0 (default 1.0)
     \\  --loopcd-weak-pass N     1-based weak pass index < loop passes (default 1)
     \\  --nope MODE              Inkling relative position bias ablation: off, global, all
+    \\  --draft PATH             DFlash 2 speculative draft folder (greedy decoding only)
     \\  --knobs FILE.json, --knob name=value   engine knobs instead of / over the preset
     \\Sampling (default greedy: deterministic, the engine's GPU argmax):
     \\  --temperature T  --top-k K  --top-p P  --repetition-penalty R  --seed S
@@ -81,7 +84,7 @@ const chat_help =
     \\Options: --system TEXT, --max-tokens N (per reply, default 1024), --think, --no-think,
     \\--no-thinking-output, --json (one JSON line per turn: fed ids, reply ids, text, timings),
     \\--stats (after every reply), --context N, --prefill exact|mlx, --loop-passes,
-    \\--loopcd, --loopcd-omega, --loopcd-weak-pass, --nope, --knobs, --knob, and the
+    \\--loopcd, --loopcd-omega, --loopcd-weak-pass, --nope, --draft, --knobs, --knob, and the
     \\sampling options of `nano run --help`.
     \\
 ;
@@ -184,6 +187,7 @@ const Options = struct {
     loopcd_omega: f32 = 1.0,
     loopcd_weak_pass: u32 = 1,
     nope: frontend.NoPeMode = .off,
+    draft: ?[]const u8 = null,
     knobs_file: ?[]const u8 = null,
     knob_flags: std.ArrayList([]const u8) = .empty,
     sampling_model: bool = false,
@@ -201,7 +205,7 @@ const Options = struct {
 const generation_options = [_][]const u8{
     "--system",       "--max-tokens",   "--raw",          "--json",               "--stats",           "--think",      "--no-think", "--no-thinking-output",
     "--context",      "--prefill",      "--loop-passes",  "--loopcd",             "--loopcd-omega",    "--loopcd-weak-pass", "--nope",
-    "--knobs",        "--knob",         "--sampling",     "--temperature",
+    "--draft",        "--knobs",        "--knob",         "--sampling",           "--temperature",
     "--top-k",        "--top-p",        "--repetition-penalty", "--seed",
 };
 
@@ -217,7 +221,7 @@ fn allowed(command: Command, name: []const u8) bool {
 }
 
 fn takesValue(name: []const u8) bool {
-    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--nope", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
+    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--nope", "--draft", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
         if (eql(v, name)) return true;
     return false;
 }
@@ -303,6 +307,8 @@ fn parseOptions(a: Allocator, command: Command, args: []const []const u8) !Optio
             o.loopcd_weak_pass = wp;
         } else if (eql(name, "--nope")) {
             o.nope = frontend.parseNoPeMode(value) orelse return usageError("--nope is off, global, or all, not \"{s}\"", .{value});
+        } else if (eql(name, "--draft")) {
+            o.draft = value;
         } else if (eql(name, "--knobs")) {
             o.knobs_file = value;
         } else if (eql(name, "--knob")) {
@@ -571,6 +577,9 @@ const Turn = struct {
     prefill_seconds: f64 = 0,
     first_token_seconds: f64 = 0,
     decode_seconds: f64 = 0,
+    speculative_batches: usize = 0,
+    speculative_proposed: usize = 0,
+    speculative_accepted: usize = 0,
 
     fn promptRate(t: Turn) f64 {
         return @as(f64, @floatFromInt(t.prompt_tokens)) / @max(t.prefill_seconds, 1e-9);
@@ -579,6 +588,10 @@ const Turn = struct {
     fn replyRate(t: Turn) f64 {
         if (t.reply.items.len < 2) return 0;
         return @as(f64, @floatFromInt(t.reply.items.len - 1)) / @max(t.decode_seconds, 1e-9);
+    }
+    fn meanStep(t: Turn) f64 {
+        if (t.speculative_batches == 0) return 0;
+        return @as(f64, @floatFromInt(t.reply.items.len)) / @as(f64, @floatFromInt(t.speculative_batches));
     }
 };
 
@@ -677,8 +690,24 @@ fn catchInterrupt() void {
     std.posix.sigaction(.INT, &act, null);
 }
 
+const StreamCtx = struct {
+    display: *Display,
+    a: Allocator,
+    tok: *const tokenizer.Tokenizer,
+
+    fn onToken(raw: *anyopaque, id: u32, is_eos: bool) anyerror!void {
+        const self: *StreamCtx = @ptrCast(@alignCast(raw));
+        if (!is_eos) try self.display.token(self.a, self.tok, id);
+    }
+
+    fn shouldStop(_: *anyopaque) bool {
+        return interrupted.load(.seq_cst);
+    }
+};
+
 const Generator = struct {
     engine: *exec.Engine,
+    draft: ?*dflash2.Draft = null,
     tok: *const tokenizer.Tokenizer,
     sampler: ?*sample.Sampler,
     display: *Display,
@@ -697,8 +726,42 @@ const Generator = struct {
         const engine = self.engine;
         t.prompt_tokens = prompt.len;
         t.reply.clearRetainingCapacity();
+        t.speculative_batches = 0;
+        t.speculative_proposed = 0;
+        t.speculative_accepted = 0;
         if (self.sampler) |s| s.observe(prompt);
         const start = try io.now();
+        if (self.draft) |d| {
+            const pf = try d.prefill(engine, prompt);
+            t.prefill_seconds = try io.now() - start;
+            t.stop = .max_tokens;
+            if (max_tokens > 0) {
+                const first_id = try engine.next(pf.last_row);
+                const first = try io.now();
+                t.first_token_seconds = first - start;
+                const out_buf = try a.alloc(u32, max_tokens);
+                var sctx: StreamCtx = .{ .display = self.display, .a = a, .tok = self.tok };
+                const res = try d.decodeGreedy(engine, first_id, out_buf, .{
+                    .stop_on_eos = true,
+                    .commit_all = commit,
+                    .stream = .{ .ctx = &sctx, .on_token = StreamCtx.onToken, .should_stop = StreamCtx.shouldStop },
+                });
+                t.decode_seconds = (try io.now()) - first;
+                try t.reply.appendSlice(a, out_buf[0..res.count]);
+                t.speculative_batches = res.batches;
+                t.speculative_proposed = res.proposed;
+                t.speculative_accepted = res.accepted;
+                if (res.interrupted) {
+                    t.stop = .interrupted;
+                } else if (res.eos) {
+                    t.stop = .eos;
+                } else if (res.context_full) {
+                    t.stop = .context;
+                }
+            }
+            try self.display.end(a);
+            return;
+        }
         var i: usize = 0;
         var row: u32 = 0;
         while (i < prompt.len) {
@@ -747,15 +810,25 @@ const Engine = struct {
     sampler: ?sample.Sampler,
 };
 
-fn knobsFor(ctx: *Context, o: *const Options) !Knobs {
+fn knobsFor(ctx: *Context, dir: []const u8, o: *const Options) !Knobs {
+    var preset_bytes: []const u8 = if (o.prefill == .mlx) mlx_preset else exact_preset;
+    if (o.knobs_file == null) {
+        const cfg_path = try std.fs.path.join(ctx.a, &.{ dir, "config.json" });
+        if (loader.readFile(ctx.a, cfg_path)) |cfg| {
+            if (exec.modelType(ctx.a, cfg)) |mt| {
+                if (std.mem.eql(u8, mt, "inkling2_loop")) preset_bytes = inkling_preset;
+            } else |_| {}
+        } else |_| {}
+    }
     var knobs = if (o.knobs_file) |path|
         Knobs.parseJson(ctx.a, loader.readFile(ctx.a, path) catch return fail("cannot read {s}", .{path})) catch |err| return fail("{s}: {s}", .{ path, @errorName(err) })
     else
-        try Knobs.parseJson(ctx.a, if (o.prefill == .mlx) mlx_preset else exact_preset);
+        try Knobs.parseJson(ctx.a, preset_bytes);
     for (o.knob_flags.items) |value| {
         const eq = std.mem.indexOfScalar(u8, value, '=') orelse return usageError("--knob takes name=value, got \"{s}\"", .{value});
         knobs.set(value[0..eq], value[eq + 1 ..]) catch |err| return fail("--knob {s}: {s}", .{ value, @errorName(err) });
     }
+    if (o.draft != null) knobs.d2_gate = false;
     knobs.validate() catch |err| return fail("knobs: {s}", .{@errorName(err)});
     return knobs;
 }
@@ -777,7 +850,7 @@ fn samplingFor(ctx: *Context, dir: []const u8, o: *const Options) !sample.Params
 }
 
 fn loadEngine(ctx: *Context, dir: []const u8, o: *const Options) !*loader.Loaded {
-    const knobs = try knobsFor(ctx, o);
+    const knobs = try knobsFor(ctx, dir, o);
     if (o.context == 0) return usageError("--context must be positive", .{});
     return loader.load(ctx.gpa, ctx.a, dir, knobs, o.context, .{
         .loop_passes = o.loop_passes,
@@ -786,6 +859,12 @@ fn loadEngine(ctx: *Context, dir: []const u8, o: *const Options) !*loader.Loaded
         .loopcd_weak_pass = o.loopcd_weak_pass,
         .nope = o.nope,
     }) catch |err| fail("cannot load {s}: {s}", .{ dir, @errorName(err) });
+}
+
+fn loadDraft(ctx: *Context, engine: *const exec.Engine, o: *const Options) !?*dflash2.Draft {
+    const dd = o.draft orelse return null;
+    if (engine.batch < 8 and o.context >= 8) return fail("--draft requires batch >= 8 (check --knobs)", .{});
+    return dflash2.Draft.init(ctx.gpa, engine, dd) catch |err| return fail("cannot load draft {s}: {s}", .{ dd, @errorName(err) });
 }
 
 fn stopName(s: Stop) []const u8 {
@@ -799,9 +878,13 @@ fn stopName(s: Stop) []const u8 {
 
 fn printStats(load_seconds: ?f64, t: *const Turn) void {
     if (load_seconds) |l| printErr("load {d:.2} s | ", .{l});
-    printErr("prompt {d} tokens, {d:.3} s, {d:.1} tok/s | first token {d:.3} s | reply {d} tokens, {d:.1} tok/s | stop: {s}\n", .{
-        t.prompt_tokens, t.prefill_seconds, t.promptRate(), t.first_token_seconds, t.reply.items.len, t.replyRate(), stopName(t.stop),
+    printErr("prompt {d} tokens, {d:.3} s, {d:.1} tok/s | first token {d:.3} s | reply {d} tokens, {d:.1} tok/s", .{
+        t.prompt_tokens, t.prefill_seconds, t.promptRate(), t.first_token_seconds, t.reply.items.len, t.replyRate(),
     });
+    if (t.speculative_batches > 0) {
+        printErr(" | spec {d:.2} tok/step ({d} batches)", .{ t.meanStep(), t.speculative_batches });
+    }
+    printErr(" | stop: {s}\n", .{stopName(t.stop)});
 }
 
 const JsonTurn = struct {
@@ -818,9 +901,14 @@ const JsonTurn = struct {
     time_to_first_token_seconds: f64,
     decode_seconds: f64,
     reply_tokens_per_second: f64,
+    speculative_batches: ?usize = null,
+    speculative_proposed: ?usize = null,
+    speculative_accepted: ?usize = null,
+    speculative_mean_step: ?f64 = null,
 };
 
 fn jsonTurn(a: Allocator, d: *const Display, t: *const Turn, load_seconds: ?f64, prompt_ids: ?[]const u32) ![]u8 {
+    const has_spec = t.speculative_batches > 0;
     const v: JsonTurn = .{
         .text = d.answer.items,
         .thinking = if (d.thinking.items.len > 0) d.thinking.items else null,
@@ -835,6 +923,10 @@ fn jsonTurn(a: Allocator, d: *const Display, t: *const Turn, load_seconds: ?f64,
         .time_to_first_token_seconds = t.first_token_seconds,
         .decode_seconds = t.decode_seconds,
         .reply_tokens_per_second = t.replyRate(),
+        .speculative_batches = if (has_spec) t.speculative_batches else null,
+        .speculative_proposed = if (has_spec) t.speculative_proposed else null,
+        .speculative_accepted = if (has_spec) t.speculative_accepted else null,
+        .speculative_mean_step = if (has_spec) t.meanStep() else null,
     };
     return std.json.Stringify.valueAlloc(a, v, .{});
 }
@@ -870,12 +962,15 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
     if (ids.items.len == 0) return usageError("the prompt is empty", .{});
     if (ids.items.len > o.context) return fail("the prompt is {d} tokens; the context holds {d} (--context N)", .{ ids.items.len, o.context });
     const params = try samplingFor(ctx, dir, o);
+    if (o.draft != null and !params.greedy()) return usageError("--draft requires greedy decoding (omit sampling flags)", .{});
 
     const loaded = try loadEngine(ctx, dir, o);
     defer {
         loaded.deinit();
         ctx.gpa.destroy(loaded);
     }
+    const draft = try loadDraft(ctx, &loaded.engine, o);
+    defer if (draft) |d| d.deinit();
     var sampler: ?sample.Sampler = if (params.greedy()) null else try sample.Sampler.init(ctx.gpa, params, loaded.program.meta.vocab);
     defer if (sampler) |*s| s.deinit(ctx.gpa);
     const load_seconds = try io.now() - ctx.start;
@@ -888,8 +983,8 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
         .think_open = if (template) |t| tok.addedId(t.think_open) else null,
         .think_close = if (template) |t| tok.addedId(t.think_close) else null,
     };
-    display.begin(template != null and o.thinking);
-    var gen: Generator = .{ .engine = &loaded.engine, .tok = &tok, .sampler = if (sampler) |*s| s else null, .display = &display, .eos = loaded.program.meta.eos, .gpa = ctx.gpa };
+    display.begin(template != null and template.?.starts_in_think and o.thinking);
+    var gen: Generator = .{ .engine = &loaded.engine, .draft = draft, .tok = &tok, .sampler = if (sampler) |*s| s else null, .display = &display, .eos = loaded.program.meta.eos, .gpa = ctx.gpa };
     var turn: Turn = .{};
     try gen.turn(ctx.a, ids.items, o.max_tokens, false, &turn);
     if (o.json) {
@@ -940,11 +1035,14 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
     defer tok.deinit();
     const template = try templateFor(ctx, dir);
     const params = try samplingFor(ctx, dir, o);
+    if (o.draft != null and !params.greedy()) return usageError("--draft requires greedy decoding (omit sampling flags)", .{});
     const loaded = try loadEngine(ctx, dir, o);
     defer {
         loaded.deinit();
         ctx.gpa.destroy(loaded);
     }
+    const draft = try loadDraft(ctx, &loaded.engine, o);
+    defer if (draft) |d| d.deinit();
     var sampler: ?sample.Sampler = if (params.greedy()) null else try sample.Sampler.init(ctx.gpa, params, loaded.program.meta.vocab);
     defer if (sampler) |*s| s.deinit(ctx.gpa);
     const load_seconds = try io.now() - ctx.start;
@@ -959,7 +1057,7 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
         .think_open = tok.addedId(template.think_open),
         .think_close = tok.addedId(template.think_close),
     };
-    var gen: Generator = .{ .engine = engine, .tok = &tok, .sampler = if (sampler) |*s| s else null, .display = &display, .eos = loaded.program.meta.eos, .gpa = ctx.gpa };
+    var gen: Generator = .{ .engine = engine, .draft = draft, .tok = &tok, .sampler = if (sampler) |*s| s else null, .display = &display, .eos = loaded.program.meta.eos, .gpa = ctx.gpa };
     catchInterrupt();
     if (in_tty) printErr("nano chat: {s} (load {d:.2} s). /help for commands, Ctrl-D to leave.\n", .{ dir, load_seconds });
 
@@ -994,6 +1092,7 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
                     printErr("{s}", .{chat_help});
                 } else if (eql(cmd, "/reset")) {
                     engine.reset();
+                    if (draft) |d| d.reset();
                     if (sampler) |*s| s.reset();
                     started = false;
                     full = false;
@@ -1002,6 +1101,7 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
                     const rest = std.mem.trim(u8, line["/system".len..], " \t");
                     system = if (rest.len > 0) try ctx.a.dupe(u8, rest) else null;
                     engine.reset();
+                    if (draft) |d| d.reset();
                     if (sampler) |*s| s.reset();
                     started = false;
                     full = false;
@@ -1028,11 +1128,15 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
             printErr("nano: this turn needs {d} more positions; {d} of {d} are used. /reset to start over\n", .{ ids.items.len, engine.position, engine.context });
             continue;
         }
-        if (engine.failed) engine.reset();
-        display.begin(o.thinking);
+        if (engine.failed) {
+            engine.reset();
+            if (draft) |d| d.reset();
+        }
+        display.begin(template.starts_in_think and o.thinking);
         gen.turn(ctx.a, ids.items, o.max_tokens, true, &turn) catch |err| {
             printErr("\nnano: {s}; the conversation was reset\n", .{@errorName(err)});
             engine.reset();
+            if (draft) |d| d.reset();
             started = false;
             continue;
         };
@@ -1071,6 +1175,11 @@ test "options: model-free parsing, values, unknown options" {
     try std.testing.expectEqual(@as(f32, 1.25), lc.loopcd_omega);
     try std.testing.expectEqual(@as(u32, 1), lc.loopcd_weak_pass);
     try std.testing.expectEqual(frontend.NoPeMode.global, lc.nope);
+    const dr = try parseOptions(a, .run, &.{ "hi", "--draft", "/tmp/draft", "--loopcd", "hidden" });
+    try std.testing.expectEqualStrings("/tmp/draft", dr.draft.?);
+    const drc = try parseOptions(a, .chat, &.{"--draft=/tmp/draft"});
+    try std.testing.expectEqualStrings("/tmp/draft", drc.draft.?);
+    try std.testing.expectError(error.Usage, parseOptions(a, .tokenize, &.{ "--draft", "/tmp/draft" }));
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loop-passes", "0" }));
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd", "invalid" }));
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd-omega", "-0.5" }));
@@ -1083,4 +1192,5 @@ test "the embedded presets are valid knob sets" {
     defer arena.deinit();
     _ = try Knobs.parseJson(arena.allocator(), exact_preset);
     _ = try Knobs.parseJson(arena.allocator(), mlx_preset);
+    _ = try Knobs.parseJson(arena.allocator(), inkling_preset);
 }

@@ -941,6 +941,152 @@ kernel void mk_bf16_mma_m8n32_softcap_direct(device const uchar *w [[buffer(0)]]
         true, p.scale, w, p.w, c0, a, tid, simd, lane);
 }
 
+// Unified rows=1..8 Direct-read dual hardware MMA BF16 helper for LoopCD logits / logits-adaptive.
+// Inactive rows [rows..7] are zero-padded so rows=1 base and rows=2..8 verify execute identical MMA FMA order.
+template <uint TILE_N, bool Fixed>
+inline void mk_bf16_mma_loopcd_direct_impl(
+    device float *arena, uint xs_off, uint xs_stride, uint xw_off, uint xw_stride,
+    uint y_off, uint ys, uint wy_off, uint wys,
+    uint row0, uint rows_in, uint m, uint n, float scale, float omega,
+    device const uchar *weights, ulong w_off, uint c0,
+    threadgroup bfloat *a_s, threadgroup bfloat *a_w,
+    uint tid, uint simd, uint lane) {
+    constexpr uint K = 64u, L = 72u;
+    const uint rows = min(rows_in, 8u);
+    const uint k_blocks = n / 64u;
+    const device bfloat *w_base = reinterpret_cast<const device bfloat *>(weights + w_off) + ulong(c0 + simd * 8u) * n;
+    simdgroup_float8x8 acc_s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_w = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    if constexpr (TILE_N == 32u) {
+        const uint ar = tid / 16u, ac = (tid % 16u) * 4u;
+        const bool a_ok = ar < rows;
+        const device float4 *xps = reinterpret_cast<const device float4 *>(arena + xs_off + ulong(row0 + (a_ok ? ar : 0u)) * xs_stride);
+        const device float4 *xpw = reinterpret_cast<const device float4 *>(arena + xw_off + ulong(row0 + (a_ok ? ar : 0u)) * xw_stride);
+        for (uint kb = 0u; kb < k_blocks; ++kb) {
+            const uint k = kb * 64u;
+            reinterpret_cast<threadgroup bfloat4 *>(a_s + ar * L + ac)[0] = bfloat4(a_ok ? xps[(k + ac) / 4u] : float4(0.0f));
+            reinterpret_cast<threadgroup bfloat4 *>(a_w + ar * L + ac)[0] = bfloat4(a_ok ? xpw[(k + ac) / 4u] : float4(0.0f));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
+            for (uint kf = 0u; kf < K; kf += 8u) {
+                simdgroup_bfloat8x8 af_s, af_w, bf;
+                simdgroup_load(bf, w_base + k + kf, n, ulong2(0), true);
+                simdgroup_load(af_s, a_s + kf, L);
+                simdgroup_load(af_w, a_w + kf, L);
+                simdgroup_multiply_accumulate(acc_s, af_s, bf, acc_s);
+                simdgroup_multiply_accumulate(acc_w, af_w, bf, acc_w);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        const uint ar = tid / 8u, ac = (tid % 8u) * 8u;
+        const bool a_ok = ar < rows;
+        const device float4 *xps = reinterpret_cast<const device float4 *>(arena + xs_off + ulong(row0 + (a_ok ? ar : 0u)) * xs_stride);
+        const device float4 *xpw = reinterpret_cast<const device float4 *>(arena + xw_off + ulong(row0 + (a_ok ? ar : 0u)) * xw_stride);
+        for (uint kb = 0u; kb < k_blocks; ++kb) {
+            const uint k = kb * 64u;
+            const float4 vs0 = a_ok ? xps[(k + ac) / 4u] : float4(0.0f);
+            const float4 vs1 = a_ok ? xps[(k + ac) / 4u + 1u] : float4(0.0f);
+            const float4 vw0 = a_ok ? xpw[(k + ac) / 4u] : float4(0.0f);
+            const float4 vw1 = a_ok ? xpw[(k + ac) / 4u + 1u] : float4(0.0f);
+            reinterpret_cast<threadgroup bfloat4 *>(a_s + ar * L + ac)[0] = bfloat4(vs0);
+            reinterpret_cast<threadgroup bfloat4 *>(a_s + ar * L + ac)[1] = bfloat4(vs1);
+            reinterpret_cast<threadgroup bfloat4 *>(a_w + ar * L + ac)[0] = bfloat4(vw0);
+            reinterpret_cast<threadgroup bfloat4 *>(a_w + ar * L + ac)[1] = bfloat4(vw1);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
+            for (uint kf = 0u; kf < K; kf += 8u) {
+                simdgroup_bfloat8x8 af_s, af_w, bf;
+                simdgroup_load(bf, w_base + k + kf, n, ulong2(0), true);
+                simdgroup_load(af_s, a_s + kf, L);
+                simdgroup_load(af_w, a_w + kf, L);
+                simdgroup_multiply_accumulate(acc_s, af_s, bf, acc_s);
+                simdgroup_multiply_accumulate(acc_w, af_w, bf, acc_w);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const uint fr = ((lane / 4u) & 4u) + (lane / 2u) % 4u;
+    const uint fc = (((lane / 4u) & 2u) + lane % 2u) * 2u;
+    if (fr < rows) {
+        const uint col = c0 + simd * 8u + fc;
+        device float *out_s = arena + y_off + ulong(row0 + fr) * ys + col;
+        device float *out_w = arena + wy_off + ulong(row0 + fr) * wys + col;
+        for (uint e = 0u; e < 2u; ++e) {
+            if (col + e < m) {
+                const float rs = mk_bf16(acc_s.thread_elements()[e]);
+                const float rw = mk_bf16(acc_w.thread_elements()[e]);
+                const float ss = tanh(rs / scale) * scale;
+                const float sw = tanh(rw / scale) * scale;
+                if constexpr (Fixed) {
+                    out_s[e] = (omega == 0.0f) ? ss : (ss + omega * (ss - sw));
+                } else {
+                    out_s[e] = ss;
+                    out_w[e] = sw;
+                }
+            }
+        }
+    }
+}
+
+kernel void mk_bf16_mma_m8n16_softcap_loopcd_direct(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                    constant MK &p [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+                                                    uint tid [[thread_index_in_threadgroup]],
+                                                    uint simd [[simdgroup_index_in_threadgroup]],
+                                                    uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup bfloat a_s[8u * 72u];
+    alignas(16) threadgroup bfloat a_w[8u * 72u];
+    const uint c0 = group * 16u;
+    if (c0 >= p.m) return;
+    mk_bf16_mma_loopcd_direct_impl<16u, true>(
+        arena, p.x, p.xs, p.z, p.zs, p.y, p.ys, p.every, p.pad_k,
+        p.row0, p.rows, p.m, p.n, p.scale, p.eps, w, p.w, c0, a_s, a_w, tid, simd, lane);
+}
+
+kernel void mk_bf16_mma_m8n32_softcap_loopcd_direct(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                    constant MK &p [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+                                                    uint tid [[thread_index_in_threadgroup]],
+                                                    uint simd [[simdgroup_index_in_threadgroup]],
+                                                    uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup bfloat a_s[8u * 72u];
+    alignas(16) threadgroup bfloat a_w[8u * 72u];
+    const uint c0 = group * 32u;
+    if (c0 >= p.m) return;
+    mk_bf16_mma_loopcd_direct_impl<32u, true>(
+        arena, p.x, p.xs, p.z, p.zs, p.y, p.ys, p.every, p.pad_k,
+        p.row0, p.rows, p.m, p.n, p.scale, p.eps, w, p.w, c0, a_s, a_w, tid, simd, lane);
+}
+
+kernel void mk_bf16_mma_m8n16_softcap_dual_direct(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                  constant MK &p [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint simd [[simdgroup_index_in_threadgroup]],
+                                                  uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup bfloat a_s[8u * 72u];
+    alignas(16) threadgroup bfloat a_w[8u * 72u];
+    const uint c0 = group * 16u;
+    if (c0 >= p.m) return;
+    mk_bf16_mma_loopcd_direct_impl<16u, false>(
+        arena, p.x, p.xs, p.z, p.zs, p.y, p.ys, p.every, p.pad_k,
+        p.row0, p.rows, p.m, p.n, p.scale, p.eps, w, p.w, c0, a_s, a_w, tid, simd, lane);
+}
+
+kernel void mk_bf16_mma_m8n32_softcap_dual_direct(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+                                                  constant MK &p [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint simd [[simdgroup_index_in_threadgroup]],
+                                                  uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup bfloat a_s[8u * 72u];
+    alignas(16) threadgroup bfloat a_w[8u * 72u];
+    const uint c0 = group * 32u;
+    if (c0 >= p.m) return;
+    mk_bf16_mma_loopcd_direct_impl<32u, false>(
+        arena, p.x, p.xs, p.z, p.zs, p.y, p.ys, p.every, p.pad_k,
+        p.row0, p.rows, p.m, p.n, p.scale, p.eps, w, p.w, c0, a_s, a_w, tid, simd, lane);
+}
+
 // ---- Step 3C kernels: depth attention, depth+norm fusions, rmsnorm_fast, add_norm, store_pack, conv, l2_clip, relbias ----
 constant uint MK_INKLING_ROUND_RES = 64u;
 

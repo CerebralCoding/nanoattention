@@ -3204,9 +3204,13 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             const xw = self.words(l1.x);
             const out = self.words(cap0.out);
             const weak_out = self.words(cap1.out);
-            const vector = l0.x.width % 128 == 0 and xs.off % 4 == 0 and xs.stride % 4 == 0 and
-                xw.off % 4 == 0 and xw.stride % 4 == 0 and w.tensor.offset % 8 == 0;
-            if (rows >= 1 and rows <= 8 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
+            if (rows >= 1 and rows <= 8 and self.knobs.bf16_verify_mma and self.knobs.bf16_linear_tile and
+                cap0.out.width >= 16384 and l0.input_bf16 and l1.input_bf16 and
+                w.tensor.dtype == .bf16 and w.quant == null and
+                l0.x.width % 64 == 0 and xs.off % 4 == 0 and xs.stride % 4 == 0 and
+                xw.off % 4 == 0 and xw.stride % 4 == 0 and w.tensor.offset % 16 == 0 and
+                w.tensor.shape[0] >= ((@as(u64, cap0.out.width) + 15) / 16) * 16)
+            {
                 p.w = w.tensor.offset;
                 p.x = xs.off;
                 p.xs = xs.stride;
@@ -3220,23 +3224,52 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 p.m = cap0.out.width;
                 p.scale = cap0.transform.softcap;
                 p.eps = cd.omega;
-                const wide8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
-                const kname: [:0]const u8 = if (rows == 1) (if (!cd.adaptive)
-                    (if (wide8) "mk_bf16_linear_4x2_softcap_loopcd_vec8" else "mk_bf16_linear_4x2_softcap_loopcd")
-                else
-                    (if (wide8) "mk_bf16_linear_4x2_softcap_dual_vec8" else "mk_bf16_linear_4x2_softcap_dual")) else (if (!cd.adaptive)
-                    (if (wide8) "mk_bf16_linear_1xR_softcap_loopcd_vec8" else "mk_bf16_linear_1xR_softcap_loopcd")
-                else
-                    (if (wide8) "mk_bf16_linear_1xR_softcap_dual_vec8" else "mk_bf16_linear_1xR_softcap_dual"));
-                const threads: usize = if (rows == 1) ((@as(usize, p.m) + 3) / 4) * 32 else @as(usize, p.m) * 32;
-                try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, threads, self.knobs.linear_group);
+                if (w.tensor.shape[0] >= ((@as(u64, p.m) + 31) / 32) * 32) {
+                    const kname: [:0]const u8 = if (!cd.adaptive) "mk_bf16_mma_m8n32_softcap_loopcd_direct" else "mk_bf16_mma_m8n32_softcap_dual_direct";
+                    try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 31) / 32) * 128, 128);
+                } else {
+                    const kname: [:0]const u8 = if (!cd.adaptive) "mk_bf16_mma_m8n16_softcap_loopcd_direct" else "mk_bf16_mma_m8n16_softcap_dual_direct";
+                    try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 15) / 16) * 64, 64);
+                }
                 if (cd.adaptive) {
                     self.ctx.nano_dispatch_flags = null;
                     try self.encodeLoopCdContrast(cd, row0, rows);
                 }
             } else {
-                self.ctx.nano_dispatch_flags = null;
-                for (0..7) |k| try self.encode(ops[i + k], row0, rows);
+                const vector = l0.x.width % 128 == 0 and xs.off % 4 == 0 and xs.stride % 4 == 0 and
+                    xw.off % 4 == 0 and xw.stride % 4 == 0 and w.tensor.offset % 8 == 0;
+                if (rows >= 1 and rows <= 8 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
+                    p.w = w.tensor.offset;
+                    p.x = xs.off;
+                    p.xs = xs.stride;
+                    p.z = xw.off;
+                    p.zs = xw.stride;
+                    p.y = out.off;
+                    p.ys = out.stride;
+                    p.every = weak_out.off;
+                    p.pad_k = weak_out.stride;
+                    p.n = l0.x.width;
+                    p.m = cap0.out.width;
+                    p.scale = cap0.transform.softcap;
+                    p.eps = cd.omega;
+                    const wide8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
+                    const kname: [:0]const u8 = if (rows == 1) (if (!cd.adaptive)
+                        (if (wide8) "mk_bf16_linear_4x2_softcap_loopcd_vec8" else "mk_bf16_linear_4x2_softcap_loopcd")
+                    else
+                        (if (wide8) "mk_bf16_linear_4x2_softcap_dual_vec8" else "mk_bf16_linear_4x2_softcap_dual")) else (if (!cd.adaptive)
+                        (if (wide8) "mk_bf16_linear_1xR_softcap_loopcd_vec8" else "mk_bf16_linear_1xR_softcap_loopcd")
+                    else
+                        (if (wide8) "mk_bf16_linear_1xR_softcap_dual_vec8" else "mk_bf16_linear_1xR_softcap_dual"));
+                    const threads: usize = if (rows == 1) ((@as(usize, p.m) + 3) / 4) * 32 else @as(usize, p.m) * 32;
+                    try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, threads, self.knobs.linear_group);
+                    if (cd.adaptive) {
+                        self.ctx.nano_dispatch_flags = null;
+                        try self.encodeLoopCdContrast(cd, row0, rows);
+                    }
+                } else {
+                    self.ctx.nano_dispatch_flags = null;
+                    for (0..7) |k| try self.encode(ops[i + k], row0, rows);
+                }
             }
         },
         .controller_depth_norms => |i| {

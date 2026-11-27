@@ -48,14 +48,48 @@ SENTINEL = "\x00recorded-{}\x00"
 WRAPPER = "<|message_model|><|content_text|>{}<|end_message|><|content_model_end_sampling|>"
 
 
-def native_command(binary, checkpoint, context):
+def native_command(
+    binary,
+    checkpoint,
+    context,
+    *,
+    knobs=None,
+    draft=None,
+    loop_passes=None,
+    loopcd=None,
+    loopcd_omega=None,
+    loopcd_weak_pass=None,
+    lsa=False,
+):
     sys_path = Path(__file__).resolve().parent
-    knobs = _knobs(sys_path)
-    command = [str(binary), "session", str(checkpoint), "--context", str(context), "--knob", "batch=" + str(CHUNK)]
+    repo_root = sys_path.parent
     drop = set(filter(None, os.environ.get("NANO_DROP_KNOBS", "").split(",")))  # experiments: knobs to leave out
-    for knob in knobs:
-        if knob.split("=")[0] not in drop:
-            command += ["--knob", knob]
+    command = [str(binary), "session", str(checkpoint), "--context", str(context)]
+    inkling_preset = repo_root / "src" / "mega" / "presets" / "inkling.json"
+    if knobs is not None:
+        command += ["--knobs", str(knobs)]
+    elif inkling_preset.is_file() and not drop:
+        command += ["--knobs", str(inkling_preset)]
+    else:
+        for knob in _knobs(sys_path):
+            if knob.split("=")[0] not in drop:
+                command += ["--knob", knob]
+    command += ["--knob", "batch=" + str(CHUNK)]
+    if drop and inkling_preset.is_file() and knobs is not None:
+        for name in sorted(drop):
+            command += ["--knob", f"{name}=false"]
+    if lsa:
+        command += ["--knob", "lsa=true", "--knob", "lsa_cross_loop_reuse=true"]
+    if loop_passes is not None:
+        command += ["--loop-passes", str(loop_passes)]
+    if loopcd is not None:
+        command += ["--loopcd", str(loopcd)]
+    if loopcd_omega is not None:
+        command += ["--loopcd-omega", str(loopcd_omega)]
+    if loopcd_weak_pass is not None:
+        command += ["--loopcd-weak-pass", str(loopcd_weak_pass)]
+    if draft is not None:
+        command += ["--draft", str(draft)]
     return command
 
 
@@ -134,10 +168,14 @@ class InklingBackend(Backend):
         result = super().execute(plan)
         if self.record:
             generated = self.cached_ids[len(plan["ids"]):]
+            na = result["nanoattention"]
             line = dict(index=len(self.metrics), prompt_ids=plan["ids"], suffix_ids=plan["suffix"], generated_ids=generated,
                         reused_prefix_tokens=plan["reused"], reset=plan["reset"],
-                        prefill_seconds=result["nanoattention"]["prefill_seconds"],
-                        decode_seconds=result["nanoattention"]["decode_seconds"],
+                        prefill_seconds=na["prefill_seconds"],
+                        decode_seconds=na["decode_seconds"],
+                        speculative_batches=na.get("speculative_batches", 0),
+                        speculative_proposed=na.get("speculative_proposed", 0),
+                        speculative_accepted=na.get("speculative_accepted", 0),
                         finish_reason=result["choices"][0]["finish_reason"],
                         tool_calls=[c["function"]["name"] for c in result["choices"][0]["message"].get("tool_calls", [])])
             with open(self.record, "a") as stream:
@@ -150,6 +188,13 @@ def main():
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--engine", choices=("native", "mlx"), required=True)
     parser.add_argument("--binary", type=Path, help="nano, for --engine native")
+    parser.add_argument("--knobs", type=Path, help="knobs JSON preset for --engine native (default: src/mega/presets/inkling.json)")
+    parser.add_argument("--draft", type=Path, help="DFlash 2 draft checkpoint directory (for --engine native)")
+    parser.add_argument("--loop-passes", type=int, help="Inkling core loop passes (1..3, for --engine native)")
+    parser.add_argument("--loopcd", choices=("off", "hidden", "logits", "logits-adaptive"), help="Inkling LoopCD mode (--engine native)")
+    parser.add_argument("--loopcd-omega", type=float, help="LoopCD contrast scale omega >= 0 (--engine native)")
+    parser.add_argument("--loopcd-weak-pass", type=int, help="1-based LoopCD weak pass index (--engine native)")
+    parser.add_argument("--lsa", action="store_true", help="Enable Q4 Multi-Head LSA + cross-loop reuse (--engine native)")
     parser.add_argument("--mlx-python", type=Path, help="a Python with mlx-lm, for --engine mlx")
     parser.add_argument("--port", type=int, default=8080, help="loopback only; 0 chooses a disposable port")
     parser.add_argument("--context", type=int, default=16384)
@@ -166,8 +211,21 @@ def main():
     if args.engine == "native":
         if not args.binary:
             parser.error("--engine native needs --binary")
-        command = native_command(args.binary.resolve(), args.checkpoint.resolve(), args.context)
+        command = native_command(
+            args.binary.resolve(),
+            args.checkpoint.resolve(),
+            args.context,
+            knobs=args.knobs.resolve() if args.knobs else None,
+            draft=args.draft.resolve() if args.draft else None,
+            loop_passes=args.loop_passes,
+            loopcd=args.loopcd,
+            loopcd_omega=args.loopcd_omega,
+            loopcd_weak_pass=args.loopcd_weak_pass,
+            lsa=args.lsa,
+        )
     else:
+        if any(x is not None for x in (args.knobs, args.draft, args.loop_passes, args.loopcd, args.loopcd_omega, args.loopcd_weak_pass)) or args.lsa:
+            parser.error("--knobs/--draft/--loop-passes/--loopcd/--lsa are only supported with --engine native")
         if not args.mlx_python:
             parser.error("--engine mlx needs --mlx-python")
         command = mlx_command(args.mlx_python.absolute(), args.checkpoint.resolve(), args.context)

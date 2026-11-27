@@ -59,5 +59,6 @@ pub const chat = @import("chat.zig");
 /// The model's chat template, if its front end supplies one.
 pub fn chatTemplate(model_type: []const u8) ?chat.Template {
     if (std.mem.eql(u8, model_type, "lfm3")) return lfm3.chat_template;
+    if (std.mem.eql(u8, model_type, "inkling2_loop")) return inkling2_loop.chat_template;
     return null;
 }

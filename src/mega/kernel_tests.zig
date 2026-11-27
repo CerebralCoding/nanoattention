@@ -4339,3 +4339,93 @@ test "inkling 2p remap, MMA tile, router group, and DFlash GQA-4 constants match
     try testing.expectEqual(@as(u32, 128), inkling.dflash_head_dim);
     try testing.expectEqual(@as(u32, 2048), inkling.dflash_ring_cap);
 }
+
+test "BF16 MMA LoopCD fixed and dual softcap direct match CPU reference and rows=1 vs rows=8 bit-for-bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x7c0d_100b);
+    const rand = prng.random();
+    const rows: u32 = 8;
+    const m: u32 = 128;
+    const n: u32 = 128;
+    const scale: f32 = 30.0;
+    const omega: f32 = 0.6;
+
+    const x_s_off: u32 = 0;
+    const x_w_off: u32 = rows * n;
+    const out_s_off: u32 = x_w_off + rows * n;
+    const out_w_off: u32 = out_s_off + rows * m;
+    const ref_s_off: u32 = out_w_off + rows * m;
+    const ref_w_off: u32 = ref_s_off + rows * m;
+    const arena = try ctx.alloc(ref_w_off + rows * m);
+    defer arena.deinit();
+
+    const weights = try ctx.alloc((@as(usize, m) * n) / 2);
+    defer weights.deinit();
+    const w16 = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(weights.floats()));
+    for (w16) |*h| h.* = bf16(rand.floatNorm(f32) * 0.12);
+
+    const af = arena.floats();
+    for (af[0 .. rows * n], 0..) |*v, idx| {
+        const vv = fromBf16(bf16(rand.floatNorm(f32) * 0.25));
+        v.* = vv;
+        af[x_w_off + idx] = fromBf16(bf16(rand.floatNorm(f32) * 0.25));
+    }
+
+    inline for (.{ false, true }) |adaptive| {
+        @memset(af[out_s_off..], -9.0);
+        const kname: [:0]const u8 = if (adaptive) "mk_bf16_mma_m8n32_softcap_dual_direct" else "mk_bf16_mma_m8n32_softcap_loopcd_direct";
+        var pg: gpu.Params = .{
+            .rows = rows,
+            .row0 = 0,
+            .x = x_s_off,
+            .xs = n,
+            .z = x_w_off,
+            .zs = n,
+            .y = out_s_off,
+            .ys = m,
+            .every = out_w_off,
+            .pad_k = m,
+            .n = n,
+            .m = m,
+            .scale = scale,
+            .eps = omega,
+        };
+        try gpu.dispatch(ctx, kname, &.{ weights, arena }, &pg, ((@as(usize, m) + 31) / 32) * 128, 128);
+
+        for (0..rows) |r| {
+            var p1 = pg;
+            p1.rows = 1;
+            p1.row0 = @intCast(r);
+            p1.y = ref_s_off;
+            p1.every = ref_w_off;
+            try gpu.dispatch(ctx, kname, &.{ weights, arena }, &p1, ((@as(usize, m) + 31) / 32) * 128, 128);
+        }
+        try ctx.finish();
+
+        const au = arena.structs(u32);
+        try testing.expectEqualSlices(u32, au[ref_s_off..][0 .. rows * m], au[out_s_off..][0 .. rows * m]);
+        if (adaptive) {
+            try testing.expectEqualSlices(u32, au[ref_w_off..][0 .. rows * m], au[out_w_off..][0 .. rows * m]);
+        }
+
+        // Check against CPU BF16 reference
+        for (0..rows) |r| {
+            for (0..m) |col| {
+                var sum_s: f64 = 0;
+                var sum_w: f64 = 0;
+                for (0..n) |k| {
+                    const wf: f64 = fromBf16(w16[col * n + k]);
+                    sum_s += @as(f64, fromBf16(bf16(af[x_s_off + r * n + k]))) * wf;
+                    sum_w += @as(f64, fromBf16(bf16(af[x_w_off + r * n + k]))) * wf;
+                }
+                const ss = std.math.tanh(@as(f32, @floatCast(sum_s)) / scale) * scale;
+                const sw = std.math.tanh(@as(f32, @floatCast(sum_w)) / scale) * scale;
+                const exp_s = if (adaptive) ss else ss + omega * (ss - sw);
+                try close(exp_s, af[out_s_off + r * m + col], 2e-2);
+                if (adaptive) try close(sw, af[out_w_off + r * m + col], 2e-2);
+            }
+        }
+    }
+}

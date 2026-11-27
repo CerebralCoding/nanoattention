@@ -25,6 +25,8 @@ pub const Template = struct {
     /// Markers of a reasoning segment in the model's output (added tokens).
     think_open: []const u8,
     think_close: []const u8,
+    /// Whether the generation prompt opens inside a reasoning segment (`<think>`).
+    starts_in_think: bool = true,
 };
 
 fn pythonSpace(cp: u21) bool {

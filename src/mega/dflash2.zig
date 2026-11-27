@@ -145,14 +145,23 @@ pub const PrefillResult = struct {
     forwards: usize,
 };
 
+pub const StreamHook = struct {
+    ctx: *anyopaque,
+    on_token: *const fn (ctx: *anyopaque, tok: u32, is_eos: bool) anyerror!void,
+    should_stop: ?*const fn (ctx: *anyopaque) bool = null,
+};
+
 pub const DecodeOptions = struct {
     stop_on_eos: bool = true,
     commit_all: bool = false,
+    stream: ?StreamHook = null,
 };
 
 pub const DecodeResult = struct {
     count: usize,
     eos: bool,
+    interrupted: bool = false,
+    context_full: bool = false,
     last_row: u32,
     next_token: u32,
     batches: usize,
@@ -1295,14 +1304,39 @@ pub const Draft = struct {
         var draft_seconds: f64 = 0;
         var verify_seconds: f64 = 0;
         var eos = false;
+        var interrupted = false;
+        var context_full = false;
 
         while (count < limit) {
+            if (opts.stream) |sh| {
+                if (sh.should_stop) |stop_fn| if (stop_fn(sh.ctx)) {
+                    if (opts.commit_all and pending_commit > 0) {
+                        const td_int = try io.now();
+                        try self.commitContext(target.ctx, pending_commit, true);
+                        pending_commit = 0;
+                        draft_seconds += (try io.now()) - td_int;
+                    }
+                    interrupted = true;
+                    break;
+                };
+            }
             const remaining = limit - count;
-            if ((opts.stop_on_eos and isEos(target, anchor)) or remaining == 1) {
+            const avail_ctx = target.context -| target.position;
+            if ((opts.stop_on_eos and isEos(target, anchor)) or remaining == 1 or avail_ctx == 0) {
+                const anchor_eos = opts.stop_on_eos and isEos(target, anchor);
                 out_tokens[count] = anchor;
                 count += 1;
-                eos = opts.stop_on_eos and isEos(target, anchor);
-                if (opts.commit_all) {
+                eos = anchor_eos;
+                if (opts.stream) |sh| try sh.on_token(sh.ctx, anchor, anchor_eos);
+                if (avail_ctx == 0) {
+                    if (!eos) context_full = true;
+                    if (opts.commit_all and pending_commit > 0) {
+                        const td_ctx = try io.now();
+                        try self.commitContext(target.ctx, pending_commit, true);
+                        pending_commit = 0;
+                        draft_seconds += (try io.now()) - td_ctx;
+                    }
+                } else if (opts.commit_all) {
                     const tv0 = try io.now();
                     if (pending_commit > 0) {
                         try self.commitContext(target.ctx, pending_commit, true);
@@ -1324,7 +1358,7 @@ pub const Draft = struct {
             }
 
             const max_block = @min(verify_cap, @min(self.cfg.block_size, target.batch));
-            const propose_size: u32 = @intCast(@min(max_block, remaining));
+            const propose_size: u32 = @intCast(@min(max_block, @min(remaining, avail_ctx)));
             var verify_size: u32 = propose_size;
 
             const td0 = try io.now();
@@ -1374,13 +1408,16 @@ pub const Draft = struct {
             // Emit `anchor` + matched prefix up to EOS or `limit`.
             out_tokens[count] = anchor;
             count += 1;
+            if (opts.stream) |sh| try sh.on_token(sh.ctx, anchor, false);
             var kept: u32 = 1;
             for (0..acc) |k| {
                 const tok = block[1 + k];
                 out_tokens[count] = tok;
                 count += 1;
                 kept += 1;
-                if (opts.stop_on_eos and isEos(target, tok)) {
+                const tok_eos = opts.stop_on_eos and isEos(target, tok);
+                if (opts.stream) |sh| try sh.on_token(sh.ctx, tok, tok_eos);
+                if (tok_eos) {
                     eos = true;
                     break;
                 }
@@ -1407,6 +1444,8 @@ pub const Draft = struct {
         return .{
             .count = count,
             .eos = eos,
+            .interrupted = interrupted,
+            .context_full = context_full,
             .last_row = last_row,
             .next_token = next_token,
             .batches = batches,

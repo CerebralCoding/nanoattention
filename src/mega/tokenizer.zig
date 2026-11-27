@@ -15,8 +15,10 @@ const std = @import("std");
 const tables = @import("unicode_tables.zig");
 const Allocator = std.mem.Allocator;
 
-/// The one pre-tokenizer regex implemented (Llama 3's, used by LFM3), matched by `pieceEnd`.
+/// Supported pre-tokenizer regexes (Llama 3 / LFM3, and o200k_base / Inkling 2 Mini).
 pub const split_pattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+pub const o200k_split_pattern = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+pub const SplitPattern = enum { llama3, o200k };
 
 pub const replacement = "\u{FFFD}";
 
@@ -262,6 +264,172 @@ pub fn pieceEnd(s: []const u8, i: usize) usize {
     return j;
 }
 
+const O200kClass = tables.O200kClass;
+
+fn o200kClassSearch(cp: u21) O200kClass {
+    var lo: usize = 0;
+    var hi: usize = tables.o200k_ranges.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const r = tables.o200k_ranges[mid];
+        if (cp < r.lo) {
+            hi = mid;
+        } else if (cp > r.hi) {
+            lo = mid + 1;
+        } else return r.class;
+    }
+    return .other;
+}
+const ascii_o200k_class: [128]O200kClass = blk: {
+    @setEvalBranchQuota(100000);
+    var t: [128]O200kClass = undefined;
+    for (&t, 0..) |*c, i| c.* = o200kClassSearch(i);
+    break :blk t;
+};
+pub inline fn o200kClassOf(cp: u21) O200kClass {
+    return if (cp < 128) ascii_o200k_class[cp] else o200kClassSearch(cp);
+}
+
+inline fn isO200kLetter(k: O200kClass) bool {
+    return k == .upper or k == .lower or k == .other_letter;
+}
+inline fn isO200kA(k: O200kClass) bool {
+    return k == .upper or k == .other_letter or k == .mark;
+}
+inline fn isO200kB(k: O200kClass) bool {
+    return k == .lower or k == .other_letter or k == .mark;
+}
+inline fn isO200kPrefix(cp: u21, k: O200kClass) bool {
+    return cp != '\r' and cp != '\n' and !isO200kLetter(k) and k != .number;
+}
+inline fn isO200kNonWordNonSpace(k: O200kClass) bool {
+    return k == .other or k == .mark;
+}
+
+fn matchContraction(s: []const u8, i: usize) ?usize {
+    if (i >= s.len) return null;
+    const c0 = cpAt(s, i);
+    const j1 = i + c0.len;
+    if (c0.cp != '\'' or j1 >= s.len) return null;
+    const c1 = cpAt(s, j1);
+    const j2 = j1 + c1.len;
+    switch (c1.cp) {
+        's', 'S', 0x17F, 't', 'T', 'm', 'M', 'd', 'D' => return j2,
+        'r', 'R', 'v', 'V' => if (j2 < s.len and (s[j2] == 'e' or s[j2] == 'E')) return j2 + 1,
+        'l', 'L' => if (j2 < s.len and (s[j2] == 'l' or s[j2] == 'L')) return j2 + 1,
+        else => {},
+    }
+    return null;
+}
+
+/// Greedy `A* B+` where A = Lu|Lt|Lm|Lo|M and B = Ll|Lm|Lo|M, with backtracking on `A*`.
+fn matchABPlus(s: []const u8, start: usize) ?usize {
+    var a_end = start;
+    var last_b_end: ?usize = null;
+    while (a_end < s.len) {
+        const c = cpAt(s, a_end);
+        const k = o200kClassOf(c.cp);
+        if (!isO200kA(k)) break;
+        const next_end = a_end + c.len;
+        if (isO200kB(k)) last_b_end = next_end;
+        a_end = next_end;
+    }
+    if (a_end < s.len and isO200kB(o200kClassOf(cpAt(s, a_end).cp))) {
+        var b_end = a_end;
+        while (b_end < s.len) {
+            const c = cpAt(s, b_end);
+            if (!isO200kB(o200kClassOf(c.cp))) break;
+            b_end += c.len;
+        }
+        return b_end;
+    }
+    return last_b_end;
+}
+
+/// Greedy `A+ B*` where A = Lu|Lt|Lm|Lo|M and B = Ll|Lm|Lo|M.
+fn matchAPlusBStar(s: []const u8, start: usize) ?usize {
+    var a_end = start;
+    while (a_end < s.len) {
+        const c = cpAt(s, a_end);
+        if (!isO200kA(o200kClassOf(c.cp))) break;
+        a_end += c.len;
+    }
+    if (a_end == start) return null;
+    var b_end = a_end;
+    while (b_end < s.len) {
+        const c = cpAt(s, b_end);
+        if (!isO200kB(o200kClassOf(c.cp))) break;
+        b_end += c.len;
+    }
+    return b_end;
+}
+
+/// Exact hand-matched `o200k_base` Split regex starting at `i` (< s.len) of valid UTF-8.
+pub fn pieceEndO200k(s: []const u8, i: usize) usize {
+    const c0 = cpAt(s, i);
+    const k0 = o200kClassOf(c0.cp);
+    const j1 = i + c0.len;
+
+    // Alt 1: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+    if (isO200kPrefix(c0.cp, k0) and j1 < s.len) {
+        if (matchABPlus(s, j1)) |end| return matchContraction(s, end) orelse end;
+    }
+    if (matchABPlus(s, i)) |end| return matchContraction(s, end) orelse end;
+
+    // Alt 2: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+    if (isO200kPrefix(c0.cp, k0) and j1 < s.len) {
+        if (matchAPlusBStar(s, j1)) |end| return matchContraction(s, end) orelse end;
+    }
+    if (matchAPlusBStar(s, i)) |end| return matchContraction(s, end) orelse end;
+
+    // Alt 3: \p{N}{1,3}
+    if (k0 == .number) {
+        var j = j1;
+        var n: usize = 1;
+        while (n < 3 and j < s.len) : (n += 1) {
+            const c = cpAt(s, j);
+            if (o200kClassOf(c.cp) != .number) break;
+            j += c.len;
+        }
+        return j;
+    }
+
+    // Alt 4:  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    var other_start: ?usize = null;
+    if (isO200kNonWordNonSpace(k0)) {
+        other_start = j1;
+    } else if (c0.cp == ' ' and j1 < s.len) {
+        const c1 = cpAt(s, j1);
+        if (isO200kNonWordNonSpace(o200kClassOf(c1.cp))) other_start = j1 + c1.len;
+    }
+    if (other_start) |start| {
+        var j = start;
+        while (j < s.len) {
+            const c = cpAt(s, j);
+            if (!isO200kNonWordNonSpace(o200kClassOf(c.cp))) break;
+            j += c.len;
+        }
+        while (j < s.len and (s[j] == '\r' or s[j] == '\n' or s[j] == '/')) j += 1;
+        return j;
+    }
+
+    // Alts 5-7: \s*[\r\n]+ | \s+(?!\S) | \s+
+    var j = j1;
+    var last = i;
+    var newline: ?usize = if (c0.cp == '\r' or c0.cp == '\n') i else null;
+    while (j < s.len) {
+        const c = cpAt(s, j);
+        if (o200kClassOf(c.cp) != .space) break;
+        if (c.cp == '\r' or c.cp == '\n') newline = j;
+        last = j;
+        j += c.len;
+    }
+    if (newline) |p| return p + 1;
+    if (j == s.len) return j;
+    if (last > i) return last;
+    return j;
+}
+
 // ---- the tokenizer ----
 
 const Merge = struct { rank: u32, id: u32 };
@@ -314,6 +482,7 @@ pub const Tokenizer = struct {
     merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty,
     byte_ids: [256]?u32 = @splat(null),
     ignore_merges: bool = false,
+    split: SplitPattern = .llama3,
     non_normalized: AddedSet = .{},
     normalized: AddedSet = .{},
     added: []AddedToken = &.{},
@@ -363,7 +532,7 @@ pub const Tokenizer = struct {
         for ([_][]const u8{ "truncation", "padding", "normalizer" }) |key| {
             if (o.get(key)) |v| if (v != .null) return diag.fail("\"{s}\" is not supported (only null)", .{key});
         }
-        try checkPreTokenizer(o.get("pre_tokenizer"), diag);
+        self.split = try checkPreTokenizer(o.get("pre_tokenizer"), diag);
         if (o.get("post_processor")) |v| if (v != .null) {
             // ByteLevel post-processing only trims offsets; it adds no tokens.
             const ty = typeName(v);
@@ -546,7 +715,7 @@ pub const Tokenizer = struct {
     fn pretokenized(self: *const Tokenizer, gpa: Allocator, text: []const u8, sc: *Scratch, out: *std.ArrayList(u32)) !void {
         var i: usize = 0;
         while (i < text.len) {
-            const end = pieceEnd(text, i);
+            const end = if (self.split == .o200k) pieceEndO200k(text, i) else pieceEnd(text, i);
             try self.bpe(gpa, text[i..end], sc, out);
             i = end;
         }
@@ -671,9 +840,9 @@ fn trunc(s: []const u8) []const u8 {
     return s[0..@min(s.len, 80)];
 }
 
-fn checkPreTokenizer(v: ?std.json.Value, diag: *Diagnostic) !void {
+fn checkPreTokenizer(v: ?std.json.Value, diag: *Diagnostic) !SplitPattern {
     const p = v orelse return diag.fail("no pre_tokenizer (only Sequence[Split, ByteLevel] is supported)", .{});
-    const unsupported = "pre_tokenizer: only Sequence[Split(the Llama 3 regex, Isolated), ByteLevel(no prefix space, no regex)] is supported";
+    const unsupported = "pre_tokenizer: only Sequence[Split(Llama 3 or o200k_base regex, Isolated), ByteLevel(no prefix space, no regex)] is supported";
     if (!std.mem.eql(u8, typeName(p), "Sequence")) return diag.fail("pre_tokenizer \"{s}\" is not supported; {s}", .{ typeName(p), unsupported });
     const list = p.object.get("pretokenizers") orelse return diag.fail("{s}", .{unsupported});
     if (list != .array or list.array.items.len != 2) return diag.fail("{s}", .{unsupported});
@@ -683,7 +852,12 @@ fn checkPreTokenizer(v: ?std.json.Value, diag: *Diagnostic) !void {
     const pattern = split.object.get("pattern") orelse return diag.fail("{s}", .{unsupported});
     const regex = if (pattern == .object) pattern.object.get("Regex") else null;
     if (regex == null or regex.? != .string) return diag.fail("Split pattern must be a Regex; {s}", .{unsupported});
-    if (!std.mem.eql(u8, regex.?.string, split_pattern)) return diag.fail("Split regex {s} is not implemented (only the Llama 3 pattern is)", .{trunc(regex.?.string)});
+    const kind: SplitPattern = if (std.mem.eql(u8, regex.?.string, split_pattern))
+        .llama3
+    else if (std.mem.eql(u8, regex.?.string, o200k_split_pattern))
+        .o200k
+    else
+        return diag.fail("Split regex {s} is not implemented (only Llama 3 and o200k_base patterns are)", .{trunc(regex.?.string)});
     const behavior = split.object.get("behavior") orelse .null;
     if (behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated")) return diag.fail("Split behavior must be Isolated", .{});
     if (split.object.get("invert")) |inv| if (inv != .bool or inv.bool) return diag.fail("Split invert is not supported", .{});
@@ -691,6 +865,7 @@ fn checkPreTokenizer(v: ?std.json.Value, diag: *Diagnostic) !void {
     for ([_][]const u8{ "add_prefix_space", "use_regex" }) |key| {
         if (byte_level.object.get(key)) |f| if (f != .bool or f.bool) return diag.fail("ByteLevel pre-tokenizer {s} is not supported", .{key});
     }
+    return kind;
 }
 
 // ---- tests (CPU only; fixture made by tools/nano_tokenizer_check.py fixture) ----
@@ -769,6 +944,29 @@ test "pre-tokenizer regex alternatives" {
         var i: usize = 0;
         for (case[1]) |want| {
             const end = pieceEnd(case[0], i);
+            try std.testing.expectEqualStrings(want, case[0][i..end]);
+            i = end;
+        }
+        try std.testing.expectEqual(case[0].len, i);
+    }
+}
+
+test "o200k pre-tokenizer regex alternatives" {
+    const cases = [_]struct { []const u8, []const []const u8 }{
+        .{ "HelloWorld", &.{ "Hello", "World" } },
+        .{ "don't IT'S", &.{ "don't", " IT'S" } },
+        .{ " 's", &.{ " '", "s" } },
+        .{ "\u{4E2D}A", &.{ "\u{4E2D}", "A" } },
+        .{ "\u{4E2D}\u{4E2D}A", &.{ "\u{4E2D}\u{4E2D}", "A" } },
+        .{ "e\u{0301}x \u{0301}A", &.{ "e\u{0301}x", " \u{0301}", "A" } },
+        .{ "!\n/x", &.{ "!\n/", "x" } },
+        .{ "12345", &.{ "123", "45" } },
+        .{ "a  \n\n  b", &.{ "a", "  \n\n", " ", " b" } },
+    };
+    for (cases) |case| {
+        var i: usize = 0;
+        for (case[1]) |want| {
+            const end = pieceEndO200k(case[0], i);
             try std.testing.expectEqualStrings(want, case[0][i..end]);
             i = end;
         }
