@@ -268,9 +268,57 @@ Matched 3-repeat `nano bench` throughput on an **Apple M3 Ultra (60 GPU cores, 2
 
 Against published [`ml-explore/mlx-lm#2086`](https://github.com/ml-explore/mlx-lm/pull/2086) numbers (authored by **Jun Kim** [`@jundot`](https://github.com/jundot) with contributions from Pedro Cuenca and Lucas Gelfond, run on an **80-core M3 Ultra / 512 GB**, reporting `1,516.3` / `32.07` tok/s at 4K and `1,472.3` / `32.50` tok/s at 16K), `nano v0.2.0` on 60 cores achieves **`2.01×`** higher decode at 4K and **`1.88×`** at 16K, and exceeds MLX's raw 80-core prefill at both 4K (`+3.5%`) and 16K (`+0.4%`).
 
-See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-Elites QD grid across 4K/16K/32K in [`benchmarks/inkling-qd/elites.md`](benchmarks/inkling-qd/elites.md), the Lean 4 contracts in [`proofs/Inkling.lean`](proofs/Inkling.lean) (`49` public / `53` total theorems), and [`docs/MEGAKERNEL.md`](docs/MEGAKERNEL.md).
+#### `v0.3.0`: DFlash 2 Speculative Decoding + AngelSpec `D-cut` + Lean-Maxx Kernels
 
-**Parity & limits:** `inkling.json` is bit-identical (`max_abs = 0.0`) to pre-Qwegn `megakernel-v1` across `cake_toks` (`feed=1, 8`), `real_512` (`feed=512`, `560/560` top-1, `32/32` greedy), and `long_real` (`feed=512`, `568/568` top-1, `32/32` greedy), matches `64/64` greedy tokens on `cake_toks` against baseline, and passes [`tools/nano_inkling_attention_check.py`](tools/nano_inkling_attention_check.py) (`24/24` top-1 agreement across six arm pairs). Note that `nano` runs the text path only: the vision tower and the checkpoint's bundled `mtp.safetensors` block-diffusion drafter are not yet wired.
+`nano v0.3.0` wires native [`DFlash2DraftModel`](src/mega/dflash2.zig) speculative drafting (`--draft`), LoopCD contrastive decoding (`--loop-passes 3 --loopcd hidden --loopcd-omega 0.5`), and **AngelSpec `D-cut`** adaptive verification depth pruning ([`dflash_dcut`](src/mega/knobs.zig#L76) + unified target `bf16_verify_mma` enabled in [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json)):
+
+```sh
+./zig-out/bin/nano session "$CKPT" --knobs src/mega/presets/inkling.json \
+  --context 8192 --loop-passes 3 --loopcd hidden --loopcd-omega 0.5 \
+  --draft /path/to/inkling-2-mini-dflash2
+```
+
+- **Why `D-cut` wins without retraining:** Because Inkling 2 Mini is a 128-expert MoE target, verifying a full `r=8` draft block (`45.6 ms`) costs **`2.72×`** more than `r=1` (`16.8 ms`) while DFlash 2 takes `~4.1–4.7 ms/batch`. Computing exact post-selector softmax confidence ($c_t \in [0, 1]$ in [`df_top16_part` / `df_top16_merge` / `df_select_path`](src/mega/dflash2.metal)) and truncating low-confidence tails online via $r^* = \arg\max_r U(r)/(t_{\text{draft}} + t_{\text{verify}}(r))$ improves every workload while preserving **100% exact greedy parity** (`base == draft`).
+- **Metal kernel optimizations:** Target path adds `mk_bf16_mma_m8n32_softcap_direct` (unified rows `1..8` `unembed`), `splitk_vec8`, fused `mk_route_topk_group_tiles`, hoisted grouped MoE NVFP4/MXFP8 decode, batched `mk_store_inkling_short_conv_ring_batch`, and `mk_copy_slots4`. Draft path adds `df_bf16_mma_m8n32_direct`, `df_multi_bf16_mma_m8n16_direct` (`Q+K+V` / `K+V`), `df_bf16_gate_up_swiglu_mma`, `df_bf16_linear_splitk_rows_vec8`, `df_grouped_dyn_conv_vec4`, `df_kv_ring_store_vec4`, zero-barrier `df_rmsnorm_rope` / `df_rmsnorm_rope_ring_store`, `df_attention_gqa4`, and `d2_concurrent` overlaps.
+
+Verified coherent 3-pass **Suite A** (`nano session`, M3 Ultra 60-core / 256 GB, `--knobs src/mega/presets/inkling.json`, `0` parity failures, `SafeAllocator` leak = `False`):
+
+| Config | Workload | Base (`tok/s`) | Baseline Draft (`tok/s`) | **Final `v0.3.0` Draft (`tok/s`)** | Speedup vs Base | `mean_step` | Parity / Coherence |
+| :--- | :--- | ---: | ---: | ---: | ---: | :---: | :--- |
+| **`3p_hidden`** (`--loop-passes 3 --loopcd hidden --loopcd-omega 0.5`) | Coding (`54` tok in, `192` out) | `64.76` | `90.18` | **`104.35`** | **`1.61×`** | `4.00` | `True` / Clean |
+| **`3p_hidden`** | Math (`49` tok in, `192` out) | `64.42` | `123.08` | **`125.56`** (`131.07` A/B) | **`1.95×`** | `5.49` | `True` / Clean |
+| **`3p_hidden`** | 4K Code (`4,067` tok in, `256` out) | `62.33` | `75.07` | **`88.48`** | **`1.42×`** | `3.28` | `True` / Clean |
+| **`3p_off`** (`--loop-passes 3 --loopcd off`) | Coding | `60.03` | `89.18` | **`107.00`** | **`1.78×`** | `4.17` | `True` / Clean |
+| **`3p_off`** | Math | `64.33` | `124.41` | **`130.36`** (`132.41` A/B) | **`2.03×`** | `5.65` | `True` / Clean |
+| **`3p_off`** | 4K Code | `62.38` | `54.81` | **`83.83`** | **`1.34×`** | `2.98` | `True` / Clean |
+
+*2-pass limit (`[5, 23, 29]` remap):* `dflash2` automatically remaps 2-pass 37-trace schedules to `{5, 23, 29}` (same physical layers `[4, 10, 16]` as 3-pass `[5, 23, 41]`). While raw 2-pass throughput is fast (`108.31–113.68 tok/s` coding, `138.78 tok/s` loop-inflated `code_4k`), `--loop-passes 2` (`--loopcd off` and `--loopcd hidden --loopcd-omega 0.15..0.40`) still degrades into syntax glitches and repetition loops on math/4K code and fails `32K` needle retrieval (`0/3`), so **3-pass** (`3p_hidden` / `3p_off`) is the recommended coherent setting.
+
+#### Long-Context Q4 Multi-Head LSA, Cross-Loop Reuse & `.nkv` Cartridges (`32K / 64K / 131K`)
+
+Combine `--draft` with `--knob lsa=true --knob lsa_cross_loop_reuse=true` (and optional `--kv-in` / `--kv-out` `.nkv` persistent KV cartridges) for high-speed coherent speculative decode up to 131K–1M context indexing:
+
+```sh
+./zig-out/bin/nano session "$CKPT" --knobs src/mega/presets/inkling.json \
+  --context 131072 --loop-passes 3 --loopcd hidden --loopcd-omega 0.5 \
+  --knob lsa=true --knob lsa_cross_loop_reuse=true \
+  --draft /path/to/inkling-2-mini-dflash2
+```
+
+Verified **Suite B** multi-turn needle retrieval + technical summary (`32K / 64K / 131K`, `SafeAllocator` leak = `False`):
+
+| Context (`prompt_tokens`) | Config | Needle | Exact Parity (`T1,T2`) | Linear Prefill (`tok/s`) | Turn 1 (`base -> draft tok/s`, `ms`) | Turn 2 (`base -> draft tok/s`, `ms`) |
+| ---: | :--- | :---: | :---: | ---: | ---: | ---: |
+| **`32K`** (`32,182`) | **`3p_hidden`** | `True` | `(True, True)` | `1,353.8` | `59.0 ->` **`69.7`** (`2.67`) | `60.8 ->` **`59.6`** (`2.00`) |
+| **`32K`** (`32,182`) | **`3p_off`** | `True` | `(True, True)` | `1,358.2` | `60.9 ->` **`68.9`** (`2.67`) | `60.4 ->` **`70.8`** (`2.61`) |
+| **`64K`** (`64,601`) | **`3p_hidden`** | `True` | `(True, True)` | `1,380.2` | `59.9 ->` **`73.9`** (`2.78`) | `56.7 ->` **`60.9`** (`2.13`) |
+| **`64K`** (`64,601`) | **`3p_off`** | `True` | `(True, True)` | `1,331.2` | `56.0 ->` **`75.3`** (`2.78`) | `56.7 ->` **`77.3`** (`2.98`) |
+| **`131K`** (`129,125`) | **`3p_hidden`** | `True` | `(True, True)` | `1,299.5` | `59.8 ->` **`65.8`** (`2.46`) | `60.2 ->` **`64.9`** (`2.56`) |
+| **`131K`** (`129,125`) | **`3p_off`** | `True` | `(True, True)` | `1,328.1` | `60.3 ->` **`68.1`** (`2.46`) | `60.7 ->` **`70.4`** (`2.56`) |
+
+See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-Elites QD grid across 4K/16K/32K in [`benchmarks/inkling-qd/elites.md`](benchmarks/inkling-qd/elites.md), the Lean 4 contracts in [`proofs/Inkling.lean`](proofs/Inkling.lean) (`59` public / `65` total theorems) and [`proofs/Speculative.lean`](proofs/Speculative.lean) (`17` theorems), and [`docs/MEGAKERNEL.md`](docs/MEGAKERNEL.md).
+
+**Parity & limits:** `inkling.json` preserves exact greedy token parity across `bf16_verify_mma` + `dflash_dcut` (`0` parity failures across Suite A and Suite B `32K/64K/131K`), is bit-identical (`max_abs = 0.0`) on `bf16_verify_mma=false` to pre-Qwegn `megakernel-v1` across `cake_toks` (`feed=1, 8`), `real_512` (`feed=512`, `560/560` top-1, `32/32` greedy), and `long_real` (`feed=512`, `568/568` top-1, `32/32` greedy), matches `64/64` greedy tokens on `cake_toks` against baseline, and passes [`tools/nano_inkling_attention_check.py`](tools/nano_inkling_attention_check.py) (`24/24` top-1 agreement across six arm pairs). Native `--draft` DFlash 2 speculative decoding is wired; note that the vision tower and the checkpoint's bundled `mtp.safetensors` drafter remain separate.
 
 ## Development
 
@@ -315,6 +363,7 @@ does not remove physical-memory or Metal-buffer limits.
 - **`mlx-lm` Inkling 2 support** ([`ml-explore/mlx-lm#2086`](https://github.com/ml-explore/mlx-lm/pull/2086) / [`jundot/mlx-lm`](https://github.com/jundot/mlx-lm)) — authored by **Jun Kim** ([`@jundot`](https://github.com/jundot)), with contributions from **Pedro Cuenca** ([`@pcuenca`](https://github.com/pcuenca)) and **Lucas Gelfond** ([`@lucasgelfond`](https://github.com/lucasgelfond)) (MIT, Apple Inc.): batched relative attention tile kernel adapted in [`src/mega/inkling_tiles.metal`](src/mega/inkling_tiles.metal) and the `mlx-lm` reference baseline.
 - **MLX** ([`ml-explore/mlx`](https://github.com/ml-explore/mlx)) — Apple Inc. and the MLX contributors (MIT): INT4 `qmv_fast` / `qdot`, vector SDPA, Steel GEMM, and Steel attention kernel designs.
 - **Recursive `rec`** ([`recursive-oss/rec`](https://github.com/recursive-oss/rec)) — Recursive (**Chris Cummins** [`@ChrisCummins`](https://github.com/ChrisCummins), **Audrey Tang** [`@audreyt`](https://github.com/audreyt), **Oliver Yu** [`@tc3oliver`](https://github.com/tc3oliver); Apache-2.0): resident decode and atomic arrival/phase barrier design adapted in [`src/resident.metal`](src/resident.metal).
+- **AngelSpec** ([`Tencent/AngelSpec`](https://github.com/Tencent/AngelSpec)) — source of the `D-cut` adaptive speculative verification depth truncation algorithm adapted in [`src/mega/dflash2.zig`](src/mega/dflash2.zig) and [`src/mega/dflash2.metal`](src/mega/dflash2.metal).
 - **Model & architecture authors** — **Thinking Machines Lab** ([Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)), **Recursive** ([Flint](https://huggingface.co/RecursiveSI/flint), Apache-2.0), and **Liquid AI** (`LFM3-1.7B` / `LFM2.5-1.2B-Instruct`).
 
 ## License
