@@ -3727,6 +3727,79 @@ test "dflash2 kernels match f64 CPU reference" {
             prev = best_c;
             try testing.expectEqual(prev, ot[1 + pos]);
         }
+
+        // 4b. Verify D-cut `kind = 1` exact post-selector softmax confidence matches f64 CPU reference within 1e-4.
+        const part_vc = try ctx.alloc(rows * shards * (top_k + 2));
+        defer part_vc.deinit();
+        const part_ic = try ctx.alloc(rows * shards * top_k);
+        defer part_ic.deinit();
+        const top_vc = try ctx.alloc(rows * (top_k + 1));
+        defer top_vc.deinit();
+        const top_ic = try ctx.alloc(rows * top_k);
+        defer top_ic.deinit();
+        const out_tok_c = try ctx.alloc(2 * (1 + rows));
+        defer out_tok_c.deinit();
+
+        var p1c = p1;
+        p1c.kind = 1;
+        p1c.eps = softcap;
+        var p2c = p2;
+        p2c.kind = 1;
+        p2c.eps = softcap;
+        var p3c = p3;
+        p3c.kind = 1;
+
+        try gpu.dispatch(ctx, "df_top16_part", &.{ logits, part_vc, part_ic }, &p1c, rows * shards * 256, 256);
+        try gpu.dispatch(ctx, "df_top16_merge", &.{ part_vc, part_ic, top_vc, top_ic }, &p2c, rows * 256, 256);
+        try gpu.dispatch(ctx, "df_select_path", &.{ h_sel, pred_cb, succ_cb, top_vc, top_ic, out_tok_c }, &p3c, 512, 512);
+        try ctx.finish();
+
+        const otc = out_tok_c.structs(u32);
+        for (0..1 + rows) |i| try testing.expectEqual(ot[i], otc[i]);
+
+        var prev_c: u32 = anchor;
+        for (0..rows) |pos| {
+            var used = try a.alloc(bool, vocab);
+            @memset(used, false);
+            var post_scores = try a.alloc(f64, vocab);
+            for (0..vocab) |vid| {
+                const raw: f64 = lf[pos * vocab + vid];
+                post_scores[vid] = @as(f64, softcap) * std.math.tanh(raw / @as(f64, softcap));
+            }
+            var best_s: f64 = -std.math.inf(f64);
+            var best_vid: u32 = 0;
+            for (0..top_k) |_| {
+                var bv: f32 = -std.math.inf(f32);
+                var bi: u32 = 0;
+                for (0..vocab) |vid| {
+                    if (used[vid]) continue;
+                    const val = lf[pos * vocab + vid];
+                    if (val > bv) {
+                        bv = val;
+                        bi = @intCast(vid);
+                    }
+                }
+                used[bi] = true;
+                var dot: f64 = 0;
+                for (0..rank) |d| {
+                    dot += @as(f64, fromBf16(pu16[prev_c * rank + d])) * hf[pos * rank + d] * fromBf16(su16[bi * rank + d]);
+                }
+                const sc = @as(f64, softcap) * std.math.tanh((@as(f64, bv) + dot) / @as(f64, softcap));
+                post_scores[bi] = sc;
+                if (sc > best_s) {
+                    best_s = sc;
+                    best_vid = bi;
+                }
+            }
+            var max_all: f64 = -std.math.inf(f64);
+            for (post_scores) |s| max_all = @max(max_all, s);
+            var z_all: f64 = 0;
+            for (post_scores) |s| z_all += @exp(s - max_all);
+            const cpu_conf = @exp(best_s - max_all) / z_all;
+            const gpu_conf: f32 = @bitCast(otc[1 + rows + pos]);
+            try testing.expectApproxEqAbs(cpu_conf, @as(f64, gpu_conf), 1e-4);
+            prev_c = best_vid;
+        }
     }
 
     // 5. Coalesced df_bf16_linear_2xR_vec8, df_bf16_linear_2xR_vec, df_bf16_linear_splitk_rows
@@ -4245,4 +4318,24 @@ test "grouped MoE and multi-row striped attention match T=1 kernels bit-for-bit"
             try testing.expectEqualSlices(u32, u[out_ref_off + rr * q_w ..][0..q_w], u[out_grp_off + rr * q_w ..][0..q_w]);
         }
     }
+}
+
+test "inkling 2p remap, MMA tile, router group, and DFlash GQA-4 constants match Lean specs" {
+    const inkling = @import("inkling_plan.zig");
+    try testing.expectEqual(@as(u32, 36), inkling.inkling_2p_visits);
+    try testing.expectEqual(@as(u32, 37), inkling.dflash_2p_traces);
+    try testing.expectEqual(@as(u32, 5), inkling.dflash_2p_remap_0);
+    try testing.expectEqual(@as(u32, 23), inkling.dflash_2p_remap_1);
+    try testing.expectEqual(@as(u32, 29), inkling.dflash_2p_remap_2);
+    try testing.expectEqual(@as(u32, 16), inkling.bf16_mma_tile_n16);
+    try testing.expectEqual(@as(u32, 32), inkling.bf16_mma_tile_n32);
+    try testing.expectEqual(@as(u32, 200064), inkling.unembed_padded_vocab);
+    try testing.expect(inkling.unembed_padded_vocab <= inkling.vocab);
+    try testing.expectEqual(@as(u32, 128), inkling.route_group_max_experts);
+    try testing.expectEqual(@as(u32, 64), inkling.route_group_max_pairs);
+    try testing.expectEqual(@as(u32, 32), inkling.dflash_heads);
+    try testing.expectEqual(@as(u32, 8), inkling.dflash_kv_heads);
+    try testing.expectEqual(@as(u32, 4), inkling.dflash_gqa4_ratio);
+    try testing.expectEqual(@as(u32, 128), inkling.dflash_head_dim);
+    try testing.expectEqual(@as(u32, 2048), inkling.dflash_ring_cap);
 }

@@ -804,4 +804,139 @@ theorem inline_rel_skip_far (pos start n relExtent i : Nat)
     start + i ≤ pos ∧ relExtent ≤ pos - (start + i) := by
   omega
 
+def inkling2pVisits : Nat := 36
+def inkling2pTraces : Nat := 37
+def dflash2pRemap : List Nat := [5, 23, 29]
+def dflash2pRemap0 : Nat := 5
+def dflash2pRemap1 : Nat := 23
+def dflash2pRemap2 : Nat := 29
+def dflash3pTargets : List Nat := [5, 23, 41]
+def bf16MmaTileN16 : Nat := 16
+def bf16MmaTileN32 : Nat := 32
+def unembedPaddedVocab : Nat := ((unpaddedVocab + 31) / 32) * 32
+def routeGroupMaxExperts : Nat := 128
+def routeGroupMaxPairs : Nat := 64
+def dflashHeads : Nat := 32
+def dflashKvHeads : Nat := 8
+def dflashGqa4Ratio : Nat := 4
+def dflashHeadDim : Nat := 128
+def dflashRingCap : Nat := 2048
+
+/-- Parameterized visit schedule over `passes` loop iterations. -/
+def visitSchedulePasses (passes : Nat) : List (Nat × Nat × Nat) :=
+  let prelude := (List.range loopStart).map (fun l => (l, l, 0))
+  let coreLen := loopEnd - loopStart
+  let loop := (List.range passes).flatMap (fun pass =>
+    (List.range coreLen).map (fun off =>
+      (loopStart + pass * coreLen + off, loopStart + off, pass)))
+  let codaBase := loopStart + passes * coreLen
+  let coda := (List.range (layers - loopEnd)).map (fun off =>
+    (codaBase + off, loopEnd + off, 0))
+  prelude ++ loop ++ coda
+
+private theorem flatMap_map_range_length (p coreLen : Nat)
+    (f : Nat → Nat → Nat × Nat × Nat) :
+    ((List.range p).flatMap (fun pass => (List.range coreLen).map (f pass))).length = coreLen * p := by
+  induction p with
+  | zero => simp
+  | succ p ih =>
+      rw [List.range_succ, List.flatMap_append, List.length_append, ih, List.flatMap_singleton,
+          List.length_map, List.length_range, Nat.mul_succ]
+
+theorem inkling_visit_count_passes (p : Nat) :
+    (visitSchedulePasses p).length = loopStart + (loopEnd - loopStart) * p + (layers - loopEnd) := by
+  simp only [visitSchedulePasses, List.length_append, List.length_map, List.length_range]
+  rw [flatMap_map_range_length p (loopEnd - loopStart)]
+
+theorem inkling_2p_visit_count : (visitSchedulePasses 2).length = inkling2pVisits := by decide
+
+theorem inkling_physical_layer_bounds_passes (p : Nat) :
+    ∀ entry ∈ visitSchedulePasses p, entry.2.1 < layers := by
+  intro entry h
+  simp only [visitSchedulePasses, List.mem_append, List.mem_map, List.mem_range, List.mem_flatMap] at h
+  rcases h with (⟨l, hl, rfl⟩ | ⟨pass, -, off, hoff, rfl⟩) | ⟨off, hoff, rfl⟩ <;>
+    simp [loopStart, loopEnd, layers] at * <;> omega
+
+def tracePhysLayer (p tid : Nat) : Option Nat :=
+  match tid with
+  | 0 => none
+  | k + 1 => ((visitSchedulePasses p)[k]?).map (fun e => e.2.1)
+
+/-- 2-pass DFlash remap `[5, 23, 29]` targets the exact same physical layers `[4, 10, 16]`
+as 3-pass `[5, 23, 41]` while staying strictly inside the 37-trace 2-pass schedule. -/
+theorem dflash_2p_remap_physical_match :
+    dflash2pRemap.map (tracePhysLayer 2) = [some 4, some 10, some 16] ∧
+    dflash3pTargets.map (tracePhysLayer 3) = [some 4, some 10, some 16] := by
+  decide
+
+private theorem bf16_mma_tile_coverage_gen (col m N : Nat) (hN : 0 < N) (h8 : 8 ∣ N) (hcol : col < m) :
+    col / N < (m + N - 1) / N ∧
+    (col % N) / 8 < N / 8 ∧
+    (col / N) * N + ((col % N) / 8) * 8 + col % 8 = col := by
+  have hq : col / N < (m + N - 1) / N := by
+    rw [Nat.div_lt_iff_lt_mul hN]
+    have h1 : (m + N - 1) / N * N + (m + N - 1) % N = m + N - 1 := by
+      rw [Nat.mul_comm]; exact Nat.div_add_mod (m + N - 1) N
+    have h2 : (m + N - 1) % N < N := Nat.mod_lt _ hN
+    have h3 : (col / N) * N ≤ col := Nat.div_mul_le_self col N
+    omega
+  have hmod : (col % N) / 8 < N / 8 := by
+    have h8p : 0 < 8 := by omega
+    rcases h8 with ⟨k, rfl⟩
+    have hlt : col % (8 * k) < 8 * k := Nat.mod_lt col (by omega)
+    have hk_eq : (8 * k) / 8 = k := Nat.mul_div_right k h8p
+    rw [hk_eq, Nat.div_lt_iff_lt_mul h8p, Nat.mul_comm]
+    rw [Nat.mul_comm 8 k] at hlt
+    exact hlt
+  have hrec : (col / N) * N + ((col % N) / 8) * 8 + col % 8 = col := by
+    have hm1 : col / N * N + col % N = col := by rw [Nat.mul_comm]; exact Nat.div_add_mod col N
+    have hm2 : (col % N) / 8 * 8 + (col % N) % 8 = col % N := by rw [Nat.mul_comm]; exact Nat.div_add_mod (col % N) 8
+    have hm3 : (col % N) % 8 = col % 8 := Nat.mod_mod_of_dvd col h8
+    omega
+  exact ⟨hq, hmod, hrec⟩
+
+theorem bf16_mma_m8n16_tile_coverage (col m : Nat) (hcol : col < m) :
+    col / bf16MmaTileN16 < (m + 15) / bf16MmaTileN16 ∧
+    (col % bf16MmaTileN16) / 8 < 2 ∧
+    (col / bf16MmaTileN16) * bf16MmaTileN16 + ((col % bf16MmaTileN16) / 8) * 8 + col % 8 = col :=
+  bf16_mma_tile_coverage_gen col m bf16MmaTileN16 (by decide) ⟨2, rfl⟩ hcol
+
+theorem bf16_mma_m8n32_tile_coverage (col m : Nat) (hcol : col < m) :
+    col / bf16MmaTileN32 < (m + 31) / bf16MmaTileN32 ∧
+    (col % bf16MmaTileN32) / 8 < 4 ∧
+    (col / bf16MmaTileN32) * bf16MmaTileN32 + ((col % bf16MmaTileN32) / 8) * 8 + col % 8 = col :=
+  bf16_mma_tile_coverage_gen col m bf16MmaTileN32 (by decide) ⟨4, rfl⟩ hcol
+
+theorem bf16_mma_tail_safe_bounds :
+    unembedPaddedVocab = 200064 ∧ unembedPaddedVocab ≤ vocab := by
+  decide
+
+theorem route_group_tiles_bound (rows topk : Nat) (hr : rows ≤ 8) (ht : topk ≤ 8) :
+    rows * topk ≤ routeGroupMaxPairs := by
+  exact Nat.le_trans (Nat.mul_le_mul hr ht) (by decide)
+
+theorem dflash_gqa4_ownership (h c : Nat) (hh : h < dflashHeads) (hc : c < dflashHeadDim) :
+    h / dflashGqa4Ratio < dflashKvHeads ∧ h % dflashGqa4Ratio < dflashGqa4Ratio ∧
+    (h / dflashGqa4Ratio) * dflashGqa4Ratio + h % dflashGqa4Ratio = h ∧
+    c / 4 < 32 ∧ c % 4 < 4 ∧ (c / 4) * 4 + c % 4 = c := by
+  simp only [dflashHeads, dflashKvHeads, dflashGqa4Ratio, dflashHeadDim] at *
+  omega
+
+theorem dflash_ring_window_distinct (pos cap i j : Nat)
+    (hc : 0 < cap) (hi : i < cap) (hj : j < cap) (hne : i ≠ j) :
+    (pos + i) % cap ≠ (pos + j) % cap := by
+  intro heq
+  have wrap (x : Nat) (hx : x < cap + cap) :
+      x % cap = if x < cap then x else x - cap := by
+    split
+    · exact Nat.mod_eq_of_lt (by assumption)
+    · rw [Nat.mod_eq_sub_mod (a := x) (b := cap) (by omega)]
+      exact Nat.mod_eq_of_lt (by omega)
+  have hb := Nat.mod_lt pos hc
+  rw [Nat.add_mod pos i cap, Nat.add_mod pos j cap,
+    Nat.mod_eq_of_lt hi, Nat.mod_eq_of_lt hj,
+    wrap (pos % cap + i) (by omega),
+    wrap (pos % cap + j) (by omega)] at heq
+  split at heq <;> split at heq <;> omega
+
 end Inkling

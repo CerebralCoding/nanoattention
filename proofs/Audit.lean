@@ -155,3 +155,13 @@ import Inkling
 #print axioms Inkling.moe_tile_count_bound
 #print axioms Inkling.sconv_batch_ring_disjoint
 #print axioms Inkling.inline_rel_skip_far
+#print axioms Inkling.inkling_visit_count_passes
+#print axioms Inkling.inkling_2p_visit_count
+#print axioms Inkling.inkling_physical_layer_bounds_passes
+#print axioms Inkling.dflash_2p_remap_physical_match
+#print axioms Inkling.bf16_mma_m8n16_tile_coverage
+#print axioms Inkling.bf16_mma_m8n32_tile_coverage
+#print axioms Inkling.bf16_mma_tail_safe_bounds
+#print axioms Inkling.route_group_tiles_bound
+#print axioms Inkling.dflash_gqa4_ownership
+#print axioms Inkling.dflash_ring_window_distinct

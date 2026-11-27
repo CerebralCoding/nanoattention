@@ -281,18 +281,19 @@ kernel void df_bf16_mma_m8n16(device const float *src [[buffer(0)]], device cons
 // Split-K Direct-read hardware MMA BF16 linear projection (M<=8, N=16, K=64, 64 threads = 2 SIMDs, 1.15 KB TG).
 // Loads weight 8x8 fragments straight from L1/L2 via simdgroup_load without TG staging, and shards K across
 // `p.taps` splits (`splits == 1` writes directly to dst; `splits > 1` writes FP32 partials to `dst`).
-// Requires p.rows <= 8, p.m % 16 == 0, p.n % 64 == 0, p.w % 16 == 0, p.x % 4 == 0, p.xs % 4 == 0.
+// Requires p.rows <= 8, (p.m % 16 == 0 or w_rows >= ceil(p.m/16)*16 for splits==1), p.n % 64 == 0, p.w % 16 == 0, p.x % 4 == 0, p.xs % 4 == 0.
 kernel void df_bf16_mma_m8n16_direct(device const float *src [[buffer(0)]], device const uchar *weights [[buffer(1)]],
                                      device float *dst [[buffer(2)]], constant MK &p [[buffer(8)]],
                                      uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                                      uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint K = 64u, L = 72u;
     alignas(16) threadgroup bfloat a[8u * L];
-    const uint n_tiles = p.m / 16u;
+    const uint n_tiles = (p.m + 15u) / 16u;
     const uint splits = max(p.taps, 1u);
     const uint split = group / n_tiles;
     if (split >= splits) return;
     const uint c0 = (group % n_tiles) * 16u;
+    if (c0 >= p.m) return;
     const uint rows = min(p.rows, 8u);
     const uint k_blocks = p.n / 64u;
     const uint kb0 = (k_blocks * split) / splits;
@@ -327,13 +328,224 @@ kernel void df_bf16_mma_m8n16_direct(device const float *src [[buffer(0)]], devi
         if (splits == 1u) {
             const bool round_out = (p.flags & MK_ROUND_OUT) != 0u;
             device float *out = dst + p.y + ulong(p.row0 + fr) * p.ys + col;
-            out[0] = round_out ? mk_bf16(v0) : v0;
-            out[1] = round_out ? mk_bf16(v1) : v1;
+            if (col < p.m) out[0] = round_out ? mk_bf16(v0) : v0;
+            if (col + 1u < p.m) out[1] = round_out ? mk_bf16(v1) : v1;
         } else {
             device float *out = dst + (ulong(split) * rows + fr) * p.m + col;
             out[0] = v0;
             out[1] = v1;
         }
+    }
+}
+
+// Direct-read hardware MMA BF16 linear projection (M<=8, N=32, K=64, 128 threads = 4 SIMDs).
+// Caller guarantees w_rows >= ((p.m + 31) / 32) * 32, p.n % 64 == 0, p.w % 16 == 0, p.x % 4 == 0, p.xs % 4 == 0.
+kernel void df_bf16_mma_m8n32_direct(device const float *src [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+                                     device float *dst [[buffer(2)]], constant MK &p [[buffer(8)]],
+                                     uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                     uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K = 64u, L = 72u;
+    alignas(16) threadgroup bfloat a[8u * L];
+    const uint c0 = group * 32u;
+    if (c0 >= p.m) return;
+    const uint rows = min(p.rows, 8u);
+    const uint ar = tid / 16u, ac = (tid % 16u) * 4u;
+    const bool a_ok = ar < rows;
+    const device float4 *xp = reinterpret_cast<const device float4 *>(src + p.x + ulong(p.row0 + (a_ok ? ar : 0u)) * p.xs);
+    const device bfloat *w_base = reinterpret_cast<const device bfloat *>(weights + p.w) + ulong(c0 + simd * 8u) * p.n;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k = 0u; k < p.n; k += K) {
+        const float4 v = a_ok ? xp[(k + ac) / 4u] : float4(0.0f);
+        reinterpret_cast<threadgroup bfloat4 *>(a + ar * L + ac)[0] = bfloat4(v);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint kf = 0u; kf < K; kf += 8u) {
+            simdgroup_bfloat8x8 af, bf;
+            simdgroup_load(af, a + kf, L);
+            simdgroup_load(bf, w_base + k + kf, p.n, ulong2(0), true);
+            simdgroup_multiply_accumulate(acc, af, bf, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint fr = ((lane / 4u) & 4u) + (lane / 2u) % 4u;
+    const uint fc = (((lane / 4u) & 2u) + lane % 2u) * 2u;
+    if (fr < rows) {
+        const uint col = c0 + simd * 8u + fc;
+        const bool round_out = (p.flags & MK_ROUND_OUT) != 0u;
+        device float *out = dst + p.y + ulong(p.row0 + fr) * p.ys + col;
+        if (col < p.m) {
+            const float v0 = acc.thread_elements()[0];
+            out[0] = round_out ? mk_bf16(v0) : v0;
+        }
+        if (col + 1u < p.m) {
+            const float v1 = acc.thread_elements()[1];
+            out[1] = round_out ? mk_bf16(v1) : v1;
+        }
+    }
+}
+
+// Fused multi-matrix direct-read MMA BF16 projection (M<=8, N=16, 64 threads = 2 SIMDs per tile).
+// Used for Q+K+V (propose) and K+V (commitContext) sharing the same input and weight buffer.
+kernel void df_multi_bf16_mma_m8n16_direct(device const float *src [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+                                           device float *dst [[buffer(2)]], constant MKX &x [[buffer(8)]],
+                                           uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                           uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constant MK &p = x.p;
+    uint which = 0u;
+    uint local_tile = group;
+    for (; which < x.count; ++which) {
+        const uint n_tiles = (x.mat[which].m + 15u) / 16u;
+        if (local_tile < n_tiles) break;
+        local_tile -= n_tiles;
+    }
+    if (which >= x.count) return;
+
+    constexpr uint K = 64u, L = 72u;
+    alignas(16) threadgroup bfloat a[8u * L];
+    const uint c0 = local_tile * 16u;
+    const uint m_mat = x.mat[which].m;
+    const uint rows = min(p.rows, 8u);
+    const uint ar = tid / 8u, ac = (tid % 8u) * 8u;
+    const bool a_ok = ar < rows;
+    const device float4 *xp = reinterpret_cast<const device float4 *>(src + p.x + ulong(p.row0 + (a_ok ? ar : 0u)) * p.xs);
+    const device bfloat *w_base = reinterpret_cast<const device bfloat *>(weights + x.mat[which].w) + ulong(c0 + simd * 8u) * p.n;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k = 0u; k < p.n; k += K) {
+        const float4 v0 = a_ok ? xp[(k + ac) / 4u] : float4(0.0f);
+        const float4 v1 = a_ok ? xp[(k + ac) / 4u + 1u] : float4(0.0f);
+        reinterpret_cast<threadgroup bfloat4 *>(a + ar * L + ac)[0] = bfloat4(v0);
+        reinterpret_cast<threadgroup bfloat4 *>(a + ar * L + ac)[1] = bfloat4(v1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint kf = 0u; kf < K; kf += 8u) {
+            simdgroup_bfloat8x8 af, bf;
+            simdgroup_load(af, a + kf, L);
+            simdgroup_load(bf, w_base + k + kf, p.n, ulong2(0), true);
+            simdgroup_multiply_accumulate(acc, af, bf, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint fr = ((lane / 4u) & 4u) + (lane / 2u) % 4u;
+    const uint fc = (((lane / 4u) & 2u) + lane % 2u) * 2u;
+    if (fr < rows) {
+        const uint col = c0 + simd * 8u + fc;
+        const bool round_out = (p.flags & MK_ROUND_OUT) != 0u;
+        device float *out = dst + x.mat[which].y + ulong(p.row0 + fr) * x.mat[which].ys + col;
+        if (col < m_mat) {
+            const float v0 = acc.thread_elements()[0];
+            out[0] = round_out ? mk_bf16(v0) : v0;
+        }
+        if (col + 1u < m_mat) {
+            const float v1 = acc.thread_elements()[1];
+            out[1] = round_out ? mk_bf16(v1) : v1;
+        }
+    }
+}
+
+// Fused gate + up MMA BF16 projection + inline SwiGLU (SiLU(gate) * up) for M <= 8.
+// Shares threadgroup activation tile `a[8 * 72]` across gate (p.w) and up (p.s) weights.
+kernel void df_bf16_gate_up_swiglu_mma(device const float *src [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+                                       device float *dst [[buffer(2)]], constant MK &p [[buffer(8)]],
+                                       uint group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                       uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K = 64u, L = 72u;
+    alignas(16) threadgroup bfloat a[8u * L];
+    const uint c0 = group * 16u;
+    if (c0 >= p.m) return;
+    const uint rows = min(p.rows, 8u);
+    const uint ar = tid / 8u, ac = (tid % 8u) * 8u;
+    const bool a_ok = ar < rows;
+    const device float4 *xp = reinterpret_cast<const device float4 *>(src + p.x + ulong(p.row0 + (a_ok ? ar : 0u)) * p.xs);
+    const ulong col_off = ulong(c0 + simd * 8u) * p.n;
+    const device bfloat *wg_base = reinterpret_cast<const device bfloat *>(weights + p.w) + col_off;
+    const device bfloat *wu_base = reinterpret_cast<const device bfloat *>(weights + p.s) + col_off;
+    simdgroup_float8x8 acc_g = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc_u = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k = 0u; k < p.n; k += K) {
+        const float4 v0 = a_ok ? xp[(k + ac) / 4u] : float4(0.0f);
+        const float4 v1 = a_ok ? xp[(k + ac) / 4u + 1u] : float4(0.0f);
+        reinterpret_cast<threadgroup bfloat4 *>(a + ar * L + ac)[0] = bfloat4(v0);
+        reinterpret_cast<threadgroup bfloat4 *>(a + ar * L + ac)[1] = bfloat4(v1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint kf = 0u; kf < K; kf += 8u) {
+            simdgroup_bfloat8x8 af, bg, bu;
+            simdgroup_load(af, a + kf, L);
+            simdgroup_load(bg, wg_base + k + kf, p.n, ulong2(0), true);
+            simdgroup_load(bu, wu_base + k + kf, p.n, ulong2(0), true);
+            simdgroup_multiply_accumulate(acc_g, af, bg, acc_g);
+            simdgroup_multiply_accumulate(acc_u, af, bu, acc_u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint fr = ((lane / 4u) & 4u) + (lane / 2u) % 4u;
+    const uint fc = (((lane / 4u) & 2u) + lane % 2u) * 2u;
+    if (fr < rows) {
+        const uint col = c0 + simd * 8u + fc;
+        const bool round_out = (p.flags & MK_ROUND_OUT) != 0u;
+        device float *out = dst + p.y + ulong(p.row0 + fr) * p.ys + col;
+        if (col < p.m) {
+            const float g0 = acc_g.thread_elements()[0];
+            const float u0 = acc_u.thread_elements()[0];
+            const float res0 = (g0 * mk_sigmoid(g0)) * u0;
+            out[0] = round_out ? mk_bf16(res0) : res0;
+        }
+        if (col + 1u < p.m) {
+            const float g1 = acc_g.thread_elements()[1];
+            const float u1 = acc_u.thread_elements()[1];
+            const float res1 = (g1 * mk_sigmoid(g1)) * u1;
+            out[1] = round_out ? mk_bf16(res1) : res1;
+        }
+    }
+}
+
+// Wide uint4 (8 bf16) Multi-row Split-K small-M BF16 linear for DFlash 2 (rows <= 8, n % 256 == 0, w % 16 == 0).
+kernel void df_bf16_linear_splitk_rows_vec8(device const float *src [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+                                            device float *dst [[buffer(2)]], constant MK &p [[buffer(8)]],
+                                            uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                            uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= p.m) return;
+    const uint rows = min(p.rows, 8u);
+    const bool round_in = (p.flags & MK_ROUND_BF16) != 0u;
+    const bool round_out = (p.flags & MK_ROUND_OUT) != 0u;
+    const uint wstride = p.n / 8u;
+    const uint xs4 = p.xs / 4u;
+    device const uint4 *w8 = (device const uint4 *)(weights + p.w) + ulong(row) * wstride;
+    device const float4 *xbase = (device const float4 *)(src + p.x + ulong(p.row0) * p.xs);
+    float acc[8] = {};
+    for (uint k = tid; k < wstride; k += 256u) {
+        const uint4 raw = w8[k];
+        const ushort4 u0(ushort(raw.x), ushort(raw.x >> 16), ushort(raw.y), ushort(raw.y >> 16));
+        const ushort4 u1(ushort(raw.z), ushort(raw.z >> 16), ushort(raw.w), ushort(raw.w >> 16));
+        const float4 b0 = as_type<float4>(uint4(u0) << 16);
+        const float4 b1 = as_type<float4>(uint4(u1) << 16);
+        #pragma unroll
+        for (uint r = 0u; r < 8u; ++r) {
+            if (r < rows) {
+                float4 a0 = xbase[ulong(r) * xs4 + 2u * k];
+                float4 a1 = xbase[ulong(r) * xs4 + 2u * k + 1u];
+                if (round_in) {
+                    a0 = float4(mk_bf16(a0.x), mk_bf16(a0.y), mk_bf16(a0.z), mk_bf16(a0.w));
+                    a1 = float4(mk_bf16(a1.x), mk_bf16(a1.y), mk_bf16(a1.z), mk_bf16(a1.w));
+                }
+                acc[r] = fma(a0.w, b0.w, fma(a0.z, b0.z, fma(a0.y, b0.y, fma(a0.x, b0.x, acc[r]))));
+                acc[r] = fma(a1.w, b1.w, fma(a1.z, b1.z, fma(a1.y, b1.y, fma(a1.x, b1.x, acc[r]))));
+            }
+        }
+    }
+    threadgroup float partials[8][8];
+    #pragma unroll
+    for (uint r = 0u; r < 8u; ++r) {
+        if (r < rows) {
+            const float s = simd_sum(acc[r]);
+            if (lane == 0u) partials[r][simd] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd < rows) {
+        const uint r = simd;
+        const float total = simd_sum(lane < 8u ? partials[r][lane] : 0.0f);
+        if (lane == 0u) dst[ulong(p.y) + ulong(p.row0 + r) * p.ys + row] = round_out ? mk_bf16(total) : total;
     }
 }
 
@@ -571,6 +783,39 @@ kernel void df_grouped_dyn_conv(
     arena[ulong(p.y) + ulong(p.row0 + r) * p.ys + c] = acc;
 }
 
+// Vectorized 4-channel grouped 2-tap dynamic convolution (p.n % 4 == 0, p.dim % 4 == 0, 4-aligned arena & aligned base_w).
+kernel void df_grouped_dyn_conv_vec4(
+    device float *arena [[buffer(0)]],
+    device const uchar *base_w [[buffer(1)]],
+    constant MK &p [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+    const uint n4 = p.n / 4u;
+    const uint r = gid / n4;
+    const uint c4 = gid % n4;
+    if (r >= p.rows) return;
+    const uint stage = p.kind;
+    const uint g = (c4 * 4u) / p.dim;
+    const uint xs4 = p.xs / 4u;
+    const uint ys4 = p.ys / 4u;
+    float4 acc = float4(0.0f);
+    for (uint off = 0u; off < p.taps; ++off) {
+        if (r >= off) {
+            const float4 v = reinterpret_cast<device const float4 *>(arena + ulong(p.x) + ulong(p.row0 + r - off) * p.xs)[c4];
+            const uint base_idx4 = ((stage * p.taps + off) * p.n) / 4u + c4;
+            const float4 bw = mk_fast_load4(base_w, p.w, p.dtype, base_idx4);
+            const uint dyn_idx = (stage * p.taps + off) * p.heads + g;
+            const float dw = arena[ulong(p.z) + ulong(p.row0 + r) * p.zs + dyn_idx];
+            acc += bw * v;
+            acc += dw * v;
+        }
+    }
+    if (stage == 1u) {
+        acc += reinterpret_cast<device const float4 *>(arena + ulong(p.pad_r) + ulong(p.row0 + r) * p.pad_k)[c4];
+    }
+    reinterpret_cast<device float4 *>(arena + ulong(p.y) + ulong(p.row0 + r) * p.ys)[c4] = acc;
+    (void)xs4; (void)ys4;
+}
+
 // SiLU(gate) * up -> out inside arena.
 kernel void df_swiglu_mul(
     device float *arena [[buffer(0)]],
@@ -597,6 +842,208 @@ kernel void df_kv_ring_store(
     uint slot = (p.pos + r) % p.capacity;
     float v = arena[ulong(p.x) + ulong(p.row0 + r) * p.xs + c];
     ring[ulong(slot) * p.n + c] = df_to_bf16_bits(v);
+}
+
+// Vectorized 4-word BF16 ring store (requires p.n % 4 == 0, p.x % 4 == 0, p.xs % 4 == 0).
+kernel void df_kv_ring_store_vec4(
+    device const float *arena [[buffer(0)]],
+    device ushort *ring [[buffer(1)]],
+    constant MK &p [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+    const uint n4 = p.n / 4u;
+    const uint r = gid / n4;
+    const uint c4 = gid % n4;
+    if (r >= p.rows) return;
+    const uint slot = (p.pos + r) % p.capacity;
+    const float4 v = reinterpret_cast<device const float4 *>(arena + ulong(p.x) + ulong(p.row0 + r) * p.xs)[c4];
+    reinterpret_cast<device ushort4 *>(ring + ulong(slot) * p.n)[c4] = ushort4(
+        df_to_bf16_bits(v.x), df_to_bf16_bits(v.y), df_to_bf16_bits(v.z), df_to_bf16_bits(v.w));
+}
+
+#if DFLASH_HEAD_DIM != 128u || DFLASH_GQA4_RATIO != 4u
+#error dflash2 geometry mismatch with verified inkling_plan.metal
+#endif
+// Fused per-head RMSNorm + RoPE in-place for head_dim == 128, rot == 128 (zero TG barriers).
+// 1 SIMDgroup (32 lanes) per (row, head), 4 SIMDgroups per threadgroup (128 threads).
+kernel void df_rmsnorm_rope(
+    device const uchar *w [[buffer(0)]],
+    device float *arena [[buffer(1)]],
+    device const float *tables [[buffer(2)]],
+    constant MK &p [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint head_idx = tgid * 4u + simd;
+    if (head_idx >= p.rows * p.heads) return;
+    const uint r = head_idx / p.heads;
+    const uint h = head_idx % p.heads;
+    const uint row = p.row0 + r;
+    device float4 *xp = reinterpret_cast<device float4 *>(arena + ulong(p.x) + ulong(row) * p.xs + ulong(h) * 128u);
+    const float4 xv = xp[lane];
+    const float tot = simd_sum(dot(xv, xv));
+    const float inv = metal::precise::rsqrt(tot / 128.0f + p.eps);
+    const float4 nv = mk_fast_load4(w, p.w, p.dtype, lane) * (xv * inv);
+
+    const float4 peer = float4(
+        simd_shuffle_xor(nv.x, 16u),
+        simd_shuffle_xor(nv.y, 16u),
+        simd_shuffle_xor(nv.z, 16u),
+        simd_shuffle_xor(nv.w, 16u));
+    const bool lo = lane < 16u;
+    const float4 a = lo ? nv : peer;
+    const float4 b = lo ? peer : nv;
+    const float4 th = float(p.pos + row) * reinterpret_cast<device const float4 *>(tables + p.z)[lane & 15u];
+    const float4 c = (p.flags & MK_FAST_TRIG)
+        ? float4(metal::fast::cos(th.x), metal::fast::cos(th.y), metal::fast::cos(th.z), metal::fast::cos(th.w))
+        : float4(metal::precise::cos(th.x), metal::precise::cos(th.y), metal::precise::cos(th.z), metal::precise::cos(th.w));
+    const float4 s = (p.flags & MK_FAST_TRIG)
+        ? float4(metal::fast::sin(th.x), metal::fast::sin(th.y), metal::fast::sin(th.z), metal::fast::sin(th.w))
+        : float4(metal::precise::sin(th.x), metal::precise::sin(th.y), metal::precise::sin(th.z), metal::precise::sin(th.w));
+    xp[lane] = lo ? (a * c - b * s) : (a * s + b * c);
+}
+
+// Fused per-head RMSNorm + RoPE + BF16 ring store for K in commitContext (head_dim == 128, rot == 128).
+kernel void df_rmsnorm_rope_ring_store(
+    device const uchar *w [[buffer(0)]],
+    device const float *arena [[buffer(1)]],
+    device const float *tables [[buffer(2)]],
+    device ushort *ring [[buffer(3)]],
+    constant MK &p [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint head_idx = tgid * 4u + simd;
+    if (head_idx >= p.rows * p.heads) return;
+    const uint r = head_idx / p.heads;
+    const uint h = head_idx % p.heads;
+    const uint row = p.row0 + r;
+    const device float4 *xp = reinterpret_cast<const device float4 *>(arena + ulong(p.x) + ulong(row) * p.xs + ulong(h) * 128u);
+    const float4 xv = xp[lane];
+    const float tot = simd_sum(dot(xv, xv));
+    const float inv = metal::precise::rsqrt(tot / 128.0f + p.eps);
+    const float4 nv = mk_fast_load4(w, p.w, p.dtype, lane) * (xv * inv);
+
+    const float4 peer = float4(
+        simd_shuffle_xor(nv.x, 16u),
+        simd_shuffle_xor(nv.y, 16u),
+        simd_shuffle_xor(nv.z, 16u),
+        simd_shuffle_xor(nv.w, 16u));
+    const bool lo = lane < 16u;
+    const float4 a = lo ? nv : peer;
+    const float4 b = lo ? peer : nv;
+    const float4 th = float(p.pos + row) * reinterpret_cast<device const float4 *>(tables + p.z)[lane & 15u];
+    const float4 c = (p.flags & MK_FAST_TRIG)
+        ? float4(metal::fast::cos(th.x), metal::fast::cos(th.y), metal::fast::cos(th.z), metal::fast::cos(th.w))
+        : float4(metal::precise::cos(th.x), metal::precise::cos(th.y), metal::precise::cos(th.z), metal::precise::cos(th.w));
+    const float4 s = (p.flags & MK_FAST_TRIG)
+        ? float4(metal::fast::sin(th.x), metal::fast::sin(th.y), metal::fast::sin(th.z), metal::fast::sin(th.w))
+        : float4(metal::precise::sin(th.x), metal::precise::sin(th.y), metal::precise::sin(th.z), metal::precise::sin(th.w));
+    const float4 out = lo ? (a * c - b * s) : (a * s + b * c);
+
+    const uint slot = (p.pos + row) % p.capacity;
+    const uint kv_width = p.heads * 128u;
+    device ushort4 *kp = reinterpret_cast<device ushort4 *>(ring + ulong(slot) * kv_width + ulong(h) * 128u);
+    kp[lane] = ushort4(
+        df_to_bf16_bits(out.x), df_to_bf16_bits(out.y), df_to_bf16_bits(out.z), df_to_bf16_bits(out.w));
+}
+
+// GQA-4 shared bidirectional sliding-window attention (p.heads == 4 * p.kv_heads, p.dim == 128).
+// 1 TG of 256 threads (8 SIMDs) per (row, kv_head) loads K/V once for all 4 query heads.
+kernel void df_attention_gqa4(
+    device float *arena [[buffer(0)]],
+    device const ushort *k_ring [[buffer(1)]],
+    device const ushort *v_ring [[buffer(2)]],
+    constant MK &p [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float maxes[4][8], sums[4][8];
+    threadgroup float4 outs[4][8][32];
+    const uint r = tgid / p.kv_heads;
+    const uint kvh = tgid % p.kv_heads;
+    if (r >= p.rows) return;
+
+    const uint ctx_pos = p.pos;
+    const uint q_pos = ctx_pos + r;
+    const uint kv_width = p.kv_heads * 128u;
+    uint ctx_start = (p.window != 0u && q_pos + 1u > p.window) ? (q_pos + 1u - p.window) : 0u;
+    if (ctx_start > ctx_pos) ctx_start = ctx_pos;
+    const uint total_keys = (ctx_pos - ctx_start) + p.rows;
+    const uint h0 = kvh * 4u;
+
+    float4 qv[4], ov[4];
+    float m_s[4], l_s[4];
+    #pragma unroll
+    for (uint g = 0u; g < 4u; ++g) {
+        const device float4 *qp = reinterpret_cast<const device float4 *>(
+            arena + ulong(p.x) + ulong(p.row0 + r) * p.xs + ulong(h0 + g) * 128u);
+        qv[g] = qp[lane];
+        ov[g] = float4(0.0f);
+        m_s[g] = -INFINITY;
+        l_s[g] = 0.0f;
+    }
+
+    constexpr float LOG2E_F = 1.4426950408889634f;
+    for (uint idx = simd; idx < total_keys; idx += 8u) {
+        const uint k_pos = ctx_start + idx;
+        float4 kv, vv;
+        if (k_pos < ctx_pos) {
+            const uint slot = k_pos % p.capacity;
+            const ulong base = ulong(slot) * kv_width + ulong(kvh) * 128u;
+            const ushort4 kr = reinterpret_cast<device const ushort4 *>(k_ring + base)[lane];
+            const ushort4 vr = reinterpret_cast<device const ushort4 *>(v_ring + base)[lane];
+            kv = as_type<float4>(uint4(kr) << 16);
+            vv = as_type<float4>(uint4(vr) << 16);
+        } else {
+            const uint nr = k_pos - ctx_pos;
+            const device float4 *kp = reinterpret_cast<const device float4 *>(
+                arena + ulong(p.y) + ulong(p.row0 + nr) * p.ys + ulong(kvh) * 128u);
+            const device float4 *vp = reinterpret_cast<const device float4 *>(
+                arena + ulong(p.z) + ulong(p.row0 + nr) * p.zs + ulong(kvh) * 128u);
+            kv = kp[lane];
+            vv = vp[lane];
+        }
+        #pragma unroll
+        for (uint g = 0u; g < 4u; ++g) {
+            const float score = simd_sum(dot(qv[g], kv)) * p.scale;
+            const float m_next = max(m_s[g], score);
+            const float alpha = (m_s[g] == -INFINITY) ? 0.0f : metal::fast::exp2((m_s[g] - m_next) * LOG2E_F);
+            const float beta = metal::fast::exp2((score - m_next) * LOG2E_F);
+            l_s[g] = l_s[g] * alpha + beta;
+            ov[g] = ov[g] * alpha + beta * vv;
+            m_s[g] = m_next;
+        }
+    }
+
+    #pragma unroll
+    for (uint g = 0u; g < 4u; ++g) {
+        if (lane == 0u) {
+            maxes[g][simd] = m_s[g];
+            sums[g][simd] = l_s[g];
+        }
+        outs[g][simd][lane] = ov[g];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd < 4u) {
+        const uint g = simd;
+        float m_all = -INFINITY;
+        #pragma unroll
+        for (uint s = 0u; s < 8u; ++s) m_all = max(m_all, maxes[g][s]);
+        float denom = 0.0f;
+        float4 acc = float4(0.0f);
+        #pragma unroll
+        for (uint s = 0u; s < 8u; ++s) {
+            if (sums[g][s] == 0.0f) continue;
+            const float scale_o = metal::fast::exp2((maxes[g][s] - m_all) * LOG2E_F);
+            denom += sums[g][s] * scale_o;
+            acc += scale_o * outs[g][s][lane];
+        }
+        const float inv_d = denom > 0.0f ? (1.0f / denom) : 0.0f;
+        device float4 *op = reinterpret_cast<device float4 *>(
+            arena + ulong(p.every) + ulong(p.row0 + r) * p.pad_k + ulong(h0 + g) * 128u);
+        op[lane] = acc * inv_d;
+    }
 }
 
 // Bidirectional sliding-window GQA for DFlash 2 (head_dim <= 256, 8 SIMDgroups per (row, head)).
@@ -720,6 +1167,7 @@ kernel void df_top16_part(
     threadgroup float tg_v[8];
     threadgroup uint tg_i[8];
     threadgroup uint chosen_id;
+    threadgroup float tg_s[8];
 
     uint shards = p.heads;
     uint top_k = p.n;
@@ -741,6 +1189,41 @@ kernel void df_top16_part(
             li[count] = idx;
             ++count;
         }
+    }
+
+    if (p.kind != 0u) {
+        float lmax = -INFINITY;
+        for (uint j = 0u; j < count; ++j) {
+            float v = (p.eps > 0.0f) ? (p.eps * tanh(lv[j] / p.eps)) : lv[j];
+            lmax = max(lmax, v);
+        }
+        float smax = simd_max(lmax);
+        if (lane == 0u) tg_v[simd] = smax;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            float rmax = simd_max(lane < 8u ? tg_v[lane] : -INFINITY);
+            if (lane == 0u) tg_s[0] = rmax;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float shard_max = tg_s[0];
+        float lsum = 0.0f;
+        if (shard_max > -1e30f) {
+            for (uint j = 0u; j < count; ++j) {
+                float v = (p.eps > 0.0f) ? (p.eps * tanh(lv[j] / p.eps)) : lv[j];
+                lsum += metal::precise::exp(v - shard_max);
+            }
+        }
+        float ssum = simd_sum(lsum);
+        if (lane == 0u) tg_v[simd] = ssum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float tot = 0.0f;
+            for (uint w = 0u; w < 8u; ++w) tot += tg_v[w];
+            ulong stat_base = ulong(p.rows) * shards * top_k + (ulong(r) * shards + s) * 2u;
+            part_vals[stat_base] = shard_max;
+            part_vals[stat_base + 1u] = tot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     for (uint k = 0u; k < top_k; ++k) {
@@ -867,6 +1350,54 @@ kernel void df_top16_merge(
             if (li[j] == mask_id) lv[j] = -INFINITY;
         }
     }
+
+    if (p.kind != 0u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float smax_local = -INFINITY;
+        float ssum_local = 0.0f;
+        const ulong part_stat_base = ulong(p.rows) * shards * top_k + ulong(r) * shards * 2u;
+        for (uint s = tid; s < shards; s += 256u) {
+            float m = part_vals[part_stat_base + ulong(s) * 2u];
+            float l = part_vals[part_stat_base + ulong(s) * 2u + 1u];
+            if (l > 0.0f) {
+                if (m > smax_local) {
+                    ssum_local = ssum_local * metal::precise::exp(smax_local - m) + l;
+                    smax_local = m;
+                } else {
+                    ssum_local += l * metal::precise::exp(m - smax_local);
+                }
+            }
+        }
+        float sm_s = simd_max(smax_local);
+        if (lane == 0u) tg_v[simd] = sm_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            float gmax = simd_max(lane < 8u ? tg_v[lane] : -INFINITY);
+            if (lane == 0u) tg_v[0] = gmax;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float row_max = tg_v[0];
+        float scaled_sum = (ssum_local > 0.0f && row_max > -1e30f) ? (ssum_local * metal::precise::exp(smax_local - row_max)) : 0.0f;
+        float s_tot = simd_sum(scaled_sum);
+        if (lane == 0u) tg_v[simd] = s_tot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float z_total = 0.0f;
+            for (uint w = 0u; w < 8u; ++w) z_total += tg_v[w];
+            float z_top = 0.0f;
+            if (row_max > -1e30f) {
+                for (uint k = 0u; k < top_k; ++k) {
+                    float raw_v = out_vals[ulong(r) * top_k + k];
+                    float cap_v = (p.eps > 0.0f) ? (p.eps * tanh(raw_v / p.eps)) : raw_v;
+                    z_top += metal::precise::exp(cap_v - row_max);
+                }
+            }
+            float z_tail = max(z_total - z_top, 0.0f);
+            out_vals[ulong(p.rows) * top_k + r] = (z_tail > 1e-30f && row_max > -1e30f)
+                ? (row_max + metal::precise::log(z_tail))
+                : -1e30f;
+        }
+    }
 }
 
 // DFlash 2 CandidateSelector sequential greedy path decoding.
@@ -874,6 +1405,7 @@ kernel void df_top16_merge(
 // p.rows = draft positions (B - 1, e.g. 7), p.n = selector_rank (e.g. 256),
 // p.m = top_k (e.g. 16), p.pos = anchor_token, p.eps = softcap (30.0 for after_correction, 0 = none).
 // p.w = pred_codebook byte offset, p.s = succ_codebook byte offset, p.dtype = codebook dtype (2 = bf16).
+// When p.kind != 0, writes post-selector top-1 confidence as float bit-pattern to out_tokens[p.rows + 1 + pos].
 kernel void df_select_path(
     device const float *h_sel [[buffer(0)]],
     device const uchar *pred_cb [[buffer(1)]],
@@ -927,6 +1459,17 @@ kernel void df_select_path(
                     best_s = s;
                     best_c = c;
                 }
+            }
+            if (p.kind != 0u) {
+                float tail_lse = top_vals[ulong(p.rows) * top_k + pos];
+                float m = best_s;
+                if (tail_lse > -1e29f && tail_lse > m) m = tail_lse;
+                float z = (tail_lse > -1e29f) ? metal::precise::exp(tail_lse - m) : 0.0f;
+                for (uint k = 0u; k < top_k; ++k) {
+                    z += metal::precise::exp(tg_scores[k] - m);
+                }
+                float conf = (z > 0.0f) ? clamp(metal::precise::exp(best_s - m) / z, 0.0f, 1.0f) : 0.0f;
+                out_tokens[p.rows + 1u + pos] = as_type<uint>(conf);
             }
             tg_prev = best_c;
             out_tokens[1u + pos] = best_c;

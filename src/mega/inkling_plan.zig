@@ -42,12 +42,29 @@ pub const expert_block_simds: u32 = 4;
 pub const expert_block_simd_cols: u32 = 16;
 pub const expert_block_m: u32 = 32;
 pub const argmax_groups: u32 = 64;
+pub const inkling_2p_visits: u32 = 36;
+pub const dflash_2p_traces: u32 = 37;
+pub const dflash_2p_remap_0: u32 = 5;
+pub const dflash_2p_remap_1: u32 = 23;
+pub const dflash_2p_remap_2: u32 = 29;
+pub const bf16_mma_tile_n16: u32 = 16;
+pub const bf16_mma_tile_n32: u32 = 32;
+pub const unembed_padded_vocab: u32 = 200064;
+pub const route_group_max_experts: u32 = 128;
+pub const route_group_max_pairs: u32 = 64;
+pub const dflash_heads: u32 = 32;
+pub const dflash_kv_heads: u32 = 8;
+pub const dflash_gqa4_ratio: u32 = 4;
+pub const dflash_head_dim: u32 = 128;
+pub const dflash_ring_cap: u32 = 2048;
 comptime {
     if (kv_heads * gqa_ratio != heads) @compileError("GQA ratio mismatch");
     if (depth_reg_threads * depth_vec_elems != hidden) @compileError("depth reg width mismatch");
     if (depth_reg_simds * depth_simd_lanes != depth_reg_threads) @compileError("depth simd count mismatch");
     if (splitk_simds * splitk_lanes != splitk_threads) @compileError("splitk thread count mismatch");
     if (expert_block_simds * expert_block_simd_cols != expert_block_n64) @compileError("expert n64 geometry mismatch");
+    if (unembed_padded_vocab > vocab) @compileError("unembed padded vocab exceeds weights");
+    if (dflash_kv_heads * dflash_gqa4_ratio != dflash_heads) @compileError("dflash gqa4 mismatch");
 }
 pub fn multiProjIndex(tile: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32) u32 {
     return if (tile < p1) 0 else (if (tile < p2) 1 else (if (tile < p3) 2 else (if (tile < p4) 3 else (if (tile < p5) 4 else 5))));

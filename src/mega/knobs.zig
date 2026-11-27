@@ -68,6 +68,12 @@ pub const Knobs = struct {
     bf16_prefill_tile: u32 = 0,
     /// Vector loads for the BF16 decode tile (different summation order).
     bf16_decode_vec: bool = false,
+    /// Unified rows=1..8 hardware BF16 direct MMA across linear, bf16_projections and head_softcap.
+    bf16_verify_mma: bool = false,
+    /// Spin-wait on Metal command buffer completion in DFlash 2 finishes.
+    d2_spin: bool = false,
+    /// Enable AngelSpec D-cut adaptive verification depth truncation when drafting.
+    dflash_dcut: bool = false,
     /// Fold an in-place BF16 cast into its producer without changing arithmetic.
     fuse_bf16_cast: bool = false,
     /// Inkling's short convolutions step the ring slot from tap to tap

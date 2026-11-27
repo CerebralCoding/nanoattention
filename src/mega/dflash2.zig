@@ -4,6 +4,7 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const exec = @import("exec.zig");
+const inkling_plan = @import("inkling_plan.zig");
 const loader = @import("loader.zig");
 const io = @import("io.zig");
 const weights = @import("weights");
@@ -59,8 +60,8 @@ fn jsonF32(v: ?std.json.Value, default: ?f32) !f32 {
     };
 }
 
-pub fn parseConfig(a: std.mem.Allocator, bytes: []const u8) !Config {
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+pub fn parseConfig(gpa: std.mem.Allocator, scratch: std.mem.Allocator, bytes: []const u8) !Config {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, bytes, .{});
     const root = try jsonObj(parsed);
     const dc = try jsonObj(root.get("dflash_config"));
     const rope_theta: f32 = if (root.get("rope_parameters")) |rp| blk: {
@@ -77,7 +78,8 @@ pub fn parseConfig(a: std.mem.Allocator, bytes: []const u8) !Config {
         else => return error.InvalidConfigField,
     };
     if (ids_arr.len == 0) return error.InvalidDraftCaptureLayers;
-    const ids = try a.alloc(u32, ids_arr.len);
+    const ids = try gpa.alloc(u32, ids_arr.len);
+    errdefer gpa.free(ids);
     for (ids_arr, ids) |item, *dst| dst.* = try jsonU32(item, null);
 
     const mode_str = if (dc.get("selector_softcap_mode")) |mv| switch (mv) {
@@ -161,6 +163,105 @@ pub const DecodeResult = struct {
     verify_seconds: f64,
 };
 
+pub const DCutState = struct {
+    pub const default_verify_ratios = [_]f64{ 0.368, 0.480, 0.590, 0.658, 0.761, 0.846, 0.930, 1.000 };
+    initialized: bool = false,
+    draft_ms: f64 = 4.2,
+    verify_ms: [16]f64 = initVerifyMs(),
+    gamma: f64 = 1.0,
+
+    fn initVerifyMs() [16]f64 {
+        var v: [16]f64 = undefined;
+        const base_8: f64 = 45.6;
+        for (0..16) |i| {
+            const ratio = if (i < default_verify_ratios.len) default_verify_ratios[i] else (1.0 + 0.08 * @as(f64, @floatFromInt(i + 1 - default_verify_ratios.len)));
+            v[i] = base_8 * ratio;
+        }
+        return v;
+    }
+
+    pub fn reset(self: *DCutState) void {
+        self.* = .{};
+    }
+
+    pub fn selectVerifyLen(self: *const DCutState, confs: []const f32, max_len: u32, r_min_in: u32) u32 {
+        if (max_len <= 1) return max_len;
+        const r_min = @min(max_len, @max(@as(u32, 1), r_min_in));
+        var surv: [16]f64 = undefined;
+        var util: [16]f64 = undefined;
+        surv[0] = 1.0;
+        util[0] = 1.0;
+        var k: usize = 1;
+        while (k < max_len) : (k += 1) {
+            const c_raw: f64 = if (k - 1 < confs.len) @floatCast(confs[k - 1]) else 0.0;
+            const c = std.math.clamp(c_raw, 1e-6, 1.0);
+            surv[k] = surv[k - 1] * std.math.pow(f64, c, self.gamma);
+            util[k] = util[k - 1] + surv[k];
+        }
+        var best_r: u32 = max_len;
+        var best_tp: f64 = -1.0;
+        var r: u32 = r_min;
+        while (r <= max_len) : (r += 1) {
+            const idx = @as(usize, r - 1);
+            const cost = @max(1e-3, self.draft_ms + self.verify_ms[idx]);
+            const tp = util[idx] / cost;
+            if (tp > best_tp) {
+                best_tp = tp;
+                best_r = r;
+            }
+        }
+        return best_r;
+    }
+
+    pub fn observe(self: *DCutState, draft_ms_obs: f64, verify_r: u32, verify_ms_obs: f64, confs: []const f32, acc: u32, max_len: u32) void {
+        if (verify_r == 0 or verify_r > 16) return;
+        const r_idx = @as(usize, verify_r - 1);
+        if (!self.initialized) {
+            self.initialized = true;
+            if (draft_ms_obs > 0.1 and draft_ms_obs < 1000.0) self.draft_ms = draft_ms_obs;
+            const r_ref = if (r_idx < default_verify_ratios.len) default_verify_ratios[r_idx] else 1.0;
+            if (verify_ms_obs > 0.5 and verify_ms_obs < 5000.0) {
+                for (0..@min(@as(usize, max_len), 16)) |j| {
+                    const ratio = if (j < default_verify_ratios.len) default_verify_ratios[j] else (1.0 + 0.08 * @as(f64, @floatFromInt(j + 1 - default_verify_ratios.len)));
+                    self.verify_ms[j] = @max(0.5, verify_ms_obs * (ratio / r_ref));
+                }
+            }
+        } else {
+            const alpha: f64 = 0.25;
+            if (draft_ms_obs > 0.1 and draft_ms_obs < 1000.0) {
+                self.draft_ms = (1.0 - alpha) * self.draft_ms + alpha * draft_ms_obs;
+            }
+            if (verify_ms_obs > 0.5 and verify_ms_obs < 5000.0) {
+                self.verify_ms[r_idx] = (1.0 - alpha) * self.verify_ms[r_idx] + alpha * verify_ms_obs;
+                var j: usize = r_idx + 1;
+                while (j < 16) : (j += 1) {
+                    if (self.verify_ms[j] < self.verify_ms[j - 1] + 0.5) {
+                        self.verify_ms[j] = self.verify_ms[j - 1] + 0.5;
+                    }
+                }
+                j = r_idx;
+                while (j > 0) : (j -= 1) {
+                    if (self.verify_ms[j - 1] > self.verify_ms[j] - 0.5) {
+                        self.verify_ms[j - 1] = @max(0.5, self.verify_ms[j] - 0.5);
+                    }
+                }
+            }
+        }
+        if (verify_r > 1 and acc + 1 <= verify_r) {
+            var s: f64 = 1.0;
+            var pred: f64 = 0.0;
+            var k: usize = 0;
+            while (k + 1 < verify_r and k < confs.len) : (k += 1) {
+                const c = std.math.clamp(@as(f64, @floatCast(confs[k])), 1e-6, 1.0);
+                s *= std.math.pow(f64, c, self.gamma);
+                pred += s;
+            }
+            const err = std.math.clamp((pred - @as(f64, @floatFromInt(acc))) / @as(f64, @floatFromInt(verify_r - 1)), -1.0, 1.0);
+            self.gamma = std.math.clamp(self.gamma * @exp(0.08 * err), 0.25, 4.0);
+        }
+    }
+};
+
 pub const Draft = struct {
     gpa: std.mem.Allocator,
     cfg: Config,
@@ -222,6 +323,10 @@ pub const Draft = struct {
     off_hsel: u32,
     off_logits: u32,
 
+    d2_spin: bool = false,
+    dcut_enabled: bool = false,
+    dcut_r_min: u32 = 1,
+    dcut: DCutState = .{},
     ctx_pos: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, target: *const exec.Engine, draft_dir: []const u8) !*Draft {
@@ -231,7 +336,7 @@ pub const Draft = struct {
 
         const cfg_path = try std.fs.path.join(sa, &.{ draft_dir, "config.json" });
         const cfg_bytes = try loader.readFile(sa, cfg_path);
-        const cfg = try parseConfig(gpa, cfg_bytes);
+        const cfg = try parseConfig(gpa, sa, cfg_bytes);
         errdefer gpa.free(cfg.target_layer_ids);
 
         const valid_vocab = target.program.meta.vocab;
@@ -276,20 +381,20 @@ pub const Draft = struct {
                         idx += 1;
                     }
                     if (idx != trace_count) return error.InvalidDraftCaptureLayers;
-                } else if (traces_len == 37 and trace_count == 3) {
-                    trace_indices[0] = 5;
-                    trace_indices[1] = 17;
-                    trace_indices[2] = 29;
+                } else if (traces_len == inkling_plan.dflash_2p_traces and trace_count == 3) {
+                    trace_indices[0] = inkling_plan.dflash_2p_remap_0;
+                    trace_indices[1] = inkling_plan.dflash_2p_remap_1;
+                    trace_indices[2] = inkling_plan.dflash_2p_remap_2;
                 } else {
                     for (0..trace_count) |i| {
                         const tid = cfg.target_layer_ids[i];
                         trace_indices[i] = @min(@as(u32, @intCast(traces_len - 1)), @as(u32, @intCast((@as(u64, tid) * (traces_len - 1) + cfg.num_target_layers / 2) / cfg.num_target_layers)));
                     }
                 }
-            } else if (traces_len == 37 and trace_count == 3) {
-                trace_indices[0] = 5;
-                trace_indices[1] = 17;
-                trace_indices[2] = 29;
+            } else if (traces_len == inkling_plan.dflash_2p_traces and trace_count == 3) {
+                trace_indices[0] = inkling_plan.dflash_2p_remap_0;
+                trace_indices[1] = inkling_plan.dflash_2p_remap_1;
+                trace_indices[2] = inkling_plan.dflash_2p_remap_2;
             } else {
                 for (0..trace_count) |i| {
                     const tid = cfg.target_layer_ids[i];
@@ -442,19 +547,45 @@ pub const Draft = struct {
             }
         }
 
-        const top_part_vals = try target.ctx.alloc(P * shards * cfg.selector_top_k);
+        const top_part_vals = try target.ctx.alloc(P * shards * (cfg.selector_top_k + 2));
         errdefer top_part_vals.deinit();
         const top_part_ids = try target.ctx.alloc(P * shards * cfg.selector_top_k);
         errdefer top_part_ids.deinit();
-        const top_vals = try target.ctx.alloc(P * cfg.selector_top_k);
+        const top_vals = try target.ctx.alloc(P * (cfg.selector_top_k + 1));
         errdefer top_vals.deinit();
         const top_ids = try target.ctx.alloc(P * cfg.selector_top_k);
         errdefer top_ids.deinit();
-        const out_tokens = try target.ctx.alloc(B);
+        const out_tokens = try target.ctx.alloc(2 * B);
         errdefer out_tokens.deinit();
         const splitk_max_m: u32 = @max(H, q_dim);
         const splitk_buf = try target.ctx.alloc(8 * @as(usize, B) * splitk_max_m);
         errdefer splitk_buf.deinit();
+
+        var d2_spin = target.knobs.d2_spin;
+        if (std.c.getenv("NANO_DFLASH_SPIN")) |raw| {
+            const s = std.mem.span(raw);
+            if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true")) {
+                d2_spin = true;
+            } else if (std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "false")) {
+                d2_spin = false;
+            }
+        }
+        var dcut_enabled = target.knobs.dflash_dcut;
+        if (std.c.getenv("NANO_DFLASH_DCUT")) |raw| {
+            const s = std.mem.span(raw);
+            if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "true")) {
+                dcut_enabled = true;
+            } else if (std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "false")) {
+                dcut_enabled = false;
+            }
+        }
+        var dcut_r_min: u32 = 1;
+        if (std.c.getenv("NANO_DFLASH_DCUT_RMIN")) |raw| {
+            const s = std.mem.trim(u8, std.mem.span(raw), " \t");
+            if (s.len > 0) {
+                dcut_r_min = std.fmt.parseInt(u32, s, 10) catch return error.InvalidDraftBlock;
+            }
+        }
 
         const self = try gpa.create(Draft);
         self.* = .{
@@ -508,6 +639,9 @@ pub const Draft = struct {
             .off_up = off_up,
             .off_hsel = off_hsel,
             .off_logits = off_logits,
+            .d2_spin = d2_spin,
+            .dcut_enabled = dcut_enabled,
+            .dcut_r_min = dcut_r_min,
         };
         return self;
     }
@@ -537,6 +671,7 @@ pub const Draft = struct {
 
     pub fn reset(self: *Draft) void {
         self.ctx_pos = 0;
+        self.dcut.reset();
     }
 
     pub fn makeCapture(self: *const Draft, row0: u32, rows: u32, dst_row0: u32) exec.Capture {
@@ -567,8 +702,13 @@ pub const Draft = struct {
         n: u32,
         round_in: bool,
         round_out: bool,
+        concurrent_first: bool,
     ) !void {
         if (n % 4 != 0) return error.InvalidDraftLinearWidth;
+        var first_ctx = ctx;
+        if (concurrent_first) first_ctx.nano_dispatch_flags = gpu.d2_concurrent;
+        var barrier_ctx = ctx;
+        barrier_ctx.nano_dispatch_flags = null;
         var p: gpu.Params = .{
             .w = w.tensor.offset,
             .dtype = @backingInt(w.tensor.dtype),
@@ -583,28 +723,38 @@ pub const Draft = struct {
             .flags = (if (round_in) gpu.flag_round_bf16 else 0) | (if (round_out) gpu.flag_round_out else 0),
         };
         if (rows <= 8) {
-            if (w.tensor.dtype == .bf16 and m <= 256 and n % 128 == 0 and w.tensor.offset % 8 == 0 and src_off % 4 == 0 and src_stride % 4 == 0) {
-                try gpu.dispatch(ctx, "df_bf16_linear_splitk_rows", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, m) * 256, 256);
-            } else if (w.tensor.dtype == .bf16 and m % 16 == 0 and n % 64 == 0 and w.tensor.offset % 16 == 0 and src_off % 4 == 0 and src_stride % 4 == 0 and dst_off % 4 == 0 and dst_stride % 4 == 0) {
-                const n_tiles: u32 = m / 16;
+            const w_rows: u32 = @intCast(w.tensor.shape[0]);
+            const tile16 = inkling_plan.bf16_mma_tile_n16;
+            const tile32 = inkling_plan.bf16_mma_tile_n32;
+            const pad16_m: u32 = ((m + tile16 - 1) / tile16) * tile16;
+            const pad32_m: u32 = ((m + tile32 - 1) / tile32) * tile32;
+            if (w.tensor.dtype == .bf16 and m <= 256 and n % 256 == 0 and w.tensor.offset % 16 == 0 and src_off % 4 == 0 and src_stride % 4 == 0) {
+                try gpu.dispatch(first_ctx, "df_bf16_linear_splitk_rows_vec8", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, m) * 256, 256);
+            } else if (w.tensor.dtype == .bf16 and m <= 256 and n % 128 == 0 and w.tensor.offset % 8 == 0 and src_off % 4 == 0 and src_stride % 4 == 0) {
+                try gpu.dispatch(first_ctx, "df_bf16_linear_splitk_rows", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, m) * 256, 256);
+            } else if (w.tensor.dtype == .bf16 and m >= 16384 and w_rows >= pad32_m and n % 64 == 0 and w.tensor.offset % 16 == 0 and src_off % 4 == 0 and src_stride % 4 == 0) {
+                try gpu.dispatch(first_ctx, "df_bf16_mma_m8n32_direct", &.{ src_buf, w.buffer, dst_buf }, &p, ((@as(usize, m) + 31) / 32) * 128, 128);
+            } else if (w.tensor.dtype == .bf16 and (m % 16 == 0 or w_rows >= pad16_m) and n % 64 == 0 and w.tensor.offset % 16 == 0 and src_off % 4 == 0 and src_stride % 4 == 0 and (m % 16 != 0 or (dst_off % 4 == 0 and dst_stride % 4 == 0))) {
+                const n_tiles: u32 = (m + 15) / 16;
                 const k_blocks: u32 = n / 64;
-                const desired: u32 = if (n_tiles >= 384) 1 else (512 + n_tiles - 1) / n_tiles;
+                const desired: u32 = if (n_tiles >= 256 or (n_tiles >= 120 and n <= 2304)) 1 else (384 + n_tiles - 1) / n_tiles;
                 const max_by_k: u32 = @max(@as(u32, 1), k_blocks / 4);
-                const splits: u32 = if (m <= self.splitk_max_m) @min(@as(u32, 8), @min(desired, max_by_k)) else 1;
+                const can_split = (m % 16 == 0) and (dst_off % 4 == 0) and (dst_stride % 4 == 0) and (m <= self.splitk_max_m);
+                const splits: u32 = if (can_split) @min(@as(u32, 8), @min(desired, max_by_k)) else 1;
                 p.taps = splits;
                 if (splits == 1) {
-                    try gpu.dispatch(ctx, "df_bf16_mma_m8n16_direct", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, n_tiles) * 64, 64);
+                    try gpu.dispatch(first_ctx, "df_bf16_mma_m8n16_direct", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, n_tiles) * 64, 64);
                 } else {
-                    try gpu.dispatch(ctx, "df_bf16_mma_m8n16_direct", &.{ src_buf, w.buffer, self.splitk_buf }, &p, @as(usize, splits) * n_tiles * 64, 64);
-                    try gpu.dispatch(ctx, "df_bf16_splitk_reduce", &.{ self.splitk_buf, dst_buf }, &p, @as(usize, rows) * (m / 4), 256);
+                    try gpu.dispatch(first_ctx, "df_bf16_mma_m8n16_direct", &.{ src_buf, w.buffer, self.splitk_buf }, &p, @as(usize, splits) * n_tiles * 64, 64);
+                    try gpu.dispatch(barrier_ctx, "df_bf16_splitk_reduce", &.{ self.splitk_buf, dst_buf }, &p, @as(usize, rows) * (m / 4), 256);
                 }
             } else if (w.tensor.dtype == .bf16 and n % 64 == 0 and w.tensor.offset % 16 == 0 and src_off % 4 == 0 and src_stride % 4 == 0) {
-                try gpu.dispatch(ctx, "df_bf16_mma_m8n16", &.{ src_buf, w.buffer, dst_buf }, &p, ((@as(usize, m) + 15) / 16) * 64, 64);
+                try gpu.dispatch(first_ctx, "df_bf16_mma_m8n16", &.{ src_buf, w.buffer, dst_buf }, &p, ((@as(usize, m) + 15) / 16) * 64, 64);
             } else if (w.tensor.dtype == .bf16 and n % 128 == 0 and w.tensor.offset % 8 == 0 and src_off % 4 == 0 and src_stride % 4 == 0) {
-                try gpu.dispatch(ctx, "df_bf16_linear_2xR_vec", &.{ src_buf, w.buffer, dst_buf }, &p, ((@as(usize, m) + 1) / 2) * 32, 128);
+                try gpu.dispatch(first_ctx, "df_bf16_linear_2xR_vec", &.{ src_buf, w.buffer, dst_buf }, &p, ((@as(usize, m) + 1) / 2) * 32, 128);
             } else {
                 const threads = ((@as(usize, m) + 15) / 16) * 128;
-                try gpu.dispatch(ctx, "df_bf16_linear", &.{ src_buf, w.buffer, dst_buf }, &p, threads, 128);
+                try gpu.dispatch(first_ctx, "df_bf16_linear", &.{ src_buf, w.buffer, dst_buf }, &p, threads, 128);
             }
             return;
         }
@@ -614,12 +764,12 @@ pub const Draft = struct {
             w.tensor.offset % 8 == 0 and src_off % 4 == 0 and src_stride % 4 == 0;
         if (can_mma) {
             const tiles_r = (@as(usize, rows) + 31) / 32;
-            try gpu.dispatch(ctx, "df_bf16_matrix32", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, tiles_n) * tiles_r * 128, 128);
+            try gpu.dispatch(first_ctx, "df_bf16_matrix32", &.{ src_buf, w.buffer, dst_buf }, &p, @as(usize, tiles_n) * tiles_r * 128, 128);
             return;
         }
         const tiles_m = (@as(usize, m) + 31) / 32;
         const tiles_r = (@as(usize, rows) + 31) / 32;
-        try gpu.dispatch(ctx, "df_bf16_linear_tile", &.{ src_buf, w.buffer, dst_buf }, &p, tiles_m * tiles_r * 128, 128);
+        try gpu.dispatch(first_ctx, "df_bf16_linear_tile", &.{ src_buf, w.buffer, dst_buf }, &p, tiles_m * tiles_r * 128, 128);
     }
 
     fn dispatchNorm(ctx: metal.Context, buf: metal.Buffer, w: weights.Weight, x_off: u32, xs: u32, y_off: u32, ys: u32, rows: u32, heads: u32, n: u32, eps: f32, round_out: bool) !void {
@@ -643,55 +793,112 @@ pub const Draft = struct {
         try gpu.dispatch(ctx, if (fast) "mk_rmsnorm_vec" else "mk_rmsnorm", &.{ w.buffer, buf }, &p, @as(usize, rows) * heads * grp, grp);
     }
 
+    fn fastWeightAligned(w: weights.Weight) bool {
+        return switch (w.tensor.dtype) {
+            .f32 => w.tensor.offset % 16 == 0,
+            .f16, .bf16 => w.tensor.offset % 8 == 0,
+            else => false,
+        };
+    }
+
     /// Project captured target features into draft KV rings for `rows` consecutive positions starting at `self.ctx_pos`.
     pub fn commitContext(self: *Draft, ctx: metal.Context, rows: u32, finish_after: bool) !void {
         if (rows == 0) return;
+        var mctx = ctx;
         const H = self.cfg.hidden_size;
         const in_w = self.num_capture * H;
         const kv_dim = self.cfg.num_key_value_heads * self.cfg.head_dim;
         const Hkv = self.cfg.num_key_value_heads;
         const D = self.cfg.head_dim;
+        const can_kv_fused = Hkv * D == kv_dim and D == 128 and self.off_k_ctx % 4 == 0 and kv_dim % 4 == 0 and fastWeightAligned(self.layers[0].k_norm);
+        const can_v_vec4 = self.off_v_ctx % 4 == 0 and kv_dim % 4 == 0;
 
         var start: u32 = 0;
         while (start < rows) {
             const chunk = @min(self.commit_chunk, rows - start);
             const src_off = start * in_w;
-            try self.dispatchLinear(ctx, self.capture_buf, src_off, in_w, self.fc, self.arena, self.off_ctx_proj, H, chunk, H, in_w, false, false);
-            try dispatchNorm(ctx, self.arena, self.hidden_norm, self.off_ctx_proj, H, self.off_ctx_proj, H, chunk, 1, H, self.cfg.rms_norm_eps, false);
+            try self.dispatchLinear(mctx, self.capture_buf, src_off, in_w, self.fc, self.arena, self.off_ctx_proj, H, chunk, H, in_w, false, false, start == 0);
+            try dispatchNorm(mctx, self.arena, self.hidden_norm, self.off_ctx_proj, H, self.off_ctx_proj, H, chunk, 1, H, self.cfg.rms_norm_eps, false);
 
             for (self.layers, self.k_rings, self.v_rings) |lw, k_ring, v_ring| {
-                try self.dispatchLinear(ctx, self.arena, self.off_ctx_proj, H, lw.k_proj, self.arena, self.off_k_ctx, kv_dim, chunk, kv_dim, H, false, false);
-                try self.dispatchLinear(ctx, self.arena, self.off_ctx_proj, H, lw.v_proj, self.arena, self.off_v_ctx, kv_dim, chunk, kv_dim, H, false, false);
-                try dispatchNorm(ctx, self.arena, lw.k_norm, self.off_k_ctx, kv_dim, self.off_k_ctx, kv_dim, chunk, Hkv, D, self.cfg.rms_norm_eps, false);
+                const can_multi_kv = chunk <= 8 and lw.k_proj.buffer.handle == lw.v_proj.buffer.handle and
+                    lw.k_proj.tensor.dtype == .bf16 and lw.v_proj.tensor.dtype == .bf16 and
+                    H % 64 == 0 and kv_dim % 16 == 0 and self.off_ctx_proj % 4 == 0 and H % 4 == 0 and
+                    lw.k_proj.tensor.offset % 16 == 0 and lw.v_proj.tensor.offset % 16 == 0 and
+                    self.off_k_ctx % 4 == 0 and self.off_v_ctx % 4 == 0 and kv_dim % 4 == 0;
+                if (can_multi_kv) {
+                    var mx: gpu.ParamsX = .{
+                        .p = .{ .rows = chunk, .row0 = 0, .x = self.off_ctx_proj, .xs = H, .n = H },
+                        .count = 2,
+                    };
+                    mx.mat[0] = .{ .w = lw.k_proj.tensor.offset, .m = kv_dim, .y = self.off_k_ctx, .ys = kv_dim };
+                    mx.mat[1] = .{ .w = lw.v_proj.tensor.offset, .m = kv_dim, .y = self.off_v_ctx, .ys = kv_dim };
+                    const total_tiles: usize = 2 * @as(usize, kv_dim / 16);
+                    try gpu.dispatch(ctx, "df_multi_bf16_mma_m8n16_direct", &.{ self.arena, lw.k_proj.buffer, self.arena }, &mx, total_tiles * 64, 64);
+                } else {
+                    try self.dispatchLinear(ctx, self.arena, self.off_ctx_proj, H, lw.k_proj, self.arena, self.off_k_ctx, kv_dim, chunk, kv_dim, H, false, false, false);
+                    try self.dispatchLinear(ctx, self.arena, self.off_ctx_proj, H, lw.v_proj, self.arena, self.off_v_ctx, kv_dim, chunk, kv_dim, H, false, false, false);
+                }
 
-                var rope_p: gpu.Params = .{
-                    .rows = chunk,
-                    .row0 = 0,
-                    .pos = self.ctx_pos + start,
-                    .x = self.off_k_ctx,
-                    .xs = kv_dim,
-                    .heads = Hkv,
-                    .dim = D,
-                    .rot = D,
-                    .z = 0,
-                };
-                try gpu.dispatch(ctx, "mk_rope", &.{ self.arena, self.rope_tables }, &rope_p, @as(usize, chunk) * Hkv * (D / 2), 256);
+                if (can_kv_fused and fastWeightAligned(lw.k_norm)) {
+                    var kr_p: gpu.Params = .{
+                        .w = lw.k_norm.tensor.offset,
+                        .dtype = @backingInt(lw.k_norm.tensor.dtype),
+                        .rows = chunk,
+                        .row0 = 0,
+                        .pos = self.ctx_pos + start,
+                        .capacity = self.ring_cap,
+                        .x = self.off_k_ctx,
+                        .xs = kv_dim,
+                        .heads = Hkv,
+                        .dim = D,
+                        .rot = D,
+                        .z = 0,
+                        .eps = self.cfg.rms_norm_eps,
+                    };
+                    const total_heads = @as(usize, chunk) * Hkv;
+                    try gpu.dispatch(ctx, "df_rmsnorm_rope_ring_store", &.{ lw.k_norm.buffer, self.arena, self.rope_tables, k_ring }, &kr_p, ((total_heads + 3) / 4) * 128, 128);
+                } else {
+                    try dispatchNorm(ctx, self.arena, lw.k_norm, self.off_k_ctx, kv_dim, self.off_k_ctx, kv_dim, chunk, Hkv, D, self.cfg.rms_norm_eps, false);
 
-                var sk_p: gpu.Params = .{ .rows = chunk, .row0 = 0, .pos = self.ctx_pos + start, .capacity = self.ring_cap, .x = self.off_k_ctx, .xs = kv_dim, .n = kv_dim };
-                try gpu.dispatch(ctx, "df_kv_ring_store", &.{ self.arena, k_ring }, &sk_p, @as(usize, chunk) * kv_dim, 256);
+                    var rope_p: gpu.Params = .{
+                        .rows = chunk,
+                        .row0 = 0,
+                        .pos = self.ctx_pos + start,
+                        .x = self.off_k_ctx,
+                        .xs = kv_dim,
+                        .heads = Hkv,
+                        .dim = D,
+                        .rot = D,
+                        .z = 0,
+                    };
+                    try gpu.dispatch(ctx, "mk_rope", &.{ self.arena, self.rope_tables }, &rope_p, @as(usize, chunk) * Hkv * (D / 2), 256);
 
+                    var sk_p: gpu.Params = .{ .rows = chunk, .row0 = 0, .pos = self.ctx_pos + start, .capacity = self.ring_cap, .x = self.off_k_ctx, .xs = kv_dim, .n = kv_dim };
+                    try gpu.dispatch(ctx, if (can_kv_fused or (self.off_k_ctx % 4 == 0 and kv_dim % 4 == 0)) "df_kv_ring_store_vec4" else "df_kv_ring_store", &.{ self.arena, k_ring }, &sk_p, @as(usize, chunk) * (if (self.off_k_ctx % 4 == 0 and kv_dim % 4 == 0) kv_dim / 4 else kv_dim), 256);
+                }
+
+                // V store reads off_v_ctx and writes v_ring cleanly in parallel with K norm+rope+ring_store.
+                mctx.nano_dispatch_flags = gpu.d2_concurrent;
+                defer mctx.nano_dispatch_flags = null;
                 var sv_p: gpu.Params = .{ .rows = chunk, .row0 = 0, .pos = self.ctx_pos + start, .capacity = self.ring_cap, .x = self.off_v_ctx, .xs = kv_dim, .n = kv_dim };
-                try gpu.dispatch(ctx, "df_kv_ring_store", &.{ self.arena, v_ring }, &sv_p, @as(usize, chunk) * kv_dim, 256);
+                if (can_v_vec4) {
+                    try gpu.dispatch(mctx, "df_kv_ring_store_vec4", &.{ self.arena, v_ring }, &sv_p, @as(usize, chunk) * (kv_dim / 4), 256);
+                } else {
+                    try gpu.dispatch(mctx, "df_kv_ring_store", &.{ self.arena, v_ring }, &sv_p, @as(usize, chunk) * kv_dim, 256);
+                }
             }
             start += chunk;
         }
         self.ctx_pos += rows;
-        if (finish_after) try ctx.finish();
+        if (finish_after) try gpu.finishWait(mctx, self.d2_spin, null);
     }
 
-    /// Propose `verify_size - 1` draft tokens after `anchor`; writes `[anchor, d0, ...]` to `out_block[0..verify_size]`.
-    pub fn propose(self: *Draft, ctx: metal.Context, anchor: u32, verify_size: u32, out_block: []u32) !void {
+    /// Propose `verify_size - 1` draft tokens after `anchor`; writes `[anchor, d0, ...]` to `out_block[0..verify_size]`,
+    /// and optionally writes post-selector top-1 confidence for each proposed token to `out_confs[0..verify_size-1]`.
+    pub fn propose(self: *Draft, ctx: metal.Context, anchor: u32, verify_size: u32, fresh_cmd: bool, out_block: []u32, out_confs: ?[]f32) !void {
         if (verify_size < 2 or verify_size > self.cfg.block_size or out_block.len < verify_size) return error.InvalidDraftBlock;
+        var mctx = ctx;
         const B = verify_size;
         const P = B - 1;
         const H = self.cfg.hidden_size;
@@ -703,11 +910,16 @@ pub const Draft = struct {
         const kv_dim = Hkv * D;
         const groups = H / self.cfg.conv_group_size;
         const conv_proj_dim = 2 * self.cfg.conv_kernel_size * groups;
+        const vec4_conv_ok = (H % 4 == 0) and (self.cfg.conv_group_size % 4 == 0) and
+            (self.off_norm % 4 == 0) and (self.off_conv_x % 4 == 0) and (self.off_proj % 4 == 0) and (self.off_hidden % 4 == 0);
+        const can_gqa4 = (Hq == inkling_plan.dflash_gqa4_ratio * Hkv) and (D == inkling_plan.dflash_head_dim) and (kv_dim % 4 == 0) and (q_dim % 4 == 0) and
+            (self.off_q % 4 == 0) and (self.off_k % 4 == 0) and (self.off_v % 4 == 0) and (self.off_att % 4 == 0);
 
         const tok_words = self.arena.structs(u32);
         tok_words[self.off_tokens] = anchor;
         for (1..B) |i| tok_words[self.off_tokens + i] = self.cfg.mask_token_id;
 
+        if (fresh_cmd) mctx.nano_dispatch_flags = gpu.d2_concurrent;
         var emb_p: gpu.Params = .{
             .w = self.embed.tensor.offset,
             .dtype = @backingInt(self.embed.tensor.dtype),
@@ -719,7 +931,10 @@ pub const Draft = struct {
             .ys = H,
             .n = H,
         };
-        try gpu.dispatch(ctx, "mk_embed", &.{ self.embed.buffer, self.embed.buffer, self.embed.buffer, self.arena }, &emb_p, @as(usize, B) * H, 256);
+        {
+            defer mctx.nano_dispatch_flags = null;
+            try gpu.dispatch(mctx, "mk_embed", &.{ self.embed.buffer, self.embed.buffer, self.embed.buffer, self.arena }, &emb_p, @as(usize, B) * H, 256);
+        }
         if (self.embed_norm) |en| {
             try dispatchNorm(ctx, self.arena, en, self.off_hidden, H, self.off_hidden, H, B, 1, H, self.cfg.rms_norm_eps, true);
         }
@@ -727,7 +942,7 @@ pub const Draft = struct {
         for (self.layers, self.k_rings, self.v_rings) |lw, k_ring, v_ring| {
             // Attention block
             try dispatchNorm(ctx, self.arena, lw.input_layernorm, self.off_hidden, H, self.off_norm, H, B, 1, H, self.cfg.rms_norm_eps, false);
-            try self.dispatchLinear(ctx, self.arena, self.off_norm, H, lw.attn_conv_proj, self.arena, self.off_conv_dyn, conv_proj_dim, B, conv_proj_dim, H, false, false);
+            try self.dispatchLinear(ctx, self.arena, self.off_norm, H, lw.attn_conv_proj, self.arena, self.off_conv_dyn, conv_proj_dim, B, conv_proj_dim, H, false, false, false);
             var ac0: gpu.Params = .{
                 .rows = B,
                 .row0 = 0,
@@ -745,19 +960,80 @@ pub const Draft = struct {
                 .w = lw.attn_conv_base.tensor.offset,
                 .dtype = @backingInt(lw.attn_conv_base.tensor.dtype),
             };
-            try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.attn_conv_base.buffer }, &ac0, @as(usize, B) * H, 256);
+            if (vec4_conv_ok and fastWeightAligned(lw.attn_conv_base)) {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv_vec4", &.{ self.arena, lw.attn_conv_base.buffer }, &ac0, @as(usize, B) * (H / 4), 256);
+            } else {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.attn_conv_base.buffer }, &ac0, @as(usize, B) * H, 256);
+            }
 
-            try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.q_proj, self.arena, self.off_q, q_dim, B, q_dim, H, false, false);
-            try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.k_proj, self.arena, self.off_k, kv_dim, B, kv_dim, H, false, false);
-            try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.v_proj, self.arena, self.off_v, kv_dim, B, kv_dim, H, false, false);
+            const can_multi_qkv = B <= 8 and
+                lw.q_proj.buffer.handle == lw.k_proj.buffer.handle and
+                lw.q_proj.buffer.handle == lw.v_proj.buffer.handle and
+                lw.q_proj.tensor.dtype == .bf16 and lw.k_proj.tensor.dtype == .bf16 and lw.v_proj.tensor.dtype == .bf16 and
+                H % 64 == 0 and q_dim % 16 == 0 and kv_dim % 16 == 0 and self.off_conv_x % 4 == 0 and H % 4 == 0 and
+                lw.q_proj.tensor.offset % 16 == 0 and lw.k_proj.tensor.offset % 16 == 0 and lw.v_proj.tensor.offset % 16 == 0 and
+                self.off_q % 4 == 0 and self.off_k % 4 == 0 and self.off_v % 4 == 0 and q_dim % 4 == 0 and kv_dim % 4 == 0;
+            if (can_multi_qkv) {
+                var mx: gpu.ParamsX = .{
+                    .p = .{ .rows = B, .row0 = 0, .x = self.off_conv_x, .xs = H, .n = H },
+                    .count = 3,
+                };
+                mx.mat[0] = .{ .w = lw.q_proj.tensor.offset, .m = q_dim, .y = self.off_q, .ys = q_dim };
+                mx.mat[1] = .{ .w = lw.k_proj.tensor.offset, .m = kv_dim, .y = self.off_k, .ys = kv_dim };
+                mx.mat[2] = .{ .w = lw.v_proj.tensor.offset, .m = kv_dim, .y = self.off_v, .ys = kv_dim };
+                const total_tiles: usize = @as(usize, q_dim / 16) + 2 * @as(usize, kv_dim / 16);
+                try gpu.dispatch(ctx, "df_multi_bf16_mma_m8n16_direct", &.{ self.arena, lw.q_proj.buffer, self.arena }, &mx, total_tiles * 64, 64);
+            } else {
+                try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.q_proj, self.arena, self.off_q, q_dim, B, q_dim, H, false, false, false);
+                try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.k_proj, self.arena, self.off_k, kv_dim, B, kv_dim, H, false, false, false);
+                try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.v_proj, self.arena, self.off_v, kv_dim, B, kv_dim, H, false, false, false);
+            }
 
-            try dispatchNorm(ctx, self.arena, lw.q_norm, self.off_q, q_dim, self.off_q, q_dim, B, Hq, D, self.cfg.rms_norm_eps, false);
-            try dispatchNorm(ctx, self.arena, lw.k_norm, self.off_k, kv_dim, self.off_k, kv_dim, B, Hkv, D, self.cfg.rms_norm_eps, false);
+            if (D == 128 and q_dim % 4 == 0 and kv_dim % 4 == 0 and self.off_q % 4 == 0 and self.off_k % 4 == 0 and fastWeightAligned(lw.q_norm) and fastWeightAligned(lw.k_norm)) {
+                var rnq: gpu.Params = .{
+                    .w = lw.q_norm.tensor.offset,
+                    .dtype = @backingInt(lw.q_norm.tensor.dtype),
+                    .rows = B,
+                    .row0 = 0,
+                    .pos = self.ctx_pos,
+                    .x = self.off_q,
+                    .xs = q_dim,
+                    .heads = Hq,
+                    .dim = D,
+                    .rot = D,
+                    .z = 0,
+                    .eps = self.cfg.rms_norm_eps,
+                };
+                try gpu.dispatch(ctx, "df_rmsnorm_rope", &.{ lw.q_norm.buffer, self.arena, self.rope_tables }, &rnq, ((@as(usize, B) * Hq + 3) / 4) * 128, 128);
 
-            var rq: gpu.Params = .{ .rows = B, .pos = self.ctx_pos, .x = self.off_q, .xs = q_dim, .heads = Hq, .dim = D, .rot = D, .z = 0 };
-            try gpu.dispatch(ctx, "mk_rope", &.{ self.arena, self.rope_tables }, &rq, @as(usize, B) * Hq * (D / 2), 256);
-            var rk: gpu.Params = .{ .rows = B, .pos = self.ctx_pos, .x = self.off_k, .xs = kv_dim, .heads = Hkv, .dim = D, .rot = D, .z = 0 };
-            try gpu.dispatch(ctx, "mk_rope", &.{ self.arena, self.rope_tables }, &rk, @as(usize, B) * Hkv * (D / 2), 256);
+                mctx.nano_dispatch_flags = gpu.d2_concurrent;
+                defer mctx.nano_dispatch_flags = null;
+                var rnk: gpu.Params = .{
+                    .w = lw.k_norm.tensor.offset,
+                    .dtype = @backingInt(lw.k_norm.tensor.dtype),
+                    .rows = B,
+                    .row0 = 0,
+                    .pos = self.ctx_pos,
+                    .x = self.off_k,
+                    .xs = kv_dim,
+                    .heads = Hkv,
+                    .dim = D,
+                    .rot = D,
+                    .z = 0,
+                    .eps = self.cfg.rms_norm_eps,
+                };
+                try gpu.dispatch(mctx, "df_rmsnorm_rope", &.{ lw.k_norm.buffer, self.arena, self.rope_tables }, &rnk, ((@as(usize, B) * Hkv + 3) / 4) * 128, 128);
+            } else {
+                try dispatchNorm(mctx, self.arena, lw.q_norm, self.off_q, q_dim, self.off_q, q_dim, B, Hq, D, self.cfg.rms_norm_eps, false);
+                try dispatchNorm(mctx, self.arena, lw.k_norm, self.off_k, kv_dim, self.off_k, kv_dim, B, Hkv, D, self.cfg.rms_norm_eps, false);
+
+                var rq: gpu.Params = .{ .rows = B, .pos = self.ctx_pos, .x = self.off_q, .xs = q_dim, .heads = Hq, .dim = D, .rot = D, .z = 0 };
+                try gpu.dispatch(mctx, "mk_rope", &.{ self.arena, self.rope_tables }, &rq, @as(usize, B) * Hq * (D / 2), 256);
+                mctx.nano_dispatch_flags = gpu.d2_concurrent;
+                defer mctx.nano_dispatch_flags = null;
+                var rk: gpu.Params = .{ .rows = B, .pos = self.ctx_pos, .x = self.off_k, .xs = kv_dim, .heads = Hkv, .dim = D, .rot = D, .z = 0 };
+                try gpu.dispatch(mctx, "mk_rope", &.{ self.arena, self.rope_tables }, &rk, @as(usize, B) * Hkv * (D / 2), 256);
+            }
 
             var att_p: gpu.Params = .{
                 .rows = B,
@@ -777,9 +1053,13 @@ pub const Draft = struct {
                 .every = self.off_att,
                 .pad_k = q_dim,
             };
-            try gpu.dispatch(ctx, "df_attention", &.{ self.arena, k_ring, v_ring }, &att_p, @as(usize, B) * Hq * 256, 256);
+            if (can_gqa4) {
+                try gpu.dispatch(ctx, "df_attention_gqa4", &.{ self.arena, k_ring, v_ring }, &att_p, @as(usize, B) * Hkv * 256, 256);
+            } else {
+                try gpu.dispatch(ctx, "df_attention", &.{ self.arena, k_ring, v_ring }, &att_p, @as(usize, B) * Hq * 256, 256);
+            }
 
-            try self.dispatchLinear(ctx, self.arena, self.off_att, q_dim, lw.o_proj, self.arena, self.off_proj, H, B, H, q_dim, false, false);
+            try self.dispatchLinear(ctx, self.arena, self.off_att, q_dim, lw.o_proj, self.arena, self.off_proj, H, B, H, q_dim, false, false, false);
             var ac1: gpu.Params = .{
                 .rows = B,
                 .row0 = 0,
@@ -799,11 +1079,15 @@ pub const Draft = struct {
                 .w = lw.attn_conv_base.tensor.offset,
                 .dtype = @backingInt(lw.attn_conv_base.tensor.dtype),
             };
-            try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.attn_conv_base.buffer }, &ac1, @as(usize, B) * H, 256);
+            if (vec4_conv_ok and fastWeightAligned(lw.attn_conv_base)) {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv_vec4", &.{ self.arena, lw.attn_conv_base.buffer }, &ac1, @as(usize, B) * (H / 4), 256);
+            } else {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.attn_conv_base.buffer }, &ac1, @as(usize, B) * H, 256);
+            }
 
             // MLP block
             try dispatchNorm(ctx, self.arena, lw.post_attention_layernorm, self.off_hidden, H, self.off_norm, H, B, 1, H, self.cfg.rms_norm_eps, false);
-            try self.dispatchLinear(ctx, self.arena, self.off_norm, H, lw.mlp_conv_proj, self.arena, self.off_conv_dyn, conv_proj_dim, B, conv_proj_dim, H, false, false);
+            try self.dispatchLinear(ctx, self.arena, self.off_norm, H, lw.mlp_conv_proj, self.arena, self.off_conv_dyn, conv_proj_dim, B, conv_proj_dim, H, false, false, false);
             var mc0: gpu.Params = .{
                 .rows = B,
                 .row0 = 0,
@@ -821,13 +1105,43 @@ pub const Draft = struct {
                 .w = lw.mlp_conv_base.tensor.offset,
                 .dtype = @backingInt(lw.mlp_conv_base.tensor.dtype),
             };
-            try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.mlp_conv_base.buffer }, &mc0, @as(usize, B) * H, 256);
+            if (vec4_conv_ok and fastWeightAligned(lw.mlp_conv_base)) {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv_vec4", &.{ self.arena, lw.mlp_conv_base.buffer }, &mc0, @as(usize, B) * (H / 4), 256);
+            } else {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.mlp_conv_base.buffer }, &mc0, @as(usize, B) * H, 256);
+            }
 
-            try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.gate_proj, self.arena, self.off_gate, I, B, I, H, false, false);
-            try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.up_proj, self.arena, self.off_up, I, B, I, H, false, false);
-            var sg_p: gpu.Params = .{ .rows = B, .n = I, .x = self.off_gate, .xs = I, .y = self.off_up, .ys = I, .z = self.off_gate, .zs = I };
-            try gpu.dispatch(ctx, "df_swiglu_mul", &.{self.arena}, &sg_p, @as(usize, B) * I, 256);
-            try self.dispatchLinear(ctx, self.arena, self.off_gate, I, lw.down_proj, self.arena, self.off_proj, H, B, H, I, false, false);
+            const gate_rows: u32 = @intCast(lw.gate_proj.tensor.shape[0]);
+            const up_rows: u32 = @intCast(lw.up_proj.tensor.shape[0]);
+            const pad16_I: u32 = ((I + 15) / 16) * 16;
+            const can_fused_glu = B <= 8 and
+                lw.gate_proj.buffer.handle == lw.up_proj.buffer.handle and
+                lw.gate_proj.tensor.dtype == .bf16 and lw.up_proj.tensor.dtype == .bf16 and
+                (I % 16 == 0 or (gate_rows >= pad16_I and up_rows >= pad16_I)) and
+                H % 64 == 0 and lw.gate_proj.tensor.offset % 16 == 0 and lw.up_proj.tensor.offset % 16 == 0 and
+                self.off_conv_x % 4 == 0 and H % 4 == 0;
+            if (can_fused_glu) {
+                var gu_p: gpu.Params = .{
+                    .w = lw.gate_proj.tensor.offset,
+                    .s = lw.up_proj.tensor.offset,
+                    .dtype = @backingInt(lw.gate_proj.tensor.dtype),
+                    .rows = B,
+                    .row0 = 0,
+                    .x = self.off_conv_x,
+                    .xs = H,
+                    .y = self.off_gate,
+                    .ys = I,
+                    .n = H,
+                    .m = I,
+                };
+                try gpu.dispatch(ctx, "df_bf16_gate_up_swiglu_mma", &.{ self.arena, lw.gate_proj.buffer, self.arena }, &gu_p, ((@as(usize, I) + 15) / 16) * 64, 64);
+            } else {
+                try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.gate_proj, self.arena, self.off_gate, I, B, I, H, false, false, false);
+                try self.dispatchLinear(ctx, self.arena, self.off_conv_x, H, lw.up_proj, self.arena, self.off_up, I, B, I, H, false, false, false);
+                var sg_p: gpu.Params = .{ .rows = B, .n = I, .x = self.off_gate, .xs = I, .y = self.off_up, .ys = I, .z = self.off_gate, .zs = I };
+                try gpu.dispatch(ctx, "df_swiglu_mul", &.{self.arena}, &sg_p, @as(usize, B) * I, 256);
+            }
+            try self.dispatchLinear(ctx, self.arena, self.off_gate, I, lw.down_proj, self.arena, self.off_proj, H, B, H, I, false, false, false);
 
             var mc1: gpu.Params = .{
                 .rows = B,
@@ -848,21 +1162,27 @@ pub const Draft = struct {
                 .w = lw.mlp_conv_base.tensor.offset,
                 .dtype = @backingInt(lw.mlp_conv_base.tensor.dtype),
             };
-            try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.mlp_conv_base.buffer }, &mc1, @as(usize, B) * H, 256);
+            if (vec4_conv_ok and fastWeightAligned(lw.mlp_conv_base)) {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv_vec4", &.{ self.arena, lw.mlp_conv_base.buffer }, &mc1, @as(usize, B) * (H / 4), 256);
+            } else {
+                try gpu.dispatch(ctx, "df_grouped_dyn_conv", &.{ self.arena, lw.mlp_conv_base.buffer }, &mc1, @as(usize, B) * H, 256);
+            }
         }
 
         // Proposal rows [1 .. B-1] (logits_start = 1).
         try dispatchNorm(ctx, self.arena, self.norm, self.off_hidden + H, H, self.off_norm, H, P, 1, H, self.cfg.rms_norm_eps, false);
-        try self.dispatchLinear(ctx, self.arena, self.off_norm, H, self.unembed, self.arena, self.off_logits, self.valid_vocab, P, self.valid_vocab, H, false, false);
-        try self.dispatchLinear(ctx, self.arena, self.off_norm, H, self.sel_hidden_proj, self.arena, self.off_hsel, self.cfg.selector_rank, P, self.cfg.selector_rank, H, false, false);
-
-        var t1_p: gpu.Params = .{ .rows = P, .row0 = 0, .x = self.off_logits, .xs = self.valid_vocab, .m = self.valid_vocab, .heads = self.shards, .n = self.cfg.selector_top_k };
-        try gpu.dispatch(ctx, "df_top16_part", &.{ self.arena, self.top_part_vals, self.top_part_ids }, &t1_p, @as(usize, P) * self.shards * 256, 256);
-
-        var t2_p: gpu.Params = .{ .rows = P, .heads = self.shards, .n = self.cfg.selector_top_k };
-        try gpu.dispatch(ctx, "df_top16_merge", &.{ self.top_part_vals, self.top_part_ids, self.top_vals, self.top_ids }, &t2_p, @as(usize, P) * 256, 256);
+        try self.dispatchLinear(ctx, self.arena, self.off_norm, H, self.unembed, self.arena, self.off_logits, self.valid_vocab, P, self.valid_vocab, H, false, false, false);
+        // Disjoint output (`off_hsel` vs `off_logits`) reading same immutable `off_norm`.
+        try self.dispatchLinear(ctx, self.arena, self.off_norm, H, self.sel_hidden_proj, self.arena, self.off_hsel, self.cfg.selector_rank, P, self.cfg.selector_rank, H, false, false, true);
 
         const softcap: f32 = if (self.cfg.selector_softcap_mode == .after_correction) self.cfg.final_logit_softcapping else 0.0;
+        const need_conf: u32 = if (out_confs != null) 1 else 0;
+        var t1_p: gpu.Params = .{ .rows = P, .row0 = 0, .x = self.off_logits, .xs = self.valid_vocab, .m = self.valid_vocab, .heads = self.shards, .n = self.cfg.selector_top_k, .kind = need_conf, .eps = softcap };
+        try gpu.dispatch(ctx, "df_top16_part", &.{ self.arena, self.top_part_vals, self.top_part_ids }, &t1_p, @as(usize, P) * self.shards * 256, 256);
+
+        var t2_p: gpu.Params = .{ .rows = P, .heads = self.shards, .n = self.cfg.selector_top_k, .kind = need_conf, .eps = softcap };
+        try gpu.dispatch(ctx, "df_top16_merge", &.{ self.top_part_vals, self.top_part_ids, self.top_vals, self.top_ids }, &t2_p, @as(usize, P) * 256, 256);
+
         var sp_p: gpu.Params = .{
             .rows = P,
             .n = self.cfg.selector_rank,
@@ -873,16 +1193,21 @@ pub const Draft = struct {
             .w = self.sel_pred_cb.tensor.offset,
             .s = self.sel_succ_cb.tensor.offset,
             .dtype = @backingInt(self.sel_pred_cb.tensor.dtype),
+            .kind = need_conf,
             .eps = softcap,
         };
         try gpu.dispatch(ctx, "df_select_path", &.{ self.arena, self.sel_pred_cb.buffer, self.sel_succ_cb.buffer, self.top_vals, self.top_ids, self.out_tokens }, &sp_p, 512, 512);
 
-        try ctx.finish();
+        try gpu.finishWait(ctx, self.d2_spin, null);
         const out_u32 = self.out_tokens.structs(u32);
         for (0..B) |i| {
             const tok = out_u32[i];
             if (tok >= self.valid_vocab) return error.InvalidDraftToken;
             out_block[i] = tok;
+        }
+        if (out_confs) |confs| {
+            if (confs.len < P) return error.InvalidDraftBlock;
+            for (0..P) |i| confs[i] = @bitCast(out_u32[B + i]);
         }
     }
 
@@ -944,8 +1269,19 @@ pub const Draft = struct {
         if (target.batch < self.cfg.block_size and !opts.commit_all) {
             // Fall through safely; `verify_size` clamps by `target.batch` below.
         }
-        const block = try self.gpa.alloc(u32, self.cfg.block_size);
-        defer self.gpa.free(block);
+        var block_buf: [16]u32 = undefined;
+        var conf_buf: [16]f32 = undefined;
+        if (self.cfg.block_size > block_buf.len) return error.InvalidDraftBlock;
+        const block = block_buf[0..self.cfg.block_size];
+        var verify_cap: u32 = self.cfg.block_size;
+        if (std.c.getenv("NANO_DFLASH_VERIFY_MAX")) |raw| {
+            const s = std.mem.trim(u8, std.mem.span(raw), " \t");
+            if (s.len > 0) {
+                const v = std.fmt.parseInt(u32, s, 10) catch return error.InvalidDraftBlock;
+                if (v < 1 or v > self.cfg.block_size) return error.InvalidDraftBlock;
+                verify_cap = v;
+            }
+        }
 
         var anchor = first_token;
         var count: usize = 0;
@@ -987,19 +1323,22 @@ pub const Draft = struct {
                 break;
             }
 
-            const max_block = @min(self.cfg.block_size, target.batch);
-            const verify_size: u32 = @intCast(@min(max_block, remaining));
+            const max_block = @min(verify_cap, @min(self.cfg.block_size, target.batch));
+            const propose_size: u32 = @intCast(@min(max_block, remaining));
+            var verify_size: u32 = propose_size;
 
             const td0 = try io.now();
-            if (verify_size > 1) {
-                const tok_words = self.arena.structs(u32);
-                tok_words[self.off_tokens] = anchor;
-                for (1..verify_size) |ti| tok_words[self.off_tokens + ti] = self.cfg.mask_token_id;
+            if (propose_size > 1) {
+                const fresh_cmd = (pending_commit == 0);
                 if (pending_commit > 0) {
                     try self.commitContext(target.ctx, pending_commit, false);
                     pending_commit = 0;
                 }
-                try self.propose(target.ctx, anchor, verify_size, block[0..verify_size]);
+                const conf_slice: ?[]f32 = if (self.dcut_enabled) conf_buf[0 .. propose_size - 1] else null;
+                try self.propose(target.ctx, anchor, propose_size, fresh_cmd, block[0..propose_size], conf_slice);
+                if (self.dcut_enabled) {
+                    verify_size = self.dcut.selectVerifyLen(conf_buf[0 .. propose_size - 1], propose_size, self.dcut_r_min);
+                }
                 proposed += verify_size - 1;
             } else {
                 if (pending_commit > 0) {
@@ -1008,7 +1347,8 @@ pub const Draft = struct {
                 }
                 block[0] = anchor;
             }
-            draft_seconds += (try io.now()) - td0;
+            const draft_dt = (try io.now()) - td0;
+            draft_seconds += draft_dt;
             batches += 1;
 
             const tv0 = try io.now();
@@ -1018,12 +1358,16 @@ pub const Draft = struct {
             defer target.capture = null;
             try target.forward(block[0..verify_size], 0);
             dispatches += target.last.dispatches;
-            verify_seconds += (try io.now()) - tv0;
+            const verify_dt = (try io.now()) - tv0;
+            verify_seconds += verify_dt;
 
             var acc: u32 = 0;
             while (acc + 1 < verify_size) : (acc += 1) {
                 const expected = try target.next(acc);
                 if (block[1 + acc] != expected) break;
+            }
+            if (self.dcut_enabled and propose_size > 1) {
+                self.dcut.observe(draft_dt * 1000.0, verify_size, verify_dt * 1000.0, conf_buf[0 .. propose_size - 1], acc, propose_size);
             }
             accepted_total += acc;
 

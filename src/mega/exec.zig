@@ -1198,36 +1198,64 @@ pub const Engine = struct {
         }
         if (self.capture) |cap| {
             self.ctx.nano_dispatch_flags = null;
-            for (cap.trace_indices, 0..) |ti, slot| {
-                const v = self.program.traces[ti].view;
-                const w = self.words(v);
-                var p: gpu.Params = .{
-                    .rows = cap.rows,
-                    .row0 = cap.dst_row0,
-                    .pos = cap.row0,
-                    .x = w.off,
-                    .xs = w.stride,
-                    .y = @intCast(slot * cap.width),
-                    .ys = cap.stride,
-                    .n = v.width,
+            const total_slots = cap.trace_indices.len + @as(usize, @intFromBool(cap.include_final_norm));
+            if (total_slots >= 2 and total_slots <= 6) {
+                var cx: gpu.ParamsX = .{
+                    .p = .{ .rows = cap.rows, .row0 = cap.dst_row0, .pos = cap.row0, .ys = cap.stride },
+                    .count = @intCast(total_slots),
+                    .act_a = if (cap.width % 4 == 0 and cap.stride % 4 == 0) 1 else 0,
                 };
-                try gpu.dispatch(self.ctx, "mk_copy_slot", &.{ self.arena, cap.dest }, &p, @as(usize, cap.rows) * v.width, 256);
-            }
-            if (cap.include_final_norm) {
-                const v = self.program.draft_final_norm.?.view;
-                const w = self.words(v);
-                const slot = cap.trace_indices.len;
-                var p: gpu.Params = .{
-                    .rows = cap.rows,
-                    .row0 = cap.dst_row0,
-                    .pos = cap.row0,
-                    .x = w.off,
-                    .xs = w.stride,
-                    .y = @intCast(slot * cap.width),
-                    .ys = cap.stride,
-                    .n = v.width,
-                };
-                try gpu.dispatch(self.ctx, "mk_copy_slot", &.{ self.arena, cap.dest }, &p, @as(usize, cap.rows) * v.width, 256);
+                var max_w: u32 = 0;
+                for (cap.trace_indices, 0..) |ti, slot| {
+                    const v = self.program.traces[ti].view;
+                    const w = self.words(v);
+                    if (v.width % 4 != 0 or w.off % 4 != 0 or w.stride % 4 != 0) cx.act_a = 0;
+                    cx.mat[slot] = .{ .w = slot * cap.width, .m = v.width, .y = w.off, .ys = w.stride };
+                    max_w = @max(max_w, v.width);
+                }
+                if (cap.include_final_norm) {
+                    const v = self.program.draft_final_norm.?.view;
+                    const w = self.words(v);
+                    const slot = cap.trace_indices.len;
+                    if (v.width % 4 != 0 or w.off % 4 != 0 or w.stride % 4 != 0) cx.act_a = 0;
+                    cx.mat[slot] = .{ .w = slot * cap.width, .m = v.width, .y = w.off, .ys = w.stride };
+                    max_w = @max(max_w, v.width);
+                }
+                const unit_w: u32 = if (cx.act_a != 0) max_w / 4 else max_w;
+                cx.p.n = unit_w;
+                try gpu.dispatch(self.ctx, "mk_copy_slots4", &.{ self.arena, cap.dest }, &cx, @as(usize, cap.rows) * unit_w, 256);
+            } else {
+                for (cap.trace_indices, 0..) |ti, slot| {
+                    const v = self.program.traces[ti].view;
+                    const w = self.words(v);
+                    var p: gpu.Params = .{
+                        .rows = cap.rows,
+                        .row0 = cap.dst_row0,
+                        .pos = cap.row0,
+                        .x = w.off,
+                        .xs = w.stride,
+                        .y = @intCast(slot * cap.width),
+                        .ys = cap.stride,
+                        .n = v.width,
+                    };
+                    try gpu.dispatch(self.ctx, "mk_copy_slot", &.{ self.arena, cap.dest }, &p, @as(usize, cap.rows) * v.width, 256);
+                }
+                if (cap.include_final_norm) {
+                    const v = self.program.draft_final_norm.?.view;
+                    const w = self.words(v);
+                    const slot = cap.trace_indices.len;
+                    var p: gpu.Params = .{
+                        .rows = cap.rows,
+                        .row0 = cap.dst_row0,
+                        .pos = cap.row0,
+                        .x = w.off,
+                        .xs = w.stride,
+                        .y = @intCast(slot * cap.width),
+                        .ys = cap.stride,
+                        .n = v.width,
+                    };
+                    try gpu.dispatch(self.ctx, "mk_copy_slot", &.{ self.arena, cap.dest }, &p, @as(usize, cap.rows) * v.width, 256);
+                }
             }
         }
         const t_encoded = io.now() catch 0; // decode climb 2
@@ -1836,10 +1864,20 @@ pub const Engine = struct {
                     self.knobs.bf16_decode_splitk and rows >= 1 and rows <= 8 and l.input_bf16 and
                     p.m <= 128 and p.n % 128 == 0 and w.tensor.offset % 8 == 0 and p.x % 4 == 0 and p.xs % 4 == 0)
                 {
-                    if (rows == 1) {
-                        try gpu.dispatch(self.ctx, "mk_bf16_linear_splitk", &.{ w.buffer, self.arena }, &p, @as(usize, p.m) * inkling_plan.splitk_threads, inkling_plan.splitk_threads);
+                    const splitk_vec8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
+                    const kname: [:0]const u8 = if (rows == 1)
+                        (if (splitk_vec8) "mk_bf16_linear_splitk_vec8" else "mk_bf16_linear_splitk")
+                    else
+                        (if (splitk_vec8) "mk_bf16_linear_splitk_rows_vec8" else "mk_bf16_linear_splitk_rows");
+                    try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, @as(usize, p.m) * inkling_plan.splitk_threads, inkling_plan.splitk_threads);
+                } else if (self.knobs.bf16_verify_mma and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and
+                    rows >= 1 and rows <= 8 and l.input_bf16 and p.m >= 16384 and p.n % 64 == 0 and w.tensor.offset % 16 == 0 and
+                    p.x % 4 == 0 and p.xs % 4 == 0 and w.tensor.shape[0] >= ((p.m + 15) / 16) * 16)
+                {
+                    if (w.tensor.shape[0] >= ((p.m + 31) / 32) * 32) {
+                        try gpu.dispatch(self.ctx, "mk_bf16_mma_m8n32_direct", &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 31) / 32) * 128, 128);
                     } else {
-                        try gpu.dispatch(self.ctx, "mk_bf16_linear_splitk_rows", &.{ w.buffer, self.arena }, &p, @as(usize, p.m) * inkling_plan.splitk_threads, inkling_plan.splitk_threads);
+                        try gpu.dispatch(self.ctx, "mk_bf16_mma_m8n16_direct", &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 15) / 16) * 64, 64);
                     }
                 } else if (self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and p.m % 4 == 0 and p.n % 32 == 0) {
                     const tile = self.knobs.bf16_prefill_tile;
@@ -2253,7 +2291,16 @@ pub const Engine = struct {
                 p.s = correction.tensor.offset;
                 p.eps = r.eps;
                 p.scale = r.scale;
-                try gpu.dispatch(self.ctx, "mk_route_topk", &.{ self.arena, correction.buffer }, &p, @as(usize, rows) * 32, 256);
+                if (self.expert_tiles != null and rows >= 2 and rows <= 8 and self.knobs.expert_compact_tiles and
+                    (self.knobs.expert_nvfp4_fast or self.knobs.expert_block_m64n64) and r.experts <= 128 and r.top_k <= 8)
+                {
+                    const tile = self.expert_tiles.?;
+                    self.ctx.nano_dispatch_flags = null;
+                    try gpu.dispatch(self.ctx, "mk_route_topk_group_tiles", &.{ self.arena, correction.buffer, tile[0] }, &p, 256, 256);
+                    self.expert_routes = .{ .off = o.off, .stride = o.stride, .row0 = row0, .rows = rows, .experts = r.experts, .top_k = r.top_k, .compact = true };
+                } else {
+                    try gpu.dispatch(self.ctx, "mk_route_topk", &.{ self.arena, correction.buffer }, &p, @as(usize, rows) * 32, 256);
+                }
             },
             .expert_gate_up => |e| {
                 const out_bf16 = self.expert_bf16_out;
@@ -3102,8 +3149,11 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             const w = self.bound[l.w];
             const xin = self.words(l.x);
             const out = self.words(cap.out);
-            const vector = l.x.width % 128 == 0 and xin.off % 4 == 0 and xin.stride % 4 == 0 and w.tensor.offset % 8 == 0;
-            if (rows >= 1 and rows <= 8 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
+            if (rows >= 1 and rows <= 8 and self.knobs.bf16_verify_mma and self.knobs.bf16_linear_tile and
+                cap.out.width >= 16384 and l.input_bf16 and w.tensor.dtype == .bf16 and w.quant == null and
+                l.x.width % 64 == 0 and xin.off % 4 == 0 and xin.stride % 4 == 0 and w.tensor.offset % 16 == 0 and
+                w.tensor.shape[0] >= ((@as(u64, cap.out.width) + 15) / 16) * 16)
+            {
                 p.w = w.tensor.offset;
                 p.x = xin.off;
                 p.xs = xin.stride;
@@ -3112,18 +3162,35 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 p.n = l.x.width;
                 p.m = cap.out.width;
                 p.scale = cap.transform.softcap;
-                const wide8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
-                const kname: [:0]const u8 = if (rows == 1)
-                    (if (wide8) "mk_bf16_linear_4x1_softcap_vec8" else "mk_bf16_linear_4x1_softcap")
-                else if (wide8)
-                    "mk_bf16_linear_2xR_softcap_vec8"
-                else
-                    "mk_bf16_linear_2xR_softcap";
-                const threads: usize = if (rows == 1) ((@as(usize, p.m) + 3) / 4) * 32 else ((@as(usize, p.m) + 1) / 2) * 32;
-                try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, threads, self.knobs.linear_group);
+                if (w.tensor.shape[0] >= ((@as(u64, p.m) + 31) / 32) * 32) {
+                    try gpu.dispatch(self.ctx, "mk_bf16_mma_m8n32_softcap_direct", &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 31) / 32) * 128, 128);
+                } else {
+                    try gpu.dispatch(self.ctx, "mk_bf16_mma_m8n16_softcap_direct", &.{ w.buffer, self.arena }, &p, ((@as(usize, p.m) + 15) / 16) * 64, 64);
+                }
             } else {
-                self.ctx.nano_dispatch_flags = null;
-                for (0..3) |k| try self.encode(ops[i + k], row0, rows);
+                const vector = l.x.width % 128 == 0 and xin.off % 4 == 0 and xin.stride % 4 == 0 and w.tensor.offset % 8 == 0;
+                if (rows >= 1 and rows <= 8 and self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and vector and (self.knobs.bf16_decode_vec or self.knobs.bf16_decode_wide)) {
+                    p.w = w.tensor.offset;
+                    p.x = xin.off;
+                    p.xs = xin.stride;
+                    p.y = out.off;
+                    p.ys = out.stride;
+                    p.n = l.x.width;
+                    p.m = cap.out.width;
+                    p.scale = cap.transform.softcap;
+                    const wide8 = self.knobs.bf16_decode_wide and p.n % 256 == 0 and w.tensor.offset % 16 == 0;
+                    const kname: [:0]const u8 = if (rows == 1)
+                        (if (wide8) "mk_bf16_linear_4x1_softcap_vec8" else "mk_bf16_linear_4x1_softcap")
+                    else if (wide8)
+                        "mk_bf16_linear_2xR_softcap_vec8"
+                    else
+                        "mk_bf16_linear_2xR_softcap";
+                    const threads: usize = if (rows == 1) ((@as(usize, p.m) + 3) / 4) * 32 else ((@as(usize, p.m) + 1) / 2) * 32;
+                    try gpu.dispatch(self.ctx, kname, &.{ w.buffer, self.arena }, &p, threads, self.knobs.linear_group);
+                } else {
+                    self.ctx.nano_dispatch_flags = null;
+                    for (0..3) |k| try self.encode(ops[i + k], row0, rows);
+                }
             }
         },
         .head_softcap_loopcd => |i| {
@@ -3268,7 +3335,7 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             const c = ops[i + 1].inkling_short_conv;
             const src_state = self.program.states[c.src];
             const capacity = src_state.capacity(self.batch, self.context);
-            if (rows == 1 and self.knobs.conv_ring and capacity >= c.taps) {
+            if (rows >= 1 and rows <= 8 and self.knobs.conv_ring and c.taps >= 1 and c.taps <= 8 and capacity >= c.taps + (if (rows > 1) rows else 0)) {
                 const w = self.bound[c.weight];
                 const residual = self.words(c.residual);
                 const o = self.words(c.out);
@@ -3283,7 +3350,8 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 p.capacity = capacity;
                 p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.taps + 1)));
                 p.flags = if (c.round == .bf16) gpu.flag_round_bf16 else 0;
-                try gpu.dispatch(self.ctx, "mk_store_inkling_short_conv_ring", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, p.n, 256);
+                const kname: [:0]const u8 = if (rows == 1) "mk_store_inkling_short_conv_ring" else "mk_store_inkling_short_conv_ring_batch";
+                try gpu.dispatch(self.ctx, kname, &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
             } else {
                 self.ctx.nano_dispatch_flags = null;
                 try self.encode(ops[i], row0, rows);

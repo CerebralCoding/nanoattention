@@ -49,5 +49,7 @@
   "expert_bf16_io": true,
   "fuse_qkvr_prep": true,
   "relative_inline_bias": true,
-  "fuse_merge_norm": true
+  "fuse_merge_norm": true,
+  "bf16_verify_mma": true,
+  "dflash_dcut": true
 }
