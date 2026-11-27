@@ -337,6 +337,29 @@ Verified **Suite B** multi-turn needle retrieval + technical summary (`32K / 64K
 | **`3p_adaptive`** (`--loop-passes 3 --loopcd logits-adaptive --loopcd-omega 0.7`) | `106.79 ->` **`112.14`** (`1.77×`) | `70.56 ->` **`96.37`** (`1.52×`) | `33.58 ->` **`72.16`** (`2.15×` faster, `1.15×` vs base) |
 | **`3p_hidden`** (`--loop-passes 3 --loopcd hidden --loopcd-omega 0.5`, ref) | **`103.36`** (`1.57×`) | **`133.26`** (`2.02×`) | **`92.17`** (`1.46×`) |
 
+#### Canonical Eval & Perf Suite (`tools/nano_eval.py`)
+
+[`tools/nano_eval.py`](tools/nano_eval.py) is the canonical zero-dependency harness for measuring both task quality and native Metal throughput (`nano tokenize --batch`, `nano session`, `nano bench`) side by side:
+
+- **Suites:** `core` (executable Python coding including an instrumented `O(log n)` binary-search read-count check, modular/algebraic math, strict JSON extraction, and a 3,990-token Zig/Metal audit), `long` (32K/64K/131K multi-turn needle retrieval + summary with auto LSA), `scale` (256K–1M), and `bench` (raw synthetic `nano bench`).
+- **Gates:** Grades task outputs, flags repetition loops / tail-diversity collapses via coherence checks, enforces `100%` exact `base == draft` greedy parity and `0` leaks, separates `Coherent Decode (tok/s)` from broken fast modes, and runs CI regression checks via `compare --gate`.
+
+Verified 2-repeat M3 Ultra `core` baseline ([`benchmarks/inkling-eval-v031.md`](benchmarks/inkling-eval-v031.md), `--mode both --repeats 2`):
+
+| Config | Pass | Coherent | Parity | Leaks | Prefill (`tok/s`) | Coherent Decode (`tok/s`) | 4K+ (`tok/s`) | `mean_step` | Speedup |
+| :--- | :---: | :---: | :---: | :---: | ---: | ---: | ---: | :---: | :---: |
+| **`3p_hidden`** | **6/6** | 6/6 | 6/6 | 0 | `1,153.9` | **`110.23`** | **`92.43`** | `4.39` | **`1.69×`** |
+| **`3p_off`** | **6/6** | 6/6 | 6/6 | 0 | `1,155.1` | **`107.90`** | `90.52` | `4.18` | `1.66×` |
+| **`3p_adaptive`** | **6/6** | 6/6 | 6/6 | 0 | `1,117.7` | **`99.98`** | `79.71` | `3.78` | `1.54×` |
+| **`2p_off`** | `0/6` | `2/6` | 6/6 | 0 | `1,567.6` | `117.81` (`132.98` all) | `152.08` *(loop)* | `4.06` | `1.55×` |
+
+```sh
+python3 tools/nano_eval.py run "$CKPT" --draft "$DRAFT" \
+  --suite core --config 3p_hidden,3p_off,3p_adaptive,2p_off --mode both --repeats 2 \
+  --out benchmarks/inkling-eval-v031.json --md benchmarks/inkling-eval-v031.md
+python3 tools/nano_eval.py compare benchmarks/inkling-eval-v031.json candidate.json --gate
+```
+
 See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-Elites QD grid across 4K/16K/32K in [`benchmarks/inkling-qd/elites.md`](benchmarks/inkling-qd/elites.md), the Lean 4 contracts in [`proofs/Inkling.lean`](proofs/Inkling.lean) (`59` public / `65` total theorems) and [`proofs/Speculative.lean`](proofs/Speculative.lean) (`17` theorems), and [`docs/MEGAKERNEL.md`](docs/MEGAKERNEL.md).
 
 **Parity & limits:** `inkling.json` preserves exact greedy token parity across `bf16_verify_mma` + `dflash_dcut` (`0` parity failures across Suite A and Suite B `32K/64K/131K`), is bit-identical (`max_abs = 0.0`) on `bf16_verify_mma=false` to pre-Qwegn `megakernel-v1` across `cake_toks` (`feed=1, 8`), `real_512` (`feed=512`, `560/560` top-1, `32/32` greedy), and `long_real` (`feed=512`, `568/568` top-1, `32/32` greedy), matches `64/64` greedy tokens on `cake_toks` against baseline, and passes [`tools/nano_inkling_attention_check.py`](tools/nano_inkling_attention_check.py) (`24/24` top-1 agreement across six arm pairs). Native `--draft` DFlash 2 speculative decoding is wired; note that the vision tower and the checkpoint's bundled `mtp.safetensors` drafter remain separate.
