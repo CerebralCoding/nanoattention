@@ -586,6 +586,7 @@ const Turn = struct {
     prompt_tokens: usize = 0,
     reply: std.ArrayList(u32) = .empty,
     stop: Stop = .eos,
+    vision_seconds: f64 = 0,
     prefill_seconds: f64 = 0,
     first_token_seconds: f64 = 0,
     decode_seconds: f64 = 0,
@@ -915,6 +916,7 @@ fn stopName(s: Stop) []const u8 {
 
 fn printStats(load_seconds: ?f64, t: *const Turn) void {
     if (load_seconds) |l| printErr("load {d:.2} s | ", .{l});
+    if (t.vision_seconds > 0) printErr("vision {d:.3} s | ", .{t.vision_seconds});
     printErr("prompt {d} tokens, {d:.3} s, {d:.1} tok/s | first token {d:.3} s | reply {d} tokens, {d:.1} tok/s", .{
         t.prompt_tokens, t.prefill_seconds, t.promptRate(), t.first_token_seconds, t.reply.items.len, t.replyRate(),
     });
@@ -1011,11 +1013,14 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
 
     var encoded_batch: ?inkling_vision.EncodedBatch = null;
     defer if (encoded_batch) |*eb| eb.deinit(ctx.gpa);
+    var vision_seconds: f64 = 0;
     if (o.images.items.len > 0) {
         if (!std.mem.eql(u8, loaded.program.meta.model_type, "inkling2_loop"))
             return fail("--image is currently supported for inkling2_loop models only", .{});
+        const v_start = try io.now();
         encoded_batch = vision.?.encodeFiles(ctx.a, o.images.items, o.max_image_tokens) catch |err|
             return fail("image encoding failed: {s}", .{@errorName(err)});
+        vision_seconds = (try io.now()) - v_start;
     }
 
     const text = if (o.raw)
@@ -1046,7 +1051,7 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
     };
     display.begin(template != null and template.?.starts_in_think and o.thinking);
     var gen: Generator = .{ .engine = &loaded.engine, .draft = draft, .tok = &tok, .sampler = if (sampler) |*s| s else null, .display = &display, .eos = loaded.program.meta.eos, .gpa = ctx.gpa };
-    var turn: Turn = .{};
+    var turn: Turn = .{ .vision_seconds = vision_seconds };
     try gen.turnWithVision(ctx.a, ids.items, if (vis_stream) |*vs| vs else null, o.max_tokens, false, &turn);
     if (o.json) {
         try io.out(try jsonTurn(ctx.a, &display, &turn, load_seconds, ids.items));
@@ -1198,12 +1203,15 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
         }
         var encoded_batch: ?inkling_vision.EncodedBatch = null;
         defer if (encoded_batch) |*eb| eb.deinit(ctx.gpa);
+        turn.vision_seconds = 0;
         if (pending_images.items.len > 0) {
+            const v_start = try io.now();
             encoded_batch = vision.?.encodeFiles(ctx.a, pending_images.items, o.max_image_tokens) catch |err| {
                 printErr("nano: image encoding failed: {s}\n", .{@errorName(err)});
                 pending_images.clearRetainingCapacity();
                 continue;
             };
+            turn.vision_seconds = (try io.now()) - v_start;
             pending_images.clearRetainingCapacity();
         }
 

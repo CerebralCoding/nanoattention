@@ -53,7 +53,37 @@ static CGAffineTransform orientation_transform(int orient, size_t w, size_t h) {
     return t;
 }
 
-static int decode_cg_image_source(CGImageSourceRef src, uint8_t **out_rgb, uint32_t *out_w, uint32_t *out_h) {
+static void fill_checkerboard_rgba(uint32_t *pixels, size_t w, size_t h) {
+    // Little-endian RGBA8888: R,G,B=204/153, A=255.
+    const uint32_t light = 0xFFCCCCCCu;
+    const uint32_t dark = 0xFF999999u;
+    if (w == 0 || h == 0) return;
+
+    // Fill first row of light-leading phase and first row of dark-leading phase,
+    // then memcpy entire scanlines for all remaining rows.
+    uint32_t *row0 = pixels;
+    for (size_t x = 0; x < w; x++) {
+        row0[x] = ((x >> 3) & 1u) == 0u ? light : dark;
+    }
+    size_t row_bytes = w * sizeof(uint32_t);
+    size_t first_dark_y = (h > 8) ? 8 : h;
+    for (size_t y = 1; y < first_dark_y; y++) {
+        memcpy(pixels + y * w, row0, row_bytes);
+    }
+    if (first_dark_y < h) {
+        uint32_t *row_dark = pixels + first_dark_y * w;
+        for (size_t x = 0; x < w; x++) {
+            row_dark[x] = ((x >> 3) & 1u) == 0u ? dark : light;
+        }
+        for (size_t y = first_dark_y + 1; y < h; y++) {
+            const uint32_t *src = (((y >> 3) & 1u) == 0u) ? row0 : row_dark;
+            memcpy(pixels + y * w, src, row_bytes);
+        }
+    }
+}
+
+// Decodes directly to packed RGBA8888 (4 bytes/pixel) with zero extra RGB unpack copy.
+static int decode_cg_image_source_rgba(CGImageSourceRef src, uint8_t **out_rgba, uint32_t *out_w, uint32_t *out_h) {
     if (!src) return 0;
 
     int orient = 1;
@@ -78,29 +108,19 @@ static int decode_cg_image_source(CGImageSourceRef src, uint8_t **out_rgb, uint3
     size_t h = orientation_swaps_axes(orient) ? raw_w : raw_h;
 
     size_t rgba_bytes = w * h * 4;
-    uint8_t *rgba = (uint8_t *)calloc(rgba_bytes, 1);
-    if (!rgba) {
-        CGImageRelease(image);
-        return 0;
-    }
-
     CGImageAlphaInfo alpha = CGImageGetAlphaInfo(image);
     int has_alpha = (alpha == kCGImageAlphaPremultipliedLast ||
                      alpha == kCGImageAlphaPremultipliedFirst ||
                      alpha == kCGImageAlphaLast ||
                      alpha == kCGImageAlphaFirst ||
                      alpha == kCGImageAlphaOnly);
+    uint8_t *rgba = (uint8_t *)(has_alpha ? malloc(rgba_bytes) : calloc(rgba_bytes, 1));
+    if (!rgba) {
+        CGImageRelease(image);
+        return 0;
+    }
     if (has_alpha) {
-        for (size_t y = 0; y < h; y++) {
-            for (size_t x = 0; x < w; x++) {
-                uint8_t bg = (((x / 8) + (y / 8)) % 2 == 0) ? 204 : 153;
-                size_t off = (y * w + x) * 4;
-                rgba[off + 0] = bg;
-                rgba[off + 1] = bg;
-                rgba[off + 2] = bg;
-                rgba[off + 3] = 255;
-            }
-        }
+        fill_checkerboard_rgba((uint32_t *)rgba, w, h);
     }
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -123,28 +143,15 @@ static int decode_cg_image_source(CGImageSourceRef src, uint8_t **out_rgb, uint3
     CGContextRelease(ctx);
     CGImageRelease(image);
 
-    uint8_t *rgb = (uint8_t *)malloc(w * h * 3);
-    if (!rgb) {
-        free(rgba);
-        return 0;
-    }
-    size_t n_px = w * h;
-    for (size_t i = 0; i < n_px; i++) {
-        rgb[i * 3 + 0] = rgba[i * 4 + 0];
-        rgb[i * 3 + 1] = rgba[i * 4 + 1];
-        rgb[i * 3 + 2] = rgba[i * 4 + 2];
-    }
-    free(rgba);
-
-    *out_rgb = rgb;
+    *out_rgba = rgba;
     *out_w = (uint32_t)w;
     *out_h = (uint32_t)h;
     return 1;
 }
 
-int fm_load_image_rgb(const char *path, uint8_t **out_rgb, uint32_t *out_w, uint32_t *out_h) {
-    if (!path || !out_rgb || !out_w || !out_h) return 0;
-    *out_rgb = NULL;
+int fm_load_image_rgba(const char *path, uint8_t **out_rgba, uint32_t *out_w, uint32_t *out_h) {
+    if (!path || !out_rgba || !out_w || !out_h) return 0;
+    *out_rgba = NULL;
     *out_w = 0;
     *out_h = 0;
 
@@ -156,15 +163,15 @@ int fm_load_image_rgb(const char *path, uint8_t **out_rgb, uint32_t *out_w, uint
     }
     NSURL *url = [NSURL fileURLWithPath:nsPath];
     CGImageSourceRef src = CGImageSourceCreateWithURL((CFURLRef)url, NULL);
-    int ok = decode_cg_image_source(src, out_rgb, out_w, out_h);
+    int ok = decode_cg_image_source_rgba(src, out_rgba, out_w, out_h);
     if (src) CFRelease(src);
     [pool drain];
     return ok;
 }
 
-int fm_load_image_rgb_bytes(const uint8_t *data, size_t len, uint8_t **out_rgb, uint32_t *out_w, uint32_t *out_h) {
-    if (!data || len == 0 || !out_rgb || !out_w || !out_h) return 0;
-    *out_rgb = NULL;
+int fm_load_image_rgba_bytes(const uint8_t *data, size_t len, uint8_t **out_rgba, uint32_t *out_w, uint32_t *out_h) {
+    if (!data || len == 0 || !out_rgba || !out_w || !out_h) return 0;
+    *out_rgba = NULL;
     *out_w = 0;
     *out_h = 0;
 
@@ -175,16 +182,16 @@ int fm_load_image_rgb_bytes(const uint8_t *data, size_t len, uint8_t **out_rgb, 
         return 0;
     }
     CGImageSourceRef src = CGImageSourceCreateWithData(cfData, NULL);
-    int ok = decode_cg_image_source(src, out_rgb, out_w, out_h);
+    int ok = decode_cg_image_source_rgba(src, out_rgba, out_w, out_h);
     if (src) CFRelease(src);
     CFRelease(cfData);
     [pool drain];
     return ok;
 }
 
-int fm_load_image_rgb_url(const char *url_str, uint8_t **out_rgb, uint32_t *out_w, uint32_t *out_h) {
-    if (!url_str || !out_rgb || !out_w || !out_h) return 0;
-    *out_rgb = NULL;
+int fm_load_image_rgba_url(const char *url_str, uint8_t **out_rgba, uint32_t *out_w, uint32_t *out_h) {
+    if (!url_str || !out_rgba || !out_w || !out_h) return 0;
+    *out_rgba = NULL;
     *out_w = 0;
     *out_h = 0;
 
@@ -238,13 +245,13 @@ int fm_load_image_rgb_url(const char *url_str, uint8_t **out_rgb, uint32_t *out_
 
     int ok = 0;
     if (finished && fetch_ok && fetched) {
-        ok = fm_load_image_rgb_bytes((const uint8_t *)[fetched bytes], [fetched length], out_rgb, out_w, out_h);
+        ok = fm_load_image_rgba_bytes((const uint8_t *)[fetched bytes], [fetched length], out_rgba, out_w, out_h);
     }
     if (fetched) [fetched release];
     [pool drain];
     return ok;
 }
 
-void fm_free_image(uint8_t *rgb) {
-    free(rgb);
+void fm_free_image(uint8_t *pixels) {
+    free(pixels);
 }
